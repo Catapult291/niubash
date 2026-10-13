@@ -4830,9 +4830,12 @@ complete -F _envtooldyn_hook envtooldyn
         }
     }
 
-    #[cfg(windows)]
+    /// niubash#302: the shared resolver honors `HOME` isolation on every
+    /// platform — an explicit `HOME` override wins over `USERPROFILE`
+    /// (the pre-#302 Windows order preferred the system profile, which
+    /// leaked HOME-only sandboxes back into the real home).
     #[test]
-    fn shell_home_dir_prefers_userprofile_over_home() {
+    fn shell_home_dir_prefers_home_env_over_userprofile() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = unique_temp_dir("niubash-userprofile-home-precedence");
         let home = temp.join("home");
@@ -4844,7 +4847,7 @@ complete -F _envtooldyn_hook envtooldyn
 
         assert_eq!(
             crate::path_utils::normalize_existing_host_path(shell_home_dir().unwrap()),
-            crate::path_utils::normalize_existing_host_path(userprofile.clone())
+            crate::path_utils::normalize_existing_host_path(home.clone())
         );
 
         let _ = std::fs::remove_dir_all(temp);
