@@ -29,10 +29,14 @@ const RESET: &str = "\x1b[0m";
 
 /// Render the factory-default left prompt for `cwd`.
 ///
-/// Shape (owner-approved): `green user@host  yellow cwd  cyan branch[*] $ `,
-/// segments separated by single spaces, branch segment empty outside a
-/// repository. The trailing prompt char is `$ ` (Git Bash's non-root char;
-/// niu does not run elevated by design, `PrivilegesRequired=lowest`).
+/// Shape (owner-approved, two-row per Git Bash's own layout — owner note
+/// 2026-10-14): row one is `green user@host  yellow cwd  cyan (branch*)`,
+/// row two is the `$ ` input line on its own row; segments separated by
+/// single spaces, branch segment (and its row space) empty outside a
+/// repository. The prompt char is `$ ` (Git Bash's non-root char; niu does
+/// not run elevated by design, `PrivilegesRequired=lowest`). `\r\n` keeps
+/// the raw-terminal column honest (a bare `\n` would land row two at the
+/// break column under ConPTY).
 pub fn render(cwd: &Path) -> String {
     let mut left = format!(
         "{GREEN}{}@{}{RESET} {YELLOW}{}{RESET}",
@@ -42,9 +46,14 @@ pub fn render(cwd: &Path) -> String {
     );
     if let Some(branch) = branch_segment(cwd) {
         left.push(' ');
-        left.push_str(&format!("{CYAN}{branch}{RESET}"));
+        // Git Bash's __git_ps1 shape: the branch rides in parentheses —
+        // `(master*)`, dirty star inside (owner note 2026-10-14: next to
+        // MINGW64's `(fix/...`)` the bare word read as missing something).
+        // `branch_segment` stays bare: the Vcs segment keys its dirty
+        // colour off the trailing star.
+        left.push_str(&format!("{CYAN}({branch}){RESET}"));
     }
-    left.push_str(" $ ");
+    left.push_str("\r\n$ ");
     left
 }
 
@@ -202,8 +211,9 @@ mod tests {
 
         let left = render(tmp.path());
         let branch = repo.head().unwrap().shorthand().unwrap().to_string();
-        assert!(left.contains(&branch), "{left:?}");
-        assert!(!left.contains(&format!("{branch}*")), "{left:?}");
+        // Git Bash's parenthesized __git_ps1 shape (owner note 2026-10-14).
+        assert!(left.contains(&format!("({branch})")), "{left:?}");
+        assert!(!left.contains(&format!("({branch}*)")), "{left:?}");
     }
 
     #[test]
@@ -223,7 +233,7 @@ mod tests {
         std::fs::write(&file, b"v2").unwrap();
         let left = render(tmp.path());
         let branch = repo.head().unwrap().shorthand().unwrap().to_string();
-        assert!(left.contains(&format!("{branch}*")), "{left:?}");
+        assert!(left.contains(&format!("({branch}*)")), "{left:?}");
     }
 
     #[test]

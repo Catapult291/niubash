@@ -21,22 +21,28 @@ Nothing yet.
   measured cold 39 ms, warm p50 2.5 ms / p90 3.7 ms per prompt against
   Git Bash's per-prompt `__git_ps1` fork (~100-300 ms). Claims still
   win: a PS1/theme claim displaces the floor per prompt, and `set -o
-  vi` keeps its live editing-mode indicator (niubash#184).
-- Default TAB completion style is now the GNU readline shape
-  (`CompletionStyle::Gnu`, owner ruling 2026-10-12): TAB completes the
-  longest common prefix (a lone candidate completes outright), and a second
-  TAB on an unchanged line prints the candidates as width-adaptive columns
-  next to the prompt and repaints it — a printed list, not an interactive
-  menu (no selection, no arrow-key capture, no popup; a further TAB keeps
-  the list, any edit dismisses it). Implemented as a reedline `Menu`
-  (`completion::gnu_menu`) so it renders through the normal repaint
-  pipeline. The previous default Ide popup moves to an opt-in: restore it
-  with `NIU_COMPLETION_STYLE=ide` (also accepted: `smart`, `popup`) or
-  persist it with `niu config set completion.style ide` — precedence is
-  env > config file > default, and `niu doctor` now shows the effective
-  style with the switch commands. The setup wizard gained a completion
-  style step (current value pre-highlighted) on first run and on `niu
-  setup` re-runs.
+  vi` keeps its live editing-mode indicator (niubash#184). The skeleton
+  follows Git Bash's own layout after live owner passes on 2026-10-14:
+  two rows (info row, then the `$ ` input line on its own row) and the
+  branch in MINGW64's parentheses — `(master*)`, dirty star inside.
+- Default TAB completion style is now the multi-per-row grid
+  (`CompletionStyle::Column`, owner rulings 2026-10-12 + 2026-10-14):
+  every TAB shows the candidates at once, several per row — the look of a
+  GNU-style printed listing without the silent first TAB (the literal GNU
+  readline shape shipped briefly as the default and read as "dead" at the
+  prompt when TAB #1 had nothing to complete; live owner feedback flipped
+  it). The literal GNU shape remains an opt-in
+  (`NIU_COMPLETION_STYLE=gnu` or `niu config set completion.style gnu`):
+  TAB completes the longest common prefix (a lone candidate completes
+  outright), and a second TAB on an unchanged line prints the candidates
+  as width-adaptive columns next to the prompt and repaints it —
+  implemented as a reedline `Menu` (`completion::gnu_menu`) so it renders
+  through the normal repaint pipeline. The Ide popup stays opt-in
+  (`ide`, also accepted: `smart`, `popup`); precedence is env > config
+  file > default, and `niu doctor` shows the effective style with the
+  switch commands. The setup wizard gained a completion style step
+  (current value pre-highlighted) on first run and on `niu setup`
+  re-runs.
 
 ### Added
 
