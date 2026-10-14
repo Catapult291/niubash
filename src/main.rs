@@ -346,7 +346,25 @@ fn dispatch_launcher_word(args: &[String], index: usize) -> anyhow::Result<()> {
     let word = args[index].as_str();
     let leading_options = &args[1..index];
     let rest = &args[index + 1..];
+    // niubash#585 host half (the engine half is rubash#596, printed through
+    // the shared `rubash::usage` since rubash#606): GNU keys --help and
+    // --version off argv[0]'s basename, and the shim forwards this process's
+    // invocation face in NIU_INVOKED_AS - so `bash --help` answers with the
+    // GNU usage form and `bash --version` with the GNU version banner, byte
+    // for byte what the engine binary prints, while every niu-face
+    // invocation keeps the product surfaces. -h/-V are deliberately NOT
+    // forked (GNU -h is hashall, not help - rubash#596's oracle finding).
+    let invocation_face = std::env::var("NIU_INVOKED_AS").ok();
+    let face_name = rubash::usage::invocation_help_name(invocation_face.as_deref());
     match word {
+        "--help" if face_name.is_some() => {
+            rubash::usage::show_shell_help(face_name.as_deref().unwrap_or("bash"), None);
+            Ok(())
+        }
+        "--version" if face_name.is_some() => {
+            rubash::usage::show_shell_version(None);
+            Ok(())
+        }
         "-h" | "--help" => {
             print_usage();
             Ok(())
