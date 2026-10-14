@@ -122,23 +122,25 @@ impl HistoryConfig {
 
 /// Completion menu display style.
 ///
-/// The default is [`CompletionStyle::Gnu`] (owner ruling 2026-10-12): TAB
-/// completes the longest common prefix, and a second TAB on an unchanged
-/// line prints the candidates as width-adaptive columns next to the prompt
-/// and repaints it — a printed list, not an interactive menu. Arrow keys are
-/// never captured and no popup is drawn, matching GNU readline's factory
-/// behavior. The Ide popup remains available as
-/// `NIU_COMPLETION_STYLE=ide` / `niu config set completion.style ide`.
+/// The default is [`CompletionStyle::Column`] (owner ruling 2026-10-14,
+/// superseding the 2026-10-12 Gnu flip after the owner used it live): TAB
+/// shows the candidates immediately as a multi-per-row grid — the look of
+/// GNU's printed listing without the two-TAB dance (a first TAB that
+/// completes nothing and stays silent read as "dead" at the prompt).
+/// [`CompletionStyle::Gnu`] remains available as the literal GNU readline
+/// behavior (`NIU_COMPLETION_STYLE=gnu` /
+/// `niu config set completion.style gnu`), and the Ide popup as `ide`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionStyle {
-    /// GNU readline default: first TAB completes the common prefix (a lone
+    /// GNU readline literal: first TAB completes the common prefix (a lone
     /// candidate completes outright); an ambiguous second TAB lists the
     /// candidates columnar and repaints the prompt.
     Gnu,
-    /// Multi-column popup with descriptions (VS Code style). The pre-1.4.1
-    /// default, kept as an opt-in for existing users.
+    /// Multi-column popup with descriptions (VS Code style).
     Ide,
-    /// Multi-column grid (like zsh `compinit`).
+    /// Multi-column grid (like zsh `compinit`). The default: every TAB
+    /// shows the candidates at once, several per row — the GNU listing
+    /// look without the silent first TAB.
     Column,
     /// Vertical list with descriptions (like fish).
     List,
@@ -173,7 +175,7 @@ impl CompletionStyle {
 
 impl Default for CompletionStyle {
     fn default() -> Self {
-        Self::Gnu
+        Self::Column
     }
 }
 
@@ -728,10 +730,13 @@ mod tests {
     }
 
     #[test]
-    fn completion_style_default_is_gnu() {
-        // Owner ruling 2026-10-12: the factory TAB completion shape is the GNU
-        // readline default; the Ide popup moved to an opt-in.
-        assert_eq!(CompletionStyle::default(), CompletionStyle::Gnu);
+    fn completion_style_default_is_column() {
+        // Owner ruling 2026-10-14: the factory TAB shape is the multi-per-row
+        // grid (the GNU listing look, candidates immediately) — the 2026-10-12
+        // Gnu flip read as "dead" at the prompt (silent first TAB when the
+        // typed word already is the common prefix) and the Ide popup lost on
+        // looks. Gnu remains an opt-in.
+        assert_eq!(CompletionStyle::default(), CompletionStyle::Column);
     }
 
     #[test]
@@ -750,7 +755,7 @@ mod tests {
     #[test]
     fn menu_config_default_completion_style() {
         let config = MenuConfig::default();
-        assert_eq!(config.completion_style, CompletionStyle::Gnu);
+        assert_eq!(config.completion_style, CompletionStyle::Column);
     }
 
     #[test]
@@ -774,7 +779,7 @@ mod tests {
             std::fs::remove_file(&temp).ok();
             assert_eq!(CompletionStyle::parse("gnu"), Some(CompletionStyle::Gnu));
             let (style, source) = resolve_completion_style();
-            assert_eq!(style, CompletionStyle::Gnu);
+            assert_eq!(style, CompletionStyle::Column);
             assert_eq!(source, CompletionStyleSource::Default);
 
             // Persisted file beats the default.
@@ -809,7 +814,7 @@ mod tests {
 
             // Setting the built-in default removes the key again.
             std::env::remove_var("NIU_COMPLETION_STYLE");
-            set_completion_style(CompletionStyle::Gnu)?;
+            set_completion_style(CompletionStyle::Column)?;
             let text = std::fs::read_to_string(&temp)?;
             let parsed: UserConfigFile = toml::from_str(&text)?;
             assert!(parsed.completion.is_none(), "default must not be pinned");
@@ -819,7 +824,7 @@ mod tests {
             // warning landing on stderr — the value result is what's pinned).
             std::fs::write(&temp, "[completion]\nstyle = \"winget\"").unwrap();
             let (style, source) = resolve_completion_style();
-            assert_eq!(style, CompletionStyle::Gnu);
+            assert_eq!(style, CompletionStyle::Column);
             assert_eq!(source, CompletionStyleSource::Default);
             Ok::<(), anyhow::Error>(())
         })();

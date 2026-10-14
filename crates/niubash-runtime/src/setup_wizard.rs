@@ -1870,17 +1870,17 @@ fn ask_completion_style(
         (
             CompletionStyle::Gnu,
             "gnu",
-            t.tr("default — TAB completes the prefix; TAB again lists, GNU readline style"),
+            t.tr("literal GNU readline: TAB completes the prefix; TAB again lists"),
         ),
         (
             CompletionStyle::Ide,
             "ide",
-            t.tr("VS Code-style popup with descriptions (the pre-1.4.1 default)"),
+            t.tr("VS Code-style popup with descriptions"),
         ),
         (
             CompletionStyle::Column,
             "column",
-            t.tr("zsh-style multi-column grid"),
+            t.tr("default — the candidates at once, several per row (GNU listing look)"),
         ),
         (
             CompletionStyle::List,
