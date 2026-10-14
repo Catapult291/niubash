@@ -984,7 +984,7 @@ def build_env(home: Path, exe: Path) -> dict:
 
 def ensure_tools_on_path(path: str) -> str:
     """The journey needs `git` (clones) and `ls`/`cat` (battery) on PATH.
-    On a runner only `Git\cmd` may be present; add the Git for Windows
+    On a runner only `Git\\cmd` may be present; add the Git for Windows
     layout pieces that exist. A user machine has WinuxCmd and needs none
     of this."""
     extras = []
@@ -1043,29 +1043,89 @@ NOTICE_MARK = "niu plugin sync:"
 POWERLINE_GLYPHS = "\ue0b0\ue0b2\ue0b3\ue0b6"
 
 
-def themed_prompt_signature(session: Session):
-    """The ACTIVE theme's prompt rows, digit-stripped, newest-last — the
-    stable structural signature of whatever theme this session renders
-    right now. Bottom-up from the input-glyph row, taking rows that carry
-    prompt structure (a powerline segment glyph, or the prompt-ish input
-    row) and stopping at the first notice/banner/plain-output row. Theme-
-    independent by construction: compare a session against a reference
-    captured from the SAME theme in the SAME run, never against a
-    fingerprint of a different theme's shape (P4 legitimately re-picks).
-    [] before the first prompt has rendered."""
-    rows = [row for row in session.text().splitlines() if row.strip()]
-    signature = []
-    for row in reversed(rows):
-        if NOTICE_MARK in row or re.match(r"Niubash \d+\.\d+\.\d+",
-                                          row.strip()):
+def _prompt_structure_row(row: str) -> bool:
+    """A themed prompt's own structure: a powerline separator or any
+    private-use glyph (nerd-font themes paint their segment icons in
+    \\ue000-\\uf8ff — powerline-multiline's folder/clock among them)."""
+    return (any(glyph in row for glyph in POWERLINE_GLYPHS)
+            or any("\ue000" <= ch <= "\uf8ff" for ch in row))
+
+
+def _canonical_prompt_row(row: str, input_row: bool = False) -> str:
+    """A prompt row modulo its clock, its column, and — for the block's
+    input row — the user's typed text (digits stripped: the themed
+    prompt repaints a per-second clock; whitespace runs collapsed:
+    ConPTY paints the themed rows mid-column; typed text is user
+    content, the signature compares prompt STRUCTURE)."""
+    canon = re.sub(r"\s+", " ", re.sub(r"\d", "", row or "")).strip()
+    if input_row:
+        lead = re.match(r"[$#%>❯➜▶►»❮]", canon)
+        if lead:
+            return lead.group(0)
+    return canon
+
+
+def _signature_profile(signature: list) -> tuple:
+    """The block's shape: which rows carry themed structure (PUA/
+    powerline) and which are the input row. Cross-session fragment
+    noise (a wrapped notice interleaved mid-row by a partial repaint)
+    changes the rows' TEXT but not the block's shape — the equality
+    comparisons run on the shape, never on fragment text."""
+    return tuple("s" if _prompt_structure_row(row) else "p"
+                 for row in signature)
+
+
+def themed_prompt_signature(session: Session, samples: int = 8):
+    """The ACTIVE theme's newest prompt block, digit- and column-
+    stripped, input row last — the stable structural signature of
+    whatever theme this session renders right now.
+
+    A viewport read SAMPLES a live ConPTY repaint, it does not observe
+    one instant: a partial repaint can leave the top segment row's
+    filler (dots and spaces, no letters) as the newest row, and the
+    themed rows themselves paint mid-column (release 38489787748: the
+    old single-instant walk broke on such a filler row and reported an
+    emptied signature for a prompt the raw stream shows fully
+    rendered). So the newest input row anchors the block, PUA/
+    powerline structure rows above it join, letterless filler rows
+    skip (bounded), plain output still stops the walk — and the best
+    (longest) of a few samples wins. The question the callers ask is
+    whether the theme rendered, not whether one pyte instant caught
+    it.
+
+    Theme-independent by construction: compare a session against a
+    reference captured from the SAME theme in the SAME run, never
+    against a fingerprint of a different theme's shape (P4 legitimately
+    re-picks). [] before the first prompt has rendered."""
+    best = []
+    for attempt in range(max(1, samples)):
+        if attempt:
+            time.sleep(0.25)
+        rows = [row for row in session.text().splitlines() if row.strip()]
+        input_idx = next((i for i in range(len(rows) - 1, -1, -1)
+                          if PROMPTISH_LAST_ROW.match(rows[i])), None)
+        if input_idx is None:
+            continue
+        block = []
+        skips = 0
+        for row in reversed(rows[:input_idx]):
+            if NOTICE_MARK in row or re.match(r"Niubash \d+\.\d+\.\d+",
+                                              row.strip()):
+                break
+            if _prompt_structure_row(row):
+                block.append(_canonical_prompt_row(row))
+                skips = 0
+            elif skips < 4 and not any(ch.isalnum() for ch in row):
+                skips += 1  # a partial-repaint filler fragment: skip, not stop
+            else:
+                break
+        block.append(_canonical_prompt_row(rows[input_idx], input_row=True))
+        block.reverse()
+        if len(block) > len(best):
+            best = block
+        if len(best) >= 2:  # input row + themed structure: enough
             break
-        if (any(glyph in row for glyph in POWERLINE_GLYPHS)
-                or PROMPTISH_LAST_ROW.match(row)):
-            signature.append(normalize_prompt_row(row))
-        else:
-            break
-    signature.reverse()
-    return signature
+    return best
 
 
 def await_first_prompt_row(session: Session, timeout=STARTUP_TIMEOUT):
@@ -2091,9 +2151,14 @@ def p8_s4_remove_active_theme_source(exe, home, env, verdict, seed, state):
             # 37224044818).
             sig_now = themed_prompt_signature(final)
             if themed and sig_ref:
+                # The shape comparison, never fragment text: a partial
+                # repaint interleaves notice fragments into the themed
+                # rows differently per session (the artifact that emptied
+                # the pre-removal signature in run 38489787748).
                 step.check("the themed prompt renders again (structural "
                            "match with the pre-removal prompt)",
-                           sig_now == sig_ref,
+                           (_signature_profile(sig_now)
+                            == _signature_profile(sig_ref)),
                            f"signature now: {sig_now}; expected: {sig_ref}")
             elif not themed:
                 step.check("nothing resurrects on screen (still the floor "
