@@ -309,11 +309,11 @@ fn configured_completion_menu(
 ) -> Box<dyn reedline::Menu> {
     match config.completion_style {
         CompletionStyle::Gnu => {
-            // GNU readline factory semantics (the default): TAB #1 completes
-            // the common prefix, TAB #2 on an unchanged line prints the
-            // candidates columnar and the prompt is repainted — a printed
-            // list, no menu navigation, no arrow-key capture, no popup.
-            // See `completion::gnu_menu` for the state machine.
+            // GNU readline literal semantics (opt-in, `completion.style gnu`):
+            // TAB #1 completes the common prefix, TAB #2 on an unchanged line
+            // prints the candidates columnar and the prompt is repainted — a
+            // printed list, no menu navigation, no arrow-key capture, no
+            // popup. See `completion::gnu_menu` for the state machine.
             let menu = crate::completion::gnu_menu::GnuMenu::default()
                 .with_name(name)
                 .with_marker(gnu_indicator);
