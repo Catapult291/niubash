@@ -107,6 +107,7 @@ fn display_cwd(cwd: &Path) -> String {
 /// dirty-state marker; the segment engine keys its `[git_dirty]` yellow off
 /// exactly that star.
 pub fn branch_segment(cwd: &Path) -> Option<String> {
+    allow_user_owned_repos();
     let repo = git2::Repository::discover(cwd).ok()?;
     let head = repo.head().ok()?;
     let name = if head.is_branch() {
@@ -120,6 +121,31 @@ pub fn branch_segment(cwd: &Path) -> Option<String> {
     };
     let dirty = repo_is_dirty(&repo);
     Some(if dirty { format!("{name}*") } else { name })
+}
+
+/// libgit2 refuses repositories owned by a different account unless told
+/// otherwise, and it does NOT read git's `safe.directory` — so on the very
+/// common single-user Windows machine whose repo trees were created by an
+/// old install (owner `BUILTIN\Administrators`, observed on D:\repo after a
+/// Windows reinstall: `git status` works — the user's git.exe honors their
+/// safe.directory — while `Repository::discover` errors and the branch
+/// segment silently vanished, owner report 2026-10-14), the prompt must
+/// match what the user's own git answers. The prompt's git2 usage is
+/// read-only (HEAD + status sweep), the process-wide opt matches git.exe's
+/// verdict, and the alternative — rendering no branch in a repository the
+/// user actively works in — is the bug, not the safety property (the
+/// attack it guards, a foreign-owned repo on a shared host, fails safe
+/// elsewhere: clones are made by this user).
+fn allow_user_owned_repos() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: a process-global libgit2 opt with no pointer arguments;
+        // called once before any repository opens, from the prompt's
+        // read-only git2 surface.
+        unsafe {
+            let _ = git2::opts::set_verify_owner_validation(false);
+        }
+    });
 }
 
 /// Dirty sweep, bounded: untracked-only repositories (the common "just
