@@ -820,10 +820,12 @@ def report(results: list[dict], budgets: Budgets, out_path: Path,
               f"{(med(r, 'first_prompt') or 0):8.1f} "
               f"{(med(r, 'rerender') or 0):8.1f}  {r['verdict']}")
 
-    violations = [r for r in results if r["verdict"] in ("over", "hard-fail", "timeout")]
-    if violations:
-        print(f"\nBUDGET VIOLATIONS ({len(violations)}):")
-        for r in violations:
+    hard = [r for r in results
+            if r["verdict"] in ("hard-fail", "timeout")]
+    soft = [r for r in results if r["verdict"] == "over"]
+    if hard:
+        print(f"\nBUDGET VIOLATIONS — GATE-FAILING ({len(hard)}):")
+        for r in hard:
             parts = []
             for p in PHASES:
                 m = med(r, p)
@@ -836,7 +838,28 @@ def report(results: list[dict], budgets: Budgets, out_path: Path,
             if r["verdict"] == "timeout":
                 parts.append("phase timeout (hard FAIL)")
             print(f"  {r['asset']}: " + "; ".join(parts))
-    else:
+    if soft:
+        # Soft overs warn, they do not block (owner ruling on run
+        # 38489787748's data): eleven assets measured 1.0-1.05x over with
+        # ZERO hard fails, all in the first_prompt phase, whose median
+        # moves ~30% between reps of the SAME asset under concurrent lane
+        # builds — a runner-load band, not a product regression. The hard
+        # cap (hard_fail_multiplier) still fails the release, so a real
+        # slowdown cannot hide here; every soft over is printed with its
+        # numbers and stays in the verdict JSON for the next calibration.
+        print(f"\nSOFT OVERS — warnings, not blockers ({len(soft)}):")
+        for r in soft:
+            parts = []
+            for p in PHASES:
+                m = med(r, p)
+                bk = BUDGET_KEY[p]
+                if m is not None and bk in r["budget"] \
+                        and r["phase_verdicts"][p] == "over":
+                    ratio = m / r["budget"][bk]
+                    parts.append(f"{p}={m:.1f}ms (budget "
+                                 f"{r['budget'][bk]:.0f}ms, {ratio:.2f}x)")
+            print(f"  {r['asset']}: " + "; ".join(parts))
+    if not hard and not soft:
         print("\nall measured assets within budget")
 
     bad = [r for r in results if r["verdict"] == "source-error"]
@@ -850,11 +873,17 @@ def report(results: list[dict], budgets: Budgets, out_path: Path,
     if baseline_path:
         compare_baseline(results, Path(baseline_path))
 
-    gate_fail = sum(counts.get(v, 0) for v in ("over", "hard-fail", "timeout"))
-    if gate_fail:
-        print(f"\nGATE: FAIL — {gate_fail} asset(s) over budget "
-              f"(defaults: {budgets.defaults}; hard-fail at {budgets.hard_mult}x)")
+    hard_fail = sum(counts.get(v, 0) for v in ("hard-fail", "timeout"))
+    soft_over = counts.get("over", 0)
+    if hard_fail:
+        print(f"\nGATE: FAIL — {hard_fail} asset(s) past the hard cap "
+              f"({budgets.hard_mult}x; defaults: {budgets.defaults})")
         return 1
+    if soft_over:
+        print(f"\nGATE: PASS — {soft_over} soft over(s) inside the hard "
+              f"band (warnings above; defaults: {budgets.defaults}; "
+              f"hard-fail at {budgets.hard_mult}x)")
+        return 0
     print("\nGATE: PASS")
     return 0
 
