@@ -62,3 +62,51 @@ fn coproc_command_keeps_dash_dash_args_out_of_host_cli() {
         "coproc output missing, stdout: {stdout}"
     );
 }
+
+/// niubash#362: `&` must survive a large function table. The engine
+/// serializes the WHOLE function table into the respawned child's `-c`
+/// argument; on Windows that overflows CreateProcessW's 32767-unit
+/// command line, and on Unix a single argv entry over MAX_ARG_STRLEN
+/// (128 KiB), so the spawn died with `niu: File name too long` before the
+/// command ran. The engine now hands an over-budget script to the child
+/// through a temp file (__RUBASH_CMD_FILE); niu.exe must read it back.
+///
+/// The script goes through a FILE (not `-c`) so the test harness's own
+/// spawn stays under the limit; the background `echo hello &` is what
+/// overflows.
+#[test]
+fn large_function_table_background_command_runs() {
+    let dir = std::env::temp_dir().join(format!("niu-362-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch");
+    let path = dir.join("big.sh");
+
+    // ~6000 trivial functions => ~200 KB serialized, past both caps.
+    let mut script = String::new();
+    for i in 0..6000 {
+        script.push_str(&format!("f{i}() {{ local v={i}; : \"$v\"; }}\n"));
+    }
+    script.push_str("echo hello &\nwait\necho large-fn-status:$?\n");
+    std::fs::write(&path, &script).expect("write script");
+
+    let output = Command::new(niu_binary())
+        .arg(&path)
+        .env("NIU_SKIP_WINUXCMD_ACTIVATION", "1")
+        .output()
+        .expect("spawn niubash");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        !stderr.contains("File name too long") && !stderr.contains("Argument list too long"),
+        "spawn hit an argv/command-line cap: {stderr}"
+    );
+    assert!(
+        stdout.contains("hello"),
+        "background child output missing, stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("large-fn-status:0"),
+        "wait status wrong, stdout: {stdout}\nstderr: {stderr}"
+    );
+}
