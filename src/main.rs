@@ -155,13 +155,20 @@ fn run_main() -> ExitCode {
     // `source_non_interactive_env` must all see the directory the caller
     // last left behind. The scan only ever strips a prefix group of its own
     // flags, so positional parameters and bash-style options are untouched.
-    let args = match extract_cwd_state_options(&args) {
+    let mut args = match extract_cwd_state_options(&args) {
         Ok(args) => args,
         Err(error) => {
             eprintln!("niu: {error}");
             return ExitCode::from(1);
         }
     };
+    // rubash#362 (niubash#362): an over-long `-c` script from a respawned
+    // async `&` child arrives named by __RUBASH_CMD_FILE (the engine's spawn
+    // side wrote it to a temp file because the serialized function table
+    // overflows the Windows command line). Splice it back into argv here,
+    // before the engine reads it and before Shell::new imports the process
+    // environment.
+    rubash::invocation::materialize_command_file(&mut args);
     restore_cwd_state();
 
     if let Err(e) = run(&args) {
