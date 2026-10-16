@@ -471,6 +471,47 @@ jobs:
             Write-Host "awk pipeline through packaged niu.exe: $out"
           }
 
+      - name: Verify bash/sh invocation faces in the staged release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = "dist/niubash-v${{ steps.release.outputs.version }}-win-${{ matrix.arch }}"
+          $usrBin = Join-Path $stage "winuxcmd\usr\bin"
+
+          foreach ($face in @("bash", "sh")) {
+            $exe = Join-Path $usrBin "$face.exe"
+            if (-not (Test-Path -LiteralPath $exe)) {
+              throw "$face.exe is missing from the staged package at $exe"
+            }
+
+            $help = (& $exe --help 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "$face --help exited $LASTEXITCODE inside the staged package"
+            }
+            if ($help -notmatch "GNU bash, version" -or $help -notmatch "GNU long options:") {
+              throw "$face --help did not print the GNU usage form; the shim is not forwarding the invocation face`n$help"
+            }
+
+            $version = (& $exe --version 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0 -or $version -notmatch "GNU bash, version") {
+              throw "$face --version did not print the GNU version banner"
+            }
+
+            $zero = (& $exe -c 'echo $0' 2>&1 | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or $zero -ne $face) {
+              throw "$face -c 'echo `$0' printed '$zero' instead of '$face'; the invocation face did not reach the packaged niu.exe"
+            }
+
+            Write-Host "$face --help: GNU usage OK; `$0 = $zero"
+          }
+
+          $niu = Join-Path $stage "niu.exe"
+          $productHelp = (& $niu --help 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $productHelp -notmatch "Niubash ") {
+            throw "the niu face no longer prints the product help"
+          }
+          Write-Host "niu --help: product help OK"
+
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --no-progress -y
@@ -687,6 +728,24 @@ jobs:
             exit 1
           fi
 
+          face_dir="$RUNNER_TEMP/face"
+          mkdir -p "$face_dir"
+          cp "$bin" "$face_dir/bash"
+          cp "$bin" "$face_dir/sh"
+          face_help="$("$face_dir/bash" --help)"
+          grep -qF "GNU bash, version" <<<"$face_help"
+          grep -qF "GNU long options:" <<<"$face_help"
+          face_help="$("$face_dir/sh" --help)"
+          grep -qF "GNU bash, version" <<<"$face_help"
+          grep -qF "GNU long options:" <<<"$face_help"
+          face_version="$("$face_dir/bash" --version)"
+          grep -qF "GNU bash, version" <<<"$face_version"
+          face_version="$("$face_dir/sh" --version)"
+          grep -qF "GNU bash, version" <<<"$face_version"
+          [ "$("$face_dir/bash" -c 'echo $0')" = "bash" ]
+          [ "$("$face_dir/sh" -c 'echo $0')" = "sh" ]
+          [ "$("$bin" -c 'echo $0')" = "niu" ]
+
           # Record the libc floor this binary actually requires.
           ldd --version | head -1
 
@@ -812,7 +871,7 @@ jobs:
           fi
           arch -x86_64 /usr/bin/true
 
-      # HONEST GATE — same four checks as build-linux, on this OS. The
+      # HONEST GATE — same five checks as build-linux, on this OS. The
       # x86_64 leg runs them through `arch -x86_64` (Rosetta). The prefix
       # is an unquoted string (not an array): macOS steps may run under
       # bash 3.2, where expanding an empty array under `set -u` errors.
@@ -855,6 +914,24 @@ jobs:
             printf '%s\n' "$out" >&2
             exit 1
           fi
+
+          face_dir="$RUNNER_TEMP/face"
+          mkdir -p "$face_dir"
+          cp "$bin" "$face_dir/bash"
+          cp "$bin" "$face_dir/sh"
+          face_help="$($prefix "$face_dir/bash" --help)"
+          grep -qF "GNU bash, version" <<<"$face_help"
+          grep -qF "GNU long options:" <<<"$face_help"
+          face_help="$($prefix "$face_dir/sh" --help)"
+          grep -qF "GNU bash, version" <<<"$face_help"
+          grep -qF "GNU long options:" <<<"$face_help"
+          face_version="$($prefix "$face_dir/bash" --version)"
+          grep -qF "GNU bash, version" <<<"$face_version"
+          face_version="$($prefix "$face_dir/sh" --version)"
+          grep -qF "GNU bash, version" <<<"$face_version"
+          [ "$($prefix "$face_dir/bash" -c 'echo $0')" = "bash" ]
+          [ "$($prefix "$face_dir/sh" -c 'echo $0')" = "sh" ]
+          [ "$($prefix "$bin" -c 'echo $0')" = "niu" ]
 
           # Record what this binary was smoke-verified on.
           sw_vers

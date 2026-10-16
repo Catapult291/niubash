@@ -47,7 +47,7 @@ Each tarball unpacks to a single `niubash-v{ver}-{os}-{arch}/` directory;
     `__rlimit_resource_t` typedef, which broke both targets while the
     glibc-only `cross-check` stayed green (rubash#449).
   - `cross-target-smoke` builds the musl binary `--release` and runs the
-    **same four checks as the glibc legs** (see "The smoke gate" below)
+    **four baseline checks from the glibc legs** (see "The smoke gate" below)
     against it, natively — a static musl x86_64 binary runs on the glibc
     runner, so unlike the ohos target it can carry the real gate, not just
     a compile check. It first asserts the binary is actually static (`ldd`
@@ -95,8 +95,13 @@ uploads, before anything is uploaded**:
    `NIU_PLUGIN_SPEC`, `niu plugin sync --bootstrap` must exit 0 with zero
    output and touch no network.
 
+5. Invocation-face checks: renamed `bash` and `sh` binaries must print GNU
+   `--help` and `--version`, and bind default `$0` to the invoked face.
+   The plain `niu` face must retain `$0 = niu`. Windows verifies the staged
+   package shims and also checks that `niu --help` keeps the product help.
+
 Any failure fails the job, so no artifact can leave it. The macOS x86_64 leg
-runs all four through Rosetta 2. The release body tells users every artifact
+runs all five through Rosetta 2. The release body tells users every artifact
 was "smoke-verified on each build OS" — that sentence is only true while
 this gate stays in the workflow between build and upload.
 

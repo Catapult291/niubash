@@ -513,6 +513,136 @@ fn niu_reports_niu_as_interactive_shell_zero() {
 }
 
 #[test]
+fn invocation_face_from_argv0_preserves_help_version_and_name_precedence() {
+    let temp = unique_temp_dir("niubash-host-argv0-face");
+    let home = temp.join("home");
+    let bin = temp.join("bin");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+
+    let run = |target: &Path, args: &[&str], forwarded: Option<&str>| {
+        let mut command = Command::new(target);
+        command
+            .args(args)
+            .current_dir(&home)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env_remove("NIU_INVOKED_AS")
+            .env_remove("BASH_ARGV0")
+            .env_remove("BASH_ENV")
+            .env_remove("ENV");
+        if let Some(face) = forwarded {
+            command.env("NIU_INVOKED_AS", face);
+        }
+        let output = command
+            .output()
+            .unwrap_or_else(|err| panic!("spawn {} {args:?}: {err}", target.display()));
+        assert_success(&output, &format!("{} {args:?}", target.display()));
+        assert!(
+            output.stderr.is_empty(),
+            "{} {args:?}: stderr: {}",
+            target.display(),
+            normalize_text(&output.stderr)
+        );
+        normalize_text(&output.stdout)
+    };
+
+    for face in ["bash", "sh"] {
+        let file_name = if cfg!(windows) {
+            format!("{face}.exe")
+        } else {
+            face.to_string()
+        };
+        let target = bin.join(file_name);
+        std::fs::copy(niu_binary(), &target).unwrap();
+
+        let stdout = run(&target, &["--help"], None);
+        assert!(
+            stdout.contains("GNU bash, version") && stdout.contains("GNU long options:"),
+            "{face} --help did not print the GNU usage form:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("Usage:\t{face} ")),
+            "{face} --help usage did not name the invocation face:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("Niubash ") && !stdout.contains("Usage:  niu"),
+            "{face} --help leaked the product help:\n{stdout}"
+        );
+
+        let stdout = run(&target, &["--version"], None);
+        assert!(
+            stdout.contains("GNU bash, version") && !stdout.contains("Niubash "),
+            "{face} --version did not print the GNU version:\n{stdout}"
+        );
+
+        for forwarded in [
+            None,
+            Some(if face == "bash" { "sh" } else { "bash" }),
+            Some("niu"),
+        ] {
+            let expected = forwarded.unwrap_or(face);
+            if forwarded.is_some() {
+                let stdout = run(&target, &["--help"], forwarded);
+                if expected == "niu" {
+                    assert!(
+                        stdout.contains("Niubash ") && !stdout.contains("GNU bash, version"),
+                        "{face} with NIU_INVOKED_AS=niu --help:\n{stdout}"
+                    );
+                } else {
+                    assert!(
+                        stdout.contains(&format!("Usage:\t{expected} ")),
+                        "{face} with NIU_INVOKED_AS={expected}:\n{stdout}"
+                    );
+                }
+                let stdout = run(&target, &["--version"], forwarded);
+                assert_eq!(
+                    stdout.contains("Niubash "),
+                    expected == "niu",
+                    "{face} with NIU_INVOKED_AS={expected} --version:\n{stdout}"
+                );
+                assert_eq!(
+                    stdout.contains("GNU bash, version"),
+                    expected != "niu",
+                    "{face} with NIU_INVOKED_AS={expected} --version:\n{stdout}"
+                );
+            }
+            for prefix in [vec!["-c"], vec!["-o", "posix", "-c"]] {
+                let mut args = prefix;
+                args.push("printf '%s|%s' \"$0\" \"$1\"");
+                assert_eq!(
+                    run(&target, &args, forwarded),
+                    format!("{expected}|"),
+                    "{face} with NIU_INVOKED_AS={forwarded:?}: default $0"
+                );
+                args.extend(["explicit-command-name", "argument"]);
+                assert_eq!(
+                    run(&target, &args, forwarded),
+                    "explicit-command-name|argument",
+                    "{face} with NIU_INVOKED_AS={forwarded:?}: explicit -c name"
+                );
+            }
+        }
+    }
+
+    let target = niu_binary();
+    let stdout = run(&target, &["--help"], None);
+    assert!(stdout.contains("Niubash "), "niu --help: {stdout}");
+    let stdout = run(&target, &["--version"], None);
+    assert!(
+        stdout.contains("Niubash ") && !stdout.contains("GNU bash, version"),
+        "niu --version: {stdout}"
+    );
+    assert_eq!(
+        run(&target, &["-c", "printf %s \"$0\""], Some("sh")),
+        "sh",
+        "explicit NIU_INVOKED_AS must override the niu executable name"
+    );
+
+    let _ = std::fs::remove_dir_all(temp);
+}
+
+#[test]
 fn starship_receives_bash_shell_identity() {
     let temp = unique_temp_dir("niubash-host-starship-shell");
     let home = temp.join("home");
