@@ -513,6 +513,45 @@ fn niu_reports_niu_as_interactive_shell_zero() {
 }
 
 #[test]
+fn interactive_alias_defaults_and_explicit_disable_reach_command_mode() {
+    let temp = unique_temp_dir("niubash-host-interactive-alias");
+    std::fs::create_dir_all(&temp).unwrap();
+    let probe = "if shopt -q expand_aliases; then printf on; else printf off; fi";
+    for (arguments, expected) in [
+        (vec!["--norc", "-i", "-c", probe], "on"),
+        (
+            vec!["--norc", "-i", "+O", "expand_aliases", "-c", probe],
+            "off",
+        ),
+        (
+            vec!["--norc", "+O", "expand_aliases", "-i", "-c", probe],
+            "off",
+        ),
+        (vec!["--norc", "-c", probe], "off"),
+        (
+            vec!["--norc", "-i", "-c", "alias ll='printf alias-%s done'\nll"],
+            "alias-done",
+        ),
+    ] {
+        let output = Command::new(niu_binary())
+            .args(&arguments)
+            .current_dir(&temp)
+            .env("HOME", &temp)
+            .env("USERPROFILE", &temp)
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
+            .env_remove("NIU_INVOKED_AS")
+            .env_remove("BASH_ARGV0")
+            .output()
+            .unwrap();
+        assert_success(&output, &format!("{arguments:?}"));
+        assert_eq!(normalize_text(&output.stdout), expected, "{arguments:?}");
+        assert!(output.stderr.is_empty(), "{arguments:?}: {output:?}");
+    }
+    let _ = std::fs::remove_dir_all(temp);
+}
+
+#[test]
 fn invocation_face_from_argv0_preserves_help_version_and_name_precedence() {
     let temp = unique_temp_dir("niubash-host-argv0-face");
     let home = temp.join("home");

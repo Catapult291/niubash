@@ -165,6 +165,7 @@ pub struct Shell {
     pub line_editor: Option<Reedline>,
     process_stdin_pipeline_bridge: bool,
     bash_prompt_command_running: bool,
+    interactive_lines_read: usize,
     // True once this shell enters the interactive REPL. Easter eggs are
     // routed only from here so `niu -c`, script files, and piped stdin stay
     // quiet and deterministic.
@@ -550,6 +551,7 @@ impl Shell {
             line_editor: None,
             process_stdin_pipeline_bridge: false,
             bash_prompt_command_running: false,
+            interactive_lines_read: 0,
             interactive: false,
             no_rc: false,
             no_profile: false,
@@ -721,7 +723,19 @@ impl Shell {
         // expand_aliases on so ~/.niubashrc aliases expand without a
         // user shopt line. Non-interactive entry points never call
         // this, keeping the GNU off default for scripts and -c.
-        self.executor.set_shopt_option("expand_aliases", true);
+        let expand_aliases = self
+            .startup_invocation
+            .as_ref()
+            .and_then(|invocation| {
+                invocation
+                    .shopt_flags
+                    .iter()
+                    .rev()
+                    .find_map(|(name, enabled)| (name == "expand_aliases").then_some(*enabled))
+            })
+            .unwrap_or(true);
+        self.executor
+            .set_shopt_option("expand_aliases", expand_aliases);
         // Reedline owns interactive history (see the construction-site note):
         // disable the engine's Bash history machinery only on the REPL path
         // so HISTFILE cannot create a second, competing history stream.
@@ -748,60 +762,21 @@ impl Shell {
 
     /// Execute a single input line via rubash. Returns the exit code.
     pub fn execute_line(&mut self, line: &str) -> anyhow::Result<i32> {
-        self.execute_line_with_options(line, false)
+        self.execute_line_with_options(line, false, 0)
     }
 
-    /// unixwin/rubash#365: interactive batches that are not a single simple
-    /// command run through the engine's grouped reader instead of the
-    /// whole-buffer tokenize+parse fast path.
-    ///
-    /// GNU expands aliases while READING, one complete command at a time:
-    /// the `read_token_word` tail checks `expand_aliases && quoted == 0`
-    /// before `alias_expand_token` (parse.y:5756; the `quoted` flag is set
-    /// by ANY backslash or quote in the word, parse.y:5321-5324 and the
-    /// backslash arm 5366-5397), and the reader parses each command before
-    /// executing it (shell.c reader_loop / evalstring.c parse_and_execute).
-    /// A function body is therefore alias-checked once, against the table
-    /// live at DEFINITION time, and never again when the body runs — so
-    /// `f() { \cd "$@"; }` followed by `alias cd=f` keeps calling the
-    /// builtin cd inside f, and `\`/`command` suppression is only the
-    /// explicit spelling of that read-time rule.
-    ///
-    /// rubash's tokenize+parse fast path cannot consult the table at parse
-    /// time, so the executor expands aliases at EXECUTION time against the
-    /// live table (`expand_aliases_with_raw` over bodies flagged
-    /// UNSTREAMED_FUNCTION_BODIES). For one simple command the table
-    /// cannot change between parse and execution, so the fast path is
-    /// equivalent. A batch with command separators (newline / `;` / `&&` /
-    /// `||` / `&`), compound syntax, or a function definition (the grammar
-    /// forces `;` or a newline before `}`) can diverge twice over: the
-    /// body's words are re-checked against a LATER table (plain `cd`
-    /// bodies recursed too, not just `\cd`), and the executor-level
-    /// quote test (`raw_word_is_quoted`) does not count a bare backslash
-    /// as quoting, so the `\cmd` suppression idiom (fnm/nvm/zoxide cd
-    /// hooks) expanded and recursed f -> f -> ... until the stack
-    /// overflowed (rubash#365, niu `-C` multi-line reproducer).
-    ///
-    /// Those batches take the same grouped driver rubash's own `-i -c`
-    /// uses (`script_driver::run_script_with_history`, selected by
-    /// `alias_live_at_start` in main.rs run_one_command): each command
-    /// group's text is alias-expanded against the table live at read time
-    /// (GNU parse-time semantics, including `\` suppression via
-    /// lexer::alias_stream scan_word) and the executed result is marked
-    /// `__RUBASH_ALIAS_STREAMED` so nothing expands a second time.
-    /// Whitelist admission, not a symptom blacklist (AGENTS
-    /// no-whack-a-mole): only input that is provably a single simple
-    /// command keeps the host fast path — anything with a separator or
-    /// compound token falls through to the real reader, and a false
-    /// positive in the whitelist only costs the driver's speed. The
-    /// winuxcmd grep shim and the Windows drive-arg AST normalizations
-    /// are host fast-path extras that this engine route does not apply;
-    /// single simple commands (the REPL's common case) keep them.
-    fn execute_interactive_reader_batch(&mut self, script: &str, tokens: &[Token]) -> Option<i32> {
+    /// Read alias-bearing interactive input through the engine's grouped reader.
+    /// Each submission is a fresh read boundary, even when its line number is one.
+    fn execute_interactive_reader_batch(
+        &mut self,
+        script: &str,
+        tokens: &[Token],
+        line_offset: usize,
+    ) -> Option<i32> {
         if !self.interactive || !self.executor.alias_expansion_enabled() {
             return None;
         }
-        let single_simple_command = !tokens.iter().any(|token| {
+        let needs_reader = tokens.iter().any(|token| {
             matches!(
                 token.kind,
                 TokenKind::Semicolon
@@ -809,12 +784,17 @@ impl Shell {
                     | TokenKind::Or
                     | TokenKind::Background
                     | TokenKind::Keyword
-            )
+            ) || self.aliases.contains_key(&token.value)
         });
-        if single_simple_command {
+        if !needs_reader {
             return None;
         }
-        let code = rubash::script_driver::run_script_with_history(&mut self.executor, script, None);
+        let code = rubash::script_driver::run_script_with_history_at_line_offset(
+            &mut self.executor,
+            script,
+            line_offset,
+            None,
+        );
         self.sync_process_cwd_from_executor_pwd();
         self.sync_process_path_from_executor_path();
         self.sync_alias_mirror_from_executor();
@@ -825,8 +805,13 @@ impl Shell {
         &mut self,
         line: &str,
         interactive_terminal_colors: bool,
+        line_offset: usize,
     ) -> anyhow::Result<i32> {
-        let line = line.trim();
+        let line = if interactive_terminal_colors {
+            line
+        } else {
+            line.trim()
+        };
         if line.is_empty() {
             return Ok(0);
         }
@@ -836,11 +821,13 @@ impl Shell {
         if tokens.is_empty() {
             return Ok(0);
         }
-        // rubash#365: alias-live interactive batches that are not a single
-        // simple command need GNU's read-time alias semantics — see
-        // execute_interactive_reader_batch.
-        if let Some(code) = self.execute_interactive_reader_batch(&line, &tokens) {
+        if let Some(code) = self.execute_interactive_reader_batch(&line, &tokens, line_offset) {
             return Ok(code);
+        }
+        for token in &mut tokens {
+            token.position += line_offset;
+            token.column += line_offset;
+            token.logical_line += line_offset;
         }
         rewrite_winuxcmd_command_shims(&mut tokens, interactive_terminal_colors);
 
@@ -910,7 +897,9 @@ impl Shell {
     pub fn execute_interactive_line(&mut self, line: &str) -> anyhow::Result<i32> {
         let old_pwd = self.executor.get_env("PWD").map(str::to_owned);
         self.run_preexec_hooks(line);
-        let code = self.execute_line_with_options(line, true)?;
+        let line_offset = self.interactive_lines_read;
+        self.interactive_lines_read += line.split_inclusive('\n').count().max(1);
+        let code = self.execute_line_with_options(line, true, line_offset)?;
         self.run_postcmd_hooks(code);
         self.run_zshaddhistory_hooks(line);
         self.remember_interactive_command(line, code);
@@ -927,7 +916,9 @@ impl Shell {
     pub fn execute_interactive_script(&mut self, script: &str) -> anyhow::Result<i32> {
         let old_pwd = self.executor.get_env("PWD").map(str::to_owned);
         self.run_preexec_hooks(script);
-        let code = self.execute_script_with_options(script, true)?;
+        let line_offset = self.interactive_lines_read;
+        self.interactive_lines_read += script.split_inclusive('\n').count().max(1);
+        let code = self.execute_script_with_options(script, true, line_offset)?;
         self.remember_interactive_command(script, code);
         let new_pwd = self.executor.get_env("PWD").map(str::to_owned);
         if let (Some(old_pwd), Some(new_pwd)) = (old_pwd, new_pwd) {
@@ -2044,15 +2035,20 @@ impl Shell {
     /// This enables heredocs, line continuations (backslash-newline),
     /// and multi-line compound commands (if/for/while across lines).
     pub fn execute_script(&mut self, script: &str) -> anyhow::Result<i32> {
-        self.execute_script_with_options(script, false)
+        self.execute_script_with_options(script, false, 0)
     }
 
     fn execute_script_with_options(
         &mut self,
         script: &str,
         interactive_terminal_colors: bool,
+        line_offset: usize,
     ) -> anyhow::Result<i32> {
-        let script = script.trim();
+        let script = if interactive_terminal_colors {
+            script
+        } else {
+            script.trim()
+        };
         if script.is_empty() {
             return Ok(0);
         }
@@ -2137,8 +2133,13 @@ impl Shell {
         // semantics for the same reasons as the line route above; the
         // non-interactive legs above already use this driver for
         // alias/history-bearing scripts.
-        if let Some(code) = self.execute_interactive_reader_batch(&script, &tokens) {
+        if let Some(code) = self.execute_interactive_reader_batch(&script, &tokens, line_offset) {
             return Ok(code);
+        }
+        for token in &mut tokens {
+            token.position += line_offset;
+            token.column += line_offset;
+            token.logical_line += line_offset;
         }
         rewrite_winuxcmd_command_shims(&mut tokens, interactive_terminal_colors);
 
@@ -4746,6 +4747,132 @@ complete -F _envtooldyn_hook envtooldyn
         assert!(lines.is_empty(), "{lines:?}");
     }
     #[test]
+    fn interactive_lineno_advances_across_fast_reader_and_multiline_inputs() {
+        let _env_lock = PROCESS_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _cwd_guard = CwdGuard::capture();
+        let temp = unique_temp_dir("niubash-interactive-line-base");
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut shell = test_shell(HookConfig::default());
+        shell.history_path = temp.join("history");
+        shell.enter_interactive();
+        shell.execute_interactive_line("FIRST=$LINENO").unwrap();
+        shell
+            .execute_interactive_line("alias mark='SECOND=$LINENO'")
+            .unwrap();
+        shell.execute_interactive_line("mark").unwrap();
+        shell
+            .execute_interactive_script("\nFOURTH=$LINENO\nFIFTH=$LINENO\n")
+            .unwrap();
+        shell.execute_interactive_line("SIXTH=$LINENO").unwrap();
+        for (name, expected) in [
+            ("FIRST", "1"),
+            ("SECOND", "3"),
+            ("FOURTH", "5"),
+            ("FIFTH", "6"),
+            ("SIXTH", "7"),
+        ] {
+            assert_eq!(shell.executor.get_env(name), Some(expected), "{name}");
+        }
+        shell
+            .execute_interactive_line("shopt -u expand_aliases")
+            .unwrap();
+        shell.execute_interactive_line("OFF_LINE=$LINENO").unwrap();
+        assert_eq!(shell.executor.get_env("OFF_LINE"), Some("9"));
+        drop(shell);
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn interactive_alias_cli_disable_survives_repl_entry() {
+        let _env_lock = PROCESS_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _cwd_guard = CwdGuard::capture();
+        let temp = unique_temp_dir("niubash-alias-cli-disable");
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut shell = test_shell(HookConfig::default());
+        shell.history_path = temp.join("history");
+        let invocation = rubash::invocation::ShellInvocation::parse(&[
+            "-i".into(),
+            "+O".into(),
+            "expand_aliases".into(),
+        ])
+        .unwrap();
+        shell.apply_invocation_before_startup(&invocation).unwrap();
+        shell.enter_interactive();
+        assert!(!shell.executor.alias_expansion_enabled());
+        drop(shell);
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn interactive_same_line_alias_waits_for_next_submission() {
+        let _env_lock = PROCESS_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _cwd_guard = CwdGuard::capture();
+        let temp = unique_temp_dir("niubash-alias-read-boundary");
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut shell = test_shell(HookConfig::default());
+        shell.history_path = temp.join("history");
+        shell.enter_interactive();
+        assert_eq!(
+            shell
+                .execute_interactive_line(
+                    "alias nextprompt='NIU_ALIAS_BOUNDARY_RESULT=next'; nextprompt"
+                )
+                .unwrap(),
+            127
+        );
+        assert!(shell
+            .executor
+            .get_env("NIU_ALIAS_BOUNDARY_RESULT")
+            .is_none());
+        assert_eq!(shell.execute_interactive_line("nextprompt").unwrap(), 0);
+        assert_eq!(
+            shell.executor.get_env("NIU_ALIAS_BOUNDARY_RESULT"),
+            Some("next")
+        );
+        drop(shell);
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn live_alias_executes_after_separate_interactive_submissions() {
+        let _env_lock = PROCESS_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _cwd_guard = CwdGuard::capture();
+        let temp = unique_temp_dir("niubash-live-alias");
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut shell = test_shell(HookConfig::default());
+        shell.history_path = temp.join("history");
+        shell.enter_interactive();
+        assert_eq!(
+            shell
+                .execute_interactive_line("alias ll='NIU_LIVE_ALIAS_RESULT=expanded'")
+                .unwrap(),
+            0
+        );
+        assert!(shell.executor.alias_expansion_enabled());
+        assert!(shell.executor.get_env("__RUBASH_ALIAS_STREAMED").is_none());
+        assert_eq!(
+            shell.aliases.get("ll").map(String::as_str),
+            Some("NIU_LIVE_ALIAS_RESULT=expanded")
+        );
+        assert_eq!(shell.execute_interactive_line("alias ll").unwrap(), 0);
+        assert_eq!(shell.execute_interactive_line("ll").unwrap(), 0);
+        assert_eq!(
+            shell.executor.get_env("NIU_LIVE_ALIAS_RESULT"),
+            Some("expanded")
+        );
+        drop(shell);
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn alias_mirror_tracks_successful_interactive_alias_commands() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _cwd_guard = CwdGuard::capture();
@@ -5916,6 +6043,7 @@ complete -F _envtooldyn_hook envtooldyn
             line_editor: None,
             process_stdin_pipeline_bridge: false,
             bash_prompt_command_running: false,
+            interactive_lines_read: 0,
             interactive: false,
             no_rc: false,
             no_profile: false,
