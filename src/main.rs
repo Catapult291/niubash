@@ -355,13 +355,14 @@ fn dispatch_launcher_word(args: &[String], index: usize) -> anyhow::Result<()> {
     let rest = &args[index + 1..];
     // niubash#585 host half (the engine half is rubash#596, printed through
     // the shared `rubash::usage` since rubash#606): GNU keys --help and
-    // --version off argv[0]'s basename, and the shim forwards this process's
-    // invocation face in NIU_INVOKED_AS - so `bash --help` answers with the
+    // --version off argv[0]'s basename, so `bash --help` answers with the
     // GNU usage form and `bash --version` with the GNU version banner, byte
     // for byte what the engine binary prints, while every niu-face
     // invocation keeps the product surfaces. -h/-V are deliberately NOT
     // forked (GNU -h is hashall, not help - rubash#596's oracle finding).
-    let invocation_face = std::env::var("NIU_INVOKED_AS").ok();
+    let invocation_face = std::env::var("NIU_INVOKED_AS")
+        .ok()
+        .or_else(|| args.first().cloned());
     let face_name = rubash::usage::invocation_help_name(invocation_face.as_deref());
     match word {
         "--help" if face_name.is_some() => {
@@ -1413,6 +1414,20 @@ fn print_usage() {
     );
     println!("      --cwd-state <file>       Restore the recorded directory at startup and");
     println!("                               record the final directory back on exit");
+    println!();
+    println!("Bash-compatible invocation options (GNU semantics, parsed by the engine):");
+    println!("  -i                        Force interactive");
+    println!("  -l, --login               Act as a login shell");
+    println!("  -s                        Read commands from standard input");
+    println!("  -o <option>               Set a `set -o` option (e.g. -o posix)");
+    println!("  -O <shopt>                Set a `shopt` option (e.g. -O extglob)");
+    println!("  -abefhkmnprtuvxBCEHPT     GNU single-letter shell options (e.g. -e -u -x)");
+    println!("  GNU long options:");
+    for name in rubash::usage::LONG_OPTIONS {
+        println!("    --{name}");
+    }
+    println!("  Invoke the binary as `bash` or `sh` (shim or symlink) for the full");
+    println!("  byte-for-byte GNU usage form: `bash --help`.");
     println!();
     println!("  --install-wt-profile      Add/update the Windows Terminal profile");
     println!("      --set-default         Also set Niubash as the WT default profile");

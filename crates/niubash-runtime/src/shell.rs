@@ -197,10 +197,15 @@ pub struct StdinCurrentShellChild {
 /// shim forwards its argv[0] stem in NIU_INVOKED_AS, so `sh -c 'echo $0'`
 /// prints `sh` (or `-sh` for a login-marked name), not niu — and since
 /// rubash#598 the same forward carries the bash/rbash faces, so
-/// `bash -c 'echo $0'` prints `bash`. Any other invocation (plain niu, an
-/// unrecognized stem) keeps the historical `niu` default byte-for-byte.
+/// `bash -c 'echo $0'` prints `bash`. Without a shim, argv[0] supplies
+/// the face. Other invocations keep the historical `niu` default.
 fn default_script_name() -> String {
-    default_script_name_from(std::env::var("NIU_INVOKED_AS").ok())
+    let forwarded = std::env::var("NIU_INVOKED_AS").ok().or_else(|| {
+        std::env::args_os()
+            .next()
+            .map(|arg| arg.to_string_lossy().into_owned())
+    });
+    default_script_name_from(forwarded)
 }
 
 /// Consume the shim-forwarded invocation name out of the process
