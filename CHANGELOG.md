@@ -4,7 +4,22 @@ All notable changes to Niubash are documented in this file.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **dirname/basename**: slash-shaped operands stay verbatim — `dirname /a/b`
+  reports `/a` instead of a drive spelling such as `A:`; the slash-drive
+  argument mask now covers the filesystem-blind string tools
+  (unixwin/niubash#346).
+
+### Changed
+
+- **Windows path contract**: the bundled WinuxCmd coreutils own the shell tree —
+  they receive the shell's POSIX spellings verbatim and resolve them in-child —
+  while every other child, native or a foreign POSIX runtime such as MSYS2 or
+  Cygwin, always receives native Windows paths, with no per-child probe and no
+  `MSYS_NO_PATHCONV`-style switch (unixwin/niubash#346). This rides the
+  WinuxCmd shell-tree layer, so the bundled WinuxCmd pin must be bumped in the
+  same release.
 
 ## [1.4.0] - 2026-10-10
 
