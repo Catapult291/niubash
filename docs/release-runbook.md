@@ -53,7 +53,7 @@ rules and the failure catalog earned by the v1.4.0 ignition campaign
 - [ ] For the current WinuxCmd pin, download both `*-win-x64.zip` and
       `*-win-arm64.zip`, verify their SHA-256 values against the GitHub release
       API, and keep the exact values in `scripts/release/winuxcmd-pin.json`.
-      The v1.1.9 pin was verified on 2026-10-16.
+   The v1.1.10 pin was verified on 2026-10-16.
 - [ ] CHANGELOG folded for everything user-visible since the last tag.
 - [ ] Local install smoke of the previous release still upgrades (the
       installer lane has its own R1-R7 risk list, docs/store/).

@@ -1,14 +1,14 @@
 {
   "schema": 1,
-  "winuxcmd_tag": "v1.1.9",
+  "winuxcmd_tag": "v1.1.10",
   "description": "WinuxCmd release pin for niubash releases (niubash#312). Tag-push releases bundle exactly this WinuxCmd tag: the workflow downloads the matching WinuxCmd-*-win-<arch>.zip asset and fails unless its SHA-256 equals the value recorded here. workflow_dispatch releases must instead pass the same information explicitly via the winuxcmd_tag and winuxcmd_sha256 inputs; this file is then only the reference for what the last pinned release used.",
   "sha256": {
-    "windows-x64": "62f38b1c912de0e26ffac7eb120ab3f46bc6ad6eeeb2720eca5a68e2cee34a10",
-    "windows-arm64": "f7082caac3299ac1680ef248c1de9f41eb237bc889d332ad1031c7414bee948b"
+    "windows-x64": "ad89b883c49e78a420566a5b30e2f038373bdd0cfd145d911e7b433f749b0231",
+    "windows-arm64": "b2498c39b7e9efecfa841062f980f3535a2b5ce97b9041afabfd5aa51cc9d508"
   },
   "notes": [
     "The hashes cover the WinuxCmd-<version>-win-<arch>.zip release assets (the only format the release bundles), not the .7z/.tar.gz/setup.exe variants.",
-    "Recorded from WinuxCmd v1.1.9 (2026-10-16); both values were verified against full re-downloads of the release assets and the GitHub release API digests.",
+    "Recorded from WinuxCmd v1.1.10 (2026-10-16); both values were verified against the published ZIP assets and GitHub release API digests.",
     "The previous pin was WinuxCmd v1.1.7 (2026-10-13); this bump intentionally picks up the release containing the merged shell-tree changes.",
     "Bumping the pin is a deliberate release decision: update winuxcmd_tag and both sha256 values together, and rerun a release so the bundled engine changes intentionally."
   ]
