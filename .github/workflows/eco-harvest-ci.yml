@@ -11,10 +11,19 @@ on:
     inputs:
       tier:
         description: "harvest 层级: t1|t2|t3|t4|t5|all"
-        default: "t1"
+        default: "all"
       test_tiers:
         description: "test 层级（windows runner）"
-        default: "t1"
+        default: "all"
+      test_limit:
+        description: "每轮最多测试资产数"
+        default: "400"
+      stale_limit:
+        description: "未测/暂态之后，最多重测旧版本资产数"
+        default: "80"
+      test_seconds:
+        description: "测试派发时间预算（秒；到期等待在途完成）"
+        default: "2400"
       redo:
         description: "重测已有 verdict 的资产（--redo，用于验证取数链路）"
         default: "false"
@@ -66,22 +75,25 @@ jobs:
           git config user.name "eco-bot"
           git config user.email "actions@github.com"
           git add state manifest
-          git commit -qm "state+manifest: ${{ github.event.inputs.tier || 't1' }} @ $(date -u +%FT%TZ)"
+          git commit -qm "state+manifest: ${{ github.event.inputs.tier || 'all' }} @ $(date -u +%FT%TZ)"
           git push -q --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" eco-harvest-state:eco-harvest-state
 
   test:
     needs: harvest
     runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4 # niubash：eco 脚本 + the shell under test
       # The sibling path matters: Cargo.toml patches rubash to ../rubash
       # (same step the main ci.yml windows job uses).
       - name: clone rubash as the ../rubash sibling dependency
-        run: git clone --depth 1 https://github.com/${{ github.repository_owner }}/rubash.git "${{ github.workspace }}/../rubash"
+        run: git clone --depth 1 --branch master https://github.com/${{ github.repository_owner }}/rubash.git "${{ github.workspace }}/../rubash"
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - name: install test deps
         run: pip install pyte pywinpty # pywinpty 提供的模块名就是 winpty
+      - name: safe scheduling and migration fixtures (no asset execution)
+        run: python -m unittest discover -s scripts/harvest -p "test_*.py" -v
       - name: build engine
         run: cargo build --release --manifest-path "${{ github.workspace }}/../rubash/Cargo.toml"
       # The interactive lane needs the SHELL, not just the engine: rubash's
@@ -93,30 +105,51 @@ jobs:
         run: cargo build --release --locked
       - name: locate binaries
         id: bins
-        shell: pwsh
+        shell: python {0}
         run: |
-          $rubashDir = "${{ github.workspace }}/../rubash/target/release"
-          $rubash = Get-ChildItem $rubashDir -Filter 'rubash.exe' | Select-Object -First 1
-          $niu = Get-Item "${{ github.workspace }}/target/release/niu.exe" -ErrorAction SilentlyContinue
-          if (-not $rubash) { throw "rubash.exe not built in $rubashDir" }
-          if (-not $niu) { throw "niu.exe not built in ${{ github.workspace }}/target/release" }
-          "niu=$($niu.FullName)" >> $env:GITHUB_OUTPUT
-          "rubash=$($rubash.FullName)" >> $env:GITHUB_OUTPUT
+          import os
+          import subprocess
+          from pathlib import Path
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for name, checkout in (("niu", root), ("rubash", root.parent / "rubash")):
+                  binary = checkout / "target" / "release" / (name + ".exe")
+                  if not binary.is_file():
+                      raise SystemExit(f"missing binary: {binary}")
+                  revision = subprocess.check_output(
+                      ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+                  output.write(f"{name}={binary}\n{name}_revision={revision}\n")
       - name: download manifest
         uses: actions/download-artifact@v4
         with: { name: eco-manifest, path: eco }
       - name: run tester (untrusted assets, ephemeral runner)
+        shell: python {0}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ECO_TEST_TIERS: ${{ github.event.inputs.test_tiers || 'all' }}
+          ECO_TEST_LIMIT: ${{ github.event.inputs.test_limit || '400' }}
+          ECO_STALE_LIMIT: ${{ github.event.inputs.stale_limit || '80' }}
+          ECO_TEST_SECONDS: ${{ github.event.inputs.test_seconds || '2400' }}
+          ECO_REDO: ${{ github.event.inputs.redo || 'false' }}
+          ECO_NIU: ${{ steps.bins.outputs.niu }}
+          ECO_RUBASH: ${{ steps.bins.outputs.rubash }}
+          ECO_NIU_REVISION: ${{ steps.bins.outputs.niu_revision }}
+          ECO_RUBASH_REVISION: ${{ steps.bins.outputs.rubash_revision }}
         run: |
-          python scripts/harvest/eco-test.py `
-            --tiers "${{ github.event.inputs.test_tiers || 't1' }}" `
-            --niu "${{ steps.bins.outputs.niu }}" `
-            --rubash "${{ steps.bins.outputs.rubash }}" `
-            --manifest-dir eco/manifest `
-            --results-dir eco/results `
-            --cache-dir eco/cache `
-            --tmp-root eco/tmp ${{ github.event.inputs.redo == 'true' && '--redo' || '' }}
+          import os
+          import subprocess
+          import sys
+          command = [sys.executable, "scripts/harvest/eco-test.py",
+                     "--manifest-dir", "eco/manifest", "--results-dir", "eco/results",
+                     "--cache-dir", "eco/cache", "--tmp-root", "eco/tmp"]
+          for flag, key in (("tiers", "ECO_TEST_TIERS"), ("limit", "ECO_TEST_LIMIT"),
+                            ("stale-limit", "ECO_STALE_LIMIT"), ("max-seconds", "ECO_TEST_SECONDS"),
+                            ("niu", "ECO_NIU"), ("rubash", "ECO_RUBASH"),
+                            ("niu-revision", "ECO_NIU_REVISION"), ("rubash-revision", "ECO_RUBASH_REVISION")):
+              command.extend(["--" + flag, os.environ[key]])
+          if os.environ["ECO_REDO"] == "true":
+              command.append("--redo")
+          sys.exit(subprocess.call(command))
           # exit 3 = fetch gate tripped (#356): FETCH-FAILED > 10%, the job
           # must go red instead of shipping a green shell around a dead tier.
       - name: upload verdicts
@@ -141,5 +174,5 @@ jobs:
           git config user.name "eco-bot"
           git config user.email "actions@github.com"
           git add state manifest
-          git commit -qm "manifest+verdicts: ${{ github.event.inputs.test_tiers || 't1' }} @ $(date -u +%FT%TZ)"
+          git commit -qm "manifest+verdicts: ${{ github.event.inputs.test_tiers || 'all' }} @ $(date -u +%FT%TZ)"
           git push -q --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" eco-harvest-state:eco-harvest-state

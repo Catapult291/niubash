@@ -8,7 +8,7 @@ Consumes the manifest produced by scripts/harvest/eco-harvest.py. Per asset:
      gz cache under --cache-dir (dev-box E:/eco-harvest/cache when that drive
      exists, else <repo>/eco/cache — #356); T4 assets get sha256 backfilled),
   2. rubash -n pre-filter,
-  3. if rubash accepts: ConPTY-test in a sandbox `niu -i` (the wt91/journey
+  3. if rubash accepts: ConPTY-test with a temporary HOME in `niu -i` (the wt91/journey
      harness shape: sandbox HOME with a minimal rc, marker-verified input
      delivery, hard timeouts on every phase) — source wall, first prompt
      (marker), ENTER, second ENTER,
@@ -32,6 +32,13 @@ Verdicts:
   FETCH-FAILED              raw fetch failed after retries (resumable)
 
 Results stream to results/test-results.jsonl (one line per asset, flushed).
+Verdicts are keyed by binary SHA256 + checkout SHAs + harness SHA256 + GNU
+oracle availability/version in the
+manifest DB. Legacy verdicts are stale, not current. All tiers are selected
+by default: unseen/transient first, then at most 80 stale assets, at most
+400 total; dispatch stops after 2400 seconds and drains in-flight work.
+Temporary HOME is NOT security isolation: untrusted assets must only run
+on disposable runners, never on the developer host.
 Every line carries a normalized `signature`; `--report` groups the gold
 verdicts (SYNTAX-REJECT-RUBASH-ONLY + HANG) by minimal failing construct —
 each group is one engine bug candidate with its asset list.
@@ -39,7 +46,7 @@ each group is one engine bug candidate with its asset list.
 Usage:
   python scripts/harvest/eco-test.py --tiers t1,t3 --workers 8
   python scripts/harvest/eco-test.py --report            # group the gold
-  python scripts/harvest/eco-test.py --tier all --workers 16  # full run
+  python scripts/harvest/eco-test.py --tiers all --workers 8
 
 Exit codes: 0 clean · 2 setup failure (missing binary / unusable path)
             3 fetch gate tripped (#356: FETCH-FAILED share above
@@ -53,6 +60,7 @@ import collections
 import concurrent.futures
 import datetime as dt
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -65,16 +73,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# Windows-only ConPTY (same pattern as scripts/journey/golden-journey.py).
-if os.name != "nt":
-    print("SKIP: eco-test drives ConPTY (Windows only)")
-    sys.exit(2)
+PtyProcess = None
 
-try:
+
+def load_pty():
+    if os.name != "nt":
+        raise RuntimeError("eco-test drives ConPTY (Windows only)")
     from winpty import PtyProcess
-except ImportError as err:  # pragma: no cover
-    print(f"SKIP: python deps missing ({err}); needs pywinpty")
-    sys.exit(2)
+    return PtyProcess
 
 NOW = lambda: dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -807,10 +813,182 @@ def report(results_path: Path, top: int, include_storms: bool,
     return 0
 
 
+TIERS = ("t1", "t2", "t3", "t4", "t5")
+TRANSIENT = {"FETCH-FAILED", "HARNESS-ERROR", "EXITED"}
+
+
+def build_identity(niu, rubash, niu_revision, rubash_revision, slow_threshold, gnu):
+    def digest(path):
+        with open(path, "rb") as source:
+            return hashlib.file_digest(source, "sha256").hexdigest()
+
+    identity = {
+        "niu_sha256": digest(niu), "rubash_sha256": digest(rubash),
+        "niu_revision": niu_revision, "rubash_revision": rubash_revision,
+        "harness_sha256": digest(Path(__file__)),
+        "slow_threshold": slow_threshold,
+        "gnu_oracle": {
+            "available": gnu.bin is not None,
+            "bin": gnu.bin,
+            "version": gnu.version if gnu.bin is not None else None,
+        },
+    }
+    build_id = hashlib.sha256(json.dumps(
+        identity, sort_keys=True).encode()).hexdigest()
+    return build_id, identity
+
+
+def migrate_verdicts(db, results_path):
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS eco_test_builds (
+            build_id TEXT PRIMARY KEY, identity_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS eco_test_verdicts (
+            content_hash TEXT NOT NULL, build_id TEXT NOT NULL,
+            verdict TEXT NOT NULL, tested_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (content_hash, build_id)
+        );
+        CREATE TABLE IF NOT EXISTS eco_test_meta (
+            key TEXT PRIMARY KEY, value TEXT NOT NULL
+        );
+    """)
+    if db.execute("SELECT 1 FROM eco_test_meta WHERE key='legacy_imported'").fetchone():
+        return
+    latest = {}
+    if results_path.exists():
+        with results_path.open(encoding="utf-8") as source:
+            for line in source:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict) and record.get("content_hash") and record.get("verdict"):
+                    latest[record["content_hash"]] = record
+    with db:
+        db.execute("INSERT OR IGNORE INTO eco_test_builds VALUES (?, ?)",
+                   ("legacy", json.dumps({"version": "unknown"})))
+        for content_hash, verdict in db.execute(
+                "SELECT content_hash, verdict FROM assets WHERE verdict IS NOT NULL"):
+            latest.setdefault(content_hash, {"verdict": verdict})
+        db.executemany(
+            "INSERT OR IGNORE INTO eco_test_verdicts "
+            "(content_hash, build_id, verdict, tested_at) VALUES (?, 'legacy', ?, ?)",
+            [(content_hash, record["verdict"], record.get("ts") or "")
+             for content_hash, record in latest.items()])
+        db.execute("INSERT INTO eco_test_meta VALUES ('legacy_imported', '1')")
+
+
+def select_assets(db, tiers, build_id, limit, stale_limit, redo=False):
+    qmarks = ",".join("?" for tier in tiers)
+    rows = db.execute(
+        "SELECT a.content_hash, a.hash_kind, a.source_url, a.repo, a.path, "
+        "a.commit_sha, a.bytes, a.category, a.tier, "
+        "v.verdict, h.last_tested, h.last_verdict "
+        "FROM assets a LEFT JOIN eco_test_verdicts v "
+        "ON a.content_hash=v.content_hash AND v.build_id=? "
+        "LEFT JOIN (SELECT content_hash, MAX(tested_at) AS last_tested, "
+        "verdict AS last_verdict FROM eco_test_verdicts GROUP BY content_hash) h "
+        "ON a.content_hash=h.content_hash "
+        f"WHERE a.tier IN ({qmarks}) ORDER BY a.path, a.content_hash",
+        [build_id, *tiers]).fetchall()
+    columns = ("content_hash", "hash_kind", "source_url", "repo", "path",
+               "commit", "bytes", "category", "tier")
+    stats = collections.Counter(unseen=0, transient=0, stale=0, current=0)
+    queues = {kind: collections.defaultdict(list) for kind in ("priority", "stale", "redo")}
+    tier_last = collections.defaultdict(str)
+    for row in rows:
+        asset = dict(zip(columns, row[:9]))
+        current, last_tested, last_verdict = row[9:]
+        if last_tested is None:
+            kind = "unseen"
+        elif (current or last_verdict) in TRANSIENT:
+            kind = "transient"
+        elif current is not None:
+            kind = "current"
+        else:
+            kind = "stale"
+        stats[kind] += 1
+        tier = asset["tier"]
+        tier_last[tier] = max(tier_last[tier], last_tested or "")
+        queue = "redo" if redo else "priority" if kind in ("unseen", "transient") else kind
+        if queue in queues:
+            queues[queue][tier].append((last_tested or "", asset))
+
+    def fair_order(groups):
+        active = sorted(groups, key=lambda tier: (tier_last[tier], tier))
+        ordered = {tier: collections.deque(asset for stamp, asset in sorted(
+            groups[tier], key=lambda item: (item[0], item[1]["path"], item[1]["content_hash"])))
+            for tier in active}
+        while active:
+            for tier in active[:]:
+                yield ordered[tier].popleft()
+                if not ordered[tier]:
+                    active.remove(tier)
+
+    capacity = limit or len(rows)
+    selected = []
+    for asset in fair_order(queues["redo" if redo else "priority"]):
+        if len(selected) >= capacity:
+            break
+        selected.append(asset)
+    if not redo:
+        for index, asset in enumerate(fair_order(queues["stale"])):
+            if index >= stale_limit or len(selected) >= capacity:
+                break
+            selected.append(asset)
+    stats["selected"] = len(selected)
+    stats["total"] = len(rows)
+    return selected, dict(stats)
+
+
+def save_verdict(db, record):
+    with db:
+        db.execute(
+            "INSERT INTO eco_test_verdicts "
+            "(content_hash, build_id, verdict, tested_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(content_hash, build_id) DO UPDATE SET "
+            "verdict=excluded.verdict, tested_at=excluded.tested_at, "
+            "attempts=eco_test_verdicts.attempts+1",
+            (record["content_hash"], record["build_id"], record["verdict"], record["ts"]))
+        db.execute("UPDATE assets SET fetched=1, verdict=? WHERE content_hash=?",
+                   (record["verdict"], record["content_hash"]))
+
+
+def run_bounded(assets, workers, max_seconds, run_one):
+    deadline = time.monotonic() + max_seconds if max_seconds else float("inf")
+    remaining = iter(assets)
+    submitted = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        active = set()
+
+        def submit_one():
+            nonlocal submitted
+            if time.monotonic() >= deadline:
+                return False
+            asset = next(remaining, None)
+            if asset is None:
+                return False
+            active.add(pool.submit(run_one, asset))
+            submitted += 1
+            return True
+
+        for worker in range(workers):
+            if not submit_one():
+                break
+        while active:
+            finished, active = concurrent.futures.wait(
+                active, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in finished:
+                future.result()
+                submit_one()
+    return submitted
+
+
 # ── Step summary + fetch gate (the #356 "green job, dead tier" class) ───────
 
 def write_step_summary(counts, tested, results_path, gate_msg=None,
-                       idle_note=None):
+                       idle_note=None, selection=None, build_id=None):
     """Append the verdict distribution to $GITHUB_STEP_SUMMARY (no-op when
     unset, so local runs stay quiet). Six nightly runs reported success with
     547/547 FETCH-FAILED: the distribution has to be visible, not buried in
@@ -819,6 +997,15 @@ def write_step_summary(counts, tested, results_path, gate_msg=None,
     if not path:
         return
     lines = ["## eco-test verdicts", ""]
+    if build_id:
+        lines += [f"Build identity: `{build_id}`", ""]
+    if selection is not None:
+        lines += ["| queue (before run) | count |", "| --- | ---: |"]
+        for key in ("total", "unseen", "transient", "stale", "current", "selected"):
+            lines.append(f"| {key} | {selection[key]} |")
+        lines += [f"| completed | {tested} |",
+                  f"| deferred by time budget | {selection['selected'] - tested} |",
+                  f"| idle | {'yes' if tested == 0 else 'no'} |", ""]
     if gate_msg:
         lines += [f"> 🚨 **fetch gate failed**: {gate_msg}", ""]
     lines += ["| verdict | count |", "| --- | ---: |"]
@@ -842,14 +1029,22 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description="ConPTY-test harvested ecosystem assets (wt92 harvest "
                     "lane); stamp verdict badges into the manifest")
-    ap.add_argument("--tiers", default="t1",
-                    help="comma list of tiers to test (t1,t2,t3,t4,t5)")
+    ap.add_argument("--tiers", default="all",
+                    help="all (default) or comma list of t1,t2,t3,t4,t5")
     ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument("--limit", type=int, default=0,
+    ap.add_argument("--limit", type=int, default=400,
                     help="cap assets tested this run (0 = all pending)")
+    ap.add_argument("--stale-limit", type=int, default=80,
+                    help="old-build retest cap after unseen/transient work")
+    ap.add_argument("--max-seconds", type=float, default=2400,
+                    help="stop dispatch after this budget; drain in-flight work (0 = unlimited)")
     ap.add_argument("--slow-threshold", type=float, default=2.0)
     ap.add_argument("--niu", default=str(DEFAULT_NIU))
     ap.add_argument("--rubash", default=str(DEFAULT_RUBASH))
+    ap.add_argument("--niu-revision", default="unknown",
+                    help="build checkout SHA; binary SHA256 is always included")
+    ap.add_argument("--rubash-revision", default="unknown",
+                    help="actual sibling checkout SHA; not the patched Cargo.lock revision")
     ap.add_argument("--manifest-dir", default=str(ECO_ROOT / "manifest"))
     ap.add_argument("--results-dir", default=str(RESULTS_DIR))
     ap.add_argument("--tmp-root", default=str(TMP_ROOT))
@@ -860,7 +1055,7 @@ def main(argv=None):
                     help="exit 3 when FETCH-FAILED exceeds this share of the "
                          "assets tested this run (0 disables the gate)")
     ap.add_argument("--redo", action="store_true",
-                    help="re-test assets that already have a result line")
+                    help="force all verdicts eligible, ignoring stale cap (overall budgets still apply)")
     ap.add_argument("--report", action="store_true",
                     help="group gold verdicts from existing results; no test")
     ap.add_argument("--top", type=int, default=10)
@@ -895,56 +1090,50 @@ def main(argv=None):
     db = sqlite3.connect(manifest_dir / "eco-manifest.sqlite",
                          check_same_thread=False,
                          timeout=30)  # harvest+test can run concurrently
-    tier_list = [t.strip() for t in args.tiers.split(",") if t.strip()]
-    qmarks = ",".join("?" * len(tier_list))
-
-    done = set()
-    # Transient verdicts are NOT "done": a resume must retry them.
-    # EXITED included: the first pass showed EXITED clusters under high
-    # worker concurrency (16/16 oh-my-bash completions "exited" at
-    # workers=8, all 16 pass serially) — a real exit reproduces; a
-    # concurrency artifact clears on the serial retry.
-    transient = {"FETCH-FAILED", "HARNESS-ERROR", "EXITED"}
-    if results_path.exists() and not args.redo:
-        with open(results_path, encoding="utf-8") as fh:
-            for ln in fh:
-                try:
-                    r = json.loads(ln)
-                except json.JSONDecodeError:
-                    continue
-                if r.get("verdict") not in transient:
-                    done.add(r["content_hash"])
-    # The manifest DB is now persisted run-to-run (#357: it rides the
-    # eco-harvest-state branch), so a RESTORED verdict — not only a local
-    # results file — marks an asset done. Without this every CI run would
-    # re-test the whole corpus from scratch, because eco-results never
-    # survives to the next run. Transient verdicts stay pending: they retry.
-    if not args.redo:
-        done.update(r[0] for r in db.execute(
-            f"SELECT content_hash FROM assets WHERE tier IN ({qmarks}) "
-            f"AND verdict IS NOT NULL AND verdict NOT IN "
-            f"({','.join('?' * len(transient))})",
-            [*tier_list, *sorted(transient)]))
-    rows = db.execute(
-        f"SELECT content_hash, hash_kind, source_url, repo, path, commit_sha, "
-        f"bytes, category, tier FROM assets WHERE tier IN ({qmarks}) "
-        f"ORDER BY tier, path", tier_list).fetchall()
-    cols = ["content_hash", "hash_kind", "source_url", "repo", "path",
-            "commit", "bytes", "category", "tier"]
-    assets = [dict(zip(cols, r)) for r in rows]
-    pending = [a for a in assets if a["content_hash"] not in done]
-    if args.limit:
-        pending = pending[:args.limit]
-    print(f"manifest: {len(assets)} assets in tiers {tier_list}; "
-          f"{len(done)} already tested; {len(pending)} pending")
+    tier_list = list(TIERS) if args.tiers == "all" else list(dict.fromkeys(
+        tier.strip() for tier in args.tiers.split(",") if tier.strip()))
+    if not tier_list or set(tier_list) - set(TIERS):
+        ap.error("--tiers must be all or a comma list of t1,t2,t3,t4,t5")
+    if args.workers < 1 or min(args.limit, args.stale_limit, args.max_seconds) < 0:
+        ap.error("workers must be positive; limits and budget must be non-negative")
 
     niu = Path(args.niu).resolve()
     rubash = Path(args.rubash).resolve()
-    if not niu.exists():
-        print(f"FATAL: niu not found at {niu} (build first: cargo build)")
+    if not niu.is_file() or not rubash.is_file():
+        print(f"FATAL: build binaries first: niu={niu}, rubash={rubash}")
         return 2
-    if not rubash.exists():
-        print(f"FATAL: rubash not found at {rubash}")
+    gnu = GnuBash()
+    if gnu.bin is None:
+        print("WARNING: WSL GNU bash unavailable — parity classification "
+              "degrades (failures keep niu verdicts, no GNU-ALSO-FAILS)")
+    else:
+        print(f"GNU parity oracle: WSL {gnu.version}")
+    build_id, identity = build_identity(
+        niu, rubash, args.niu_revision, args.rubash_revision, args.slow_threshold, gnu)
+    migrate_verdicts(db, results_path)
+    with db:
+        db.execute("INSERT OR IGNORE INTO eco_test_builds VALUES (?, ?)",
+                   (build_id, json.dumps(identity, sort_keys=True)))
+    pending, selection = select_assets(
+        db, tier_list, build_id, args.limit, args.stale_limit, args.redo)
+    print(f"build: {build_id} {json.dumps(identity, sort_keys=True)}")
+    print(f"manifest tiers={tier_list}: " + " ".join(
+        f"{key}={value}" for key, value in selection.items()))
+    if not pending:
+        eligible = selection["unseen"] + selection["transient"] + selection["stale"]
+        idle = ("idle: no eligible assets for this build" if not eligible else
+                "idle: eligible backlog remains, disabled by selection limits")
+        print(idle)
+        write_step_summary({}, 0, results_path, idle_note=idle,
+                           selection=selection, build_id=build_id)
+        db.close()
+        return 0
+
+    global PtyProcess
+    try:
+        PtyProcess = load_pty()
+    except (ImportError, RuntimeError) as err:
+        print(f"SKIP: {err}; execution needs Windows + pywinpty")
         return 2
     tmp_root = Path(args.tmp_root).resolve()
     cache_root = Path(args.cache_dir).resolve()
@@ -969,13 +1158,6 @@ def main(argv=None):
                                    text=True).stdout.strip() or None
         except OSError:
             token = None
-    gnu = GnuBash()
-    if gnu.bin is None:
-        print("WARNING: WSL GNU bash unavailable — parity classification "
-              "degrades (failures keep niu verdicts, no GNU-ALSO-FAILS)")
-    else:
-        print(f"GNU parity oracle: WSL {gnu.version}")
-
     class Cfg:
         pass
     cfg = Cfg()
@@ -990,7 +1172,7 @@ def main(argv=None):
 
     t0 = time.time()
     counts = collections.Counter()
-    lock = threading.Lock()
+    lock = cfg.man.lock
     fh = open(results_path, "a", encoding="utf-8")
     os.environ["ECO_WORKERS"] = str(args.workers)  # report-mode throughput
 
@@ -1002,14 +1184,13 @@ def main(argv=None):
                    "repo": asset["repo"], "path": asset["path"],
                    "tier": asset["tier"], "verdict": "HARNESS-ERROR",
                    "detail": repr(err)[:200]}
+        rec.update(build_id=build_id, build_identity=identity,
+                   ts=dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds"))
         with lock:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             fh.flush()
             counts[rec["verdict"]] += 1
-            db.execute("UPDATE assets SET fetched=1, verdict=? "
-                       "WHERE content_hash=?",
-                       (rec["verdict"], rec["content_hash"]))
-            db.commit()
+            save_verdict(db, rec)
         n = sum(counts.values())
         if n % 25 == 0:
             rate = n / max(time.time() - t0, 1)
@@ -1018,10 +1199,11 @@ def main(argv=None):
                   f"{rate:.2f}/s ETA {eta/60:.0f}m", flush=True)
         return rec
 
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=args.workers) as pool:
-        list(pool.map(run_one, pending))
-    fh.close()
+    try:
+        run_bounded(pending, args.workers, args.max_seconds, run_one)
+    finally:
+        fh.close()
+        db.close()
 
     wall = time.time() - t0
     tested = sum(counts.values())
@@ -1029,9 +1211,8 @@ def main(argv=None):
     print(f"\n== smoke verdict distribution == {dict(counts)}")
     print(f"tested {tested} in {wall:.0f}s -> {rate:.2f} assets/s "
           f"({rate*3600:.0f}/hour) at workers={args.workers}")
-    print(f"projection for the current manifest "
-          f"({len(assets)} assets): {len(assets)/max(rate*3600,1)*24/3600:.2f} "
-          f"days single full pass at this throughput")
+    print(f"selected={len(pending)} completed={tested} "
+          f"deferred_by_time_budget={len(pending) - tested}")
 
     # Fetch gate (#356): raw-fetch death is infrastructure (bad path, bad
     # token, dead CDN), never a property of the assets — and it used to be
@@ -1053,11 +1234,7 @@ def main(argv=None):
             print(f"ERROR: {gate_msg}")
     write_step_summary(
         counts, tested, results_path, gate_msg,
-        idle_note=(f"**nothing pending** — all {len(assets)} assets in tiers "
-                   f"{tier_list} already carry a verdict; this run resumed "
-                   f"from the persisted manifest instead of re-testing "
-                   f"(idle lane, not a fetch failure)." if not pending else
-                   None))
+        selection=selection, build_id=build_id)
     if gate_msg:
         return 3
     return 0
