@@ -52,9 +52,10 @@ fn continuation_double_quote_ps2_and_completes() {
     if !require_pty_or_skip("continuation_double_quote_ps2_and_completes") {
         return;
     }
-    let mut s = NiuSession::spawn("cont-dquote");
+    let rc = format!("{}\nCONT_DQUOTE_OUT=double-line\n", driver::default_rc());
+    let mut s = NiuSession::spawn_custom("cont-dquote", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
     s.wait_ready();
-    s.send_line("echo \"double-line");
+    s.send_line("printf '%s\\n' \"$CONT_DQUOTE_OUT");
     s.expect_continuation();
     s.send_line("closed\"");
     s.expect("double-line");
@@ -69,9 +70,10 @@ fn continuation_single_quote_ps2_and_completes() {
     if !require_pty_or_skip("continuation_single_quote_ps2_and_completes") {
         return;
     }
-    let mut s = NiuSession::spawn("cont-squote");
+    let rc = format!("{}\nCONT_SQUOTE_OUT=single-line\n", driver::default_rc());
+    let mut s = NiuSession::spawn_custom("cont-squote", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
     s.wait_ready();
-    s.send_line("echo 'single-line");
+    s.send_line("printf '%s\\n' '$CONT_SQUOTE_OUT");
     s.expect_continuation();
     s.send_line("closed'");
     s.expect("single-line");
@@ -85,11 +87,15 @@ fn continuation_brace_group_completes() {
     if !require_pty_or_skip("continuation_brace_group_completes") {
         return;
     }
-    let mut s = NiuSession::spawn("cont-brace");
+    let rc = format!(
+        "{}\nCONT_BRACE_ONE=brace-one\nCONT_BRACE_TWO=brace-two\n",
+        driver::default_rc()
+    );
+    let mut s = NiuSession::spawn_custom("cont-brace", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
     s.wait_ready();
-    s.send_line("{ echo brace-one;");
+    s.send_line("{ printf '%s\\n' \"$CONT_BRACE_ONE\";");
     s.expect_continuation();
-    s.send_line("echo brace-two; }");
+    s.send_line("printf '%s\\n' \"$CONT_BRACE_TWO\"; }");
     s.expect("brace-one");
     s.expect("brace-two");
     s.expect_prompt();
@@ -101,11 +107,15 @@ fn continuation_subshell_paren_completes() {
     if !require_pty_or_skip("continuation_subshell_paren_completes") {
         return;
     }
-    let mut s = NiuSession::spawn("cont-paren");
+    let rc = format!(
+        "{}\nCONT_PAREN_ONE=sub-one\nCONT_PAREN_TWO=sub-two\n",
+        driver::default_rc()
+    );
+    let mut s = NiuSession::spawn_custom("cont-paren", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
     s.wait_ready();
-    s.send_line("(echo sub-one;");
+    s.send_line("(printf '%s\\n' \"$CONT_PAREN_ONE\";");
     s.expect_continuation();
-    s.send_line("echo sub-two)");
+    s.send_line("printf '%s\\n' \"$CONT_PAREN_TWO\");)");
     s.expect("sub-one");
     s.expect("sub-two");
     s.expect_prompt();
@@ -133,11 +143,15 @@ fn continuation_heredoc_gathers_until_delimiter() {
     if !require_pty_or_skip("continuation_heredoc_gathers_until_delimiter") {
         return;
     }
-    let mut s = NiuSession::spawn("cont-heredoc");
+    let rc = format!(
+        "{}\nCONT_HEREDOC_OUT=heredoc-body-line\n",
+        driver::default_rc()
+    );
+    let mut s = NiuSession::spawn_custom("cont-heredoc", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
     s.wait_ready();
     s.send_line("cat <<HD");
     s.expect_continuation();
-    s.send_line("heredoc-body-line");
+    s.send_line("$CONT_HEREDOC_OUT");
     s.send_line("HD");
     s.expect("heredoc-body-line");
     s.expect_prompt();
@@ -150,12 +164,13 @@ fn ctrl_c_during_continuation_abandons_construct() {
     if !require_pty_or_skip("ctrl_c_during_continuation_abandons_construct") {
         return;
     }
-    let mut s = NiuSession::spawn("cont-ctrlc");
+    let rc = format!("{}\nCONT_C_OUT=never-zznever\n", driver::default_rc());
+    let mut s = NiuSession::spawn_custom("cont-ctrlc", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
     s.wait_ready();
     eprintln!("[T] ready");
     // The marker only exists in *output* if the construct executed: the
     // typed text contains ${AB} which the executed echo would resolve.
-    s.send_line("AB=zznever; echo \"never-${AB}");
+    s.send_line("printf '%s\\n' \"$CONT_C_OUT");
     eprintln!("[T] sent line 1");
     s.expect_continuation();
     eprintln!("[T] got PS2");
@@ -183,11 +198,15 @@ fn ctrl_c_on_empty_line_returns_new_prompt() {
     if !require_pty_or_skip("ctrl_c_on_empty_line_returns_new_prompt") {
         return;
     }
-    let mut s = NiuSession::spawn("ctrlc-empty");
+    let rc = format!(
+        "{}\nCTRL_C_EMPTY_OUT=after-empty-ctrlc\n",
+        driver::default_rc()
+    );
+    let mut s = NiuSession::spawn_custom("ctrlc-empty", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
     s.wait_ready();
     s.send(CTRL_C);
     s.expect_prompt();
-    s.send_line("echo after-empty-ctrlc");
+    s.send_line("echo $CTRL_C_EMPTY_OUT");
     s.expect("after-empty-ctrlc");
     s.expect_prompt();
 }
@@ -198,16 +217,18 @@ fn ctrl_c_midtyped_discards_line() {
     if !require_pty_or_skip("ctrl_c_midtyped_discards_line") {
         return;
     }
-    let mut s = NiuSession::spawn("ctrlc-midtyped");
+    let rc = format!(
+        "{}\nCTRL_C_MID_OUT=discarded-marker\n",
+        driver::default_rc()
+    );
+    let mut s = NiuSession::spawn_custom("ctrlc-midtyped", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
     s.wait_ready();
-    s.send("echo discarded-$Q");
+    s.send("echo $CTRL_C_MID_OUT");
     s.send(CTRL_C);
     s.expect_prompt();
     // The typed text contains `discarded-$Q`; execution would print
     // `discarded-<value>`.
     s.expect_absent("discarded-marker", ABSENT_WINDOW);
-    s.send_line("Q=marker");
-    s.expect_prompt();
     s.send_line("echo still-alive-ok");
     s.expect("still-alive-ok");
     s.expect_prompt();
@@ -379,6 +400,15 @@ fn history_bang_dollar_reuses_last_argument() {
     s.expect_prompt();
 }
 
+/// Echo-proof assertion discipline for every Matrix-3 case (niubash#367):
+/// the terminal echoes the submitted line, and `expect` matches the FIRST
+/// occurrence in the stream, so an expected marker that appears verbatim in
+/// the submitted input can be satisfied by that echo even when the command
+/// never executed. Expect only strings that an executed command must produce
+/// and that the input cannot contain — here the alias VALUE holds the marker
+/// behind a `printf` format / an rc variable, and the listing is checked
+/// through `type` (`is aliased to`) rather than the raw `alias ll=` text.
+///
 /// An alias defined in the session is used immediately.
 #[test]
 fn alias_define_then_use_live() {
@@ -387,10 +417,154 @@ fn alias_define_then_use_live() {
     }
     let mut s = NiuSession::spawn("alias-live");
     s.wait_ready();
-    s.send_line("alias lx='echo alias-live-out'");
+    s.send_line("alias ll='printf \"alias-%s\\n\" done'");
+    s.expect_prompt();
+    // `alias ll` would echo `alias ll=`, so the listing rides on `type ll`.
+    s.send_line("type ll");
+    s.expect("is aliased to");
+    s.expect_prompt();
+    s.send_line("ll");
+    s.expect("alias-done");
+    s.expect_absent("command not found", ABSENT_WINDOW);
+    s.expect_prompt();
+    s.send_line("alias ll='printf \"redefined-%s\\n\" done'");
+    s.expect_prompt();
+    s.send_line("type ll");
+    s.expect("is aliased to");
+    s.expect_prompt();
+    s.send_line("ll");
+    s.expect("redefined-done");
+    s.expect_absent("command not found", ABSENT_WINDOW);
+    s.expect_prompt();
+}
+
+#[test]
+fn alias_quoted_and_unalias_use_function_live() {
+    if !require_pty_or_skip("alias_quoted_and_unalias_use_function_live") {
+        return;
+    }
+    let mut session = NiuSession::spawn("alias-suppression-live");
+    session.wait_ready();
+    session.send_line("ll() { printf \"function-%s\\n\" fallback; }");
+    session.expect_prompt();
+    session.send_line("alias ll='printf \"expanded-%s\\n\" alias'");
+    session.expect_prompt();
+    session.send_line("type ll");
+    session.expect("is aliased to");
+    session.expect_prompt();
+    session.send_line("ll");
+    session.expect("expanded-alias");
+    session.expect_absent("command not found", ABSENT_WINDOW);
+    session.expect_prompt();
+    session.send_line("'ll'");
+    session.expect("function-fallback");
+    session.expect_absent("command not found", ABSENT_WINDOW);
+    session.expect_prompt();
+    session.send_line("unalias ll");
+    session.expect_prompt();
+    session.send_line("ll");
+    session.expect("function-fallback");
+    session.expect_absent("command not found", ABSENT_WINDOW);
+    session.expect_prompt();
+}
+
+/// The issue-367 headline shape, echo-proof: `alias` at one prompt, a bare
+/// use at the next. The interactive lines carry `$NIU_ALIAS_LIVE_OUT`, never
+/// the value, so the echoed definition cannot satisfy the assertion — only
+/// expanding and executing the alias prints `alias-live-out`.
+#[test]
+fn alias_use_at_next_prompt_executes_not_echo_matched() {
+    if !require_pty_or_skip("alias_use_at_next_prompt_executes_not_echo_matched") {
+        return;
+    }
+    let rc = format!(
+        "{}\nNIU_ALIAS_LIVE_OUT=alias-live-out\n",
+        driver::default_rc()
+    );
+    let mut s = NiuSession::spawn_custom("alias-live-strict", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
+    s.wait_ready();
+    s.send_line("alias lx='echo $NIU_ALIAS_LIVE_OUT'");
     s.expect_prompt();
     s.send_line("lx");
     s.expect("alias-live-out");
+    s.expect_absent("command not found", ABSENT_WINDOW);
+    s.expect_prompt();
+}
+
+/// The collision is line-specific: an alias defined on physical line 1 of the
+/// rc records `ALIAS_LINE=1`, and a fast-path submission also runs at line 1,
+/// so it was suppressed even though no interactive definition was involved.
+/// It must expand at the very first prompt (independent issue-367
+/// manifestation; no session-time alias definition).
+#[test]
+fn rc_first_line_alias_expands_at_first_prompt() {
+    if !require_pty_or_skip("rc_first_line_alias_expands_at_first_prompt") {
+        return;
+    }
+    // The alias sits on line 1 on purpose: that is the exact numeric collision.
+    let rc = concat!(
+        "alias rc1='echo rc-line-one-out'\n",
+        "PS1='P1> '\n",
+        "PS2='P2> '\n",
+        "NIU_DISABLE_DEFAULT_PLUGINS=1\n",
+    );
+    let mut s = NiuSession::spawn_custom("alias-rc-line-one", rc, &[], (120, 30), DEFAULT_TIMEOUT);
+    s.wait_ready();
+    s.send_line("rc1");
+    s.expect("rc-line-one-out");
+    s.expect_absent("command not found", ABSENT_WINDOW);
+    s.expect_prompt();
+}
+
+/// GNU read-time rule, preserved on both sides: an alias defined on the SAME
+/// submitted physical line is not visible to later tokens on that line
+/// (matches `bash -i -c 'alias q=...; q'`), but the NEXT prompt is a fresh
+/// read boundary and expands it. Both halves are echo-proof (the marker
+/// comes from an rc variable the input never contains literally).
+#[test]
+fn alias_same_line_definition_is_not_visible_until_next_prompt() {
+    if !require_pty_or_skip("alias_same_line_definition_is_not_visible_until_next_prompt") {
+        return;
+    }
+    let rc = format!(
+        "{}\nNIU_SAME_LINE_OUT=same-line-out\n",
+        driver::default_rc()
+    );
+    let mut s = NiuSession::spawn_custom("alias-same-line", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
+    s.wait_ready();
+    s.send_line("alias sl='echo $NIU_SAME_LINE_OUT'; sl");
+    s.expect("command not found");
+    s.expect_absent("same-line-out", ABSENT_WINDOW);
+    s.expect_prompt();
+    s.send_line("sl");
+    s.expect("same-line-out");
+    s.expect_absent("command not found", ABSENT_WINDOW);
+    s.expect_prompt();
+}
+
+/// Matrix control for the value-dependence (niubash#367): an alias whose
+/// value needs parser-level expansion (`;`/redirect) was exempt from the
+/// same-line suppression and worked even before the fix. It must keep
+/// working, so neither the fix nor a future suppression change regresses the
+/// other half of the acceptance matrix.
+#[test]
+fn parser_level_alias_value_expands_across_prompts() {
+    if !require_pty_or_skip("parser_level_alias_value_expands_across_prompts") {
+        return;
+    }
+    let rc = format!(
+        "{}\nNIU_PARSE_ALIAS_A=parser-alias-a\nNIU_PARSE_ALIAS_B=parser-alias-b\n",
+        driver::default_rc()
+    );
+    let mut s =
+        NiuSession::spawn_custom("alias-parser-value", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
+    s.wait_ready();
+    s.send_line("alias pa='echo $NIU_PARSE_ALIAS_A; echo $NIU_PARSE_ALIAS_B'");
+    s.expect_prompt();
+    s.send_line("pa");
+    s.expect("parser-alias-a");
+    s.expect("parser-alias-b");
+    s.expect_absent("command not found", ABSENT_WINDOW);
     s.expect_prompt();
 }
 

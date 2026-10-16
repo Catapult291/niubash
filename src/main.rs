@@ -607,7 +607,6 @@ fn run_shell_invocation(args: &[String]) -> anyhow::Result<()> {
     // driver instead of enter_interactive()/run_repl.
     if invocation.interactive && !niubash_runtime::terminal::stdio_is_interactive() {
         shell.executor.set_env("__RUBASH_INTERACTIVE", "1");
-        shell.executor.set_shopt_option("expand_aliases", true);
         // This path renders prompts through the engine's interactive stdin
         // driver (which expands executor-env PS1 itself), so the foreign
         // inherited PS1 must be discarded here too, before run_startup_rc
