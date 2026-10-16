@@ -16,14 +16,14 @@
     },
     {
       "name": "niugit",
-      "version": "2.55.0.4",
+      "version": "2.55.0.5",
       "commands": [
         "git"
       ],
       "sha256": {
-        "windows-x64": "b37000979ab6be21435270ab8c0da8a229a945946454dd78840929503eab296f"
+        "windows-x64": "dd85269514b07d873f3bde835483fc0b69d23e0d87d36c93e67b5b88aa379932"
       },
-      "purpose": "Niu-git 2.55.0.4 (native Windows git without MSYS; 2.55.0.4 fixes wrapper argv fidelity). The full plugin distro (oh-my-bash, omb-theme-robbyrussell, bash-it, bash-completion, bash-preexec) installs every entry through git clone/pull, so a fresh machine without git.exe on PATH failed all five with 'failed to run git; is git.exe on PATH?' (niubash#209). Bundling niugit removes the hard dependency on the user's environment. The payload is the whole niu-git tree (git.exe at the package root plus the mingw64/ directory carrying its minimal dependency DLLs and etc/) landing in <root>\\opt\\niugit; wpm registers command `git`, so usr\\bin\\git.exe forwards into the package (there is no niugit.exe shim — the verify step asserts on the registered commands). It is schannel-only TLS with no bundled shell/perl and accepts POSIX-shaped (/d/...) path args."
+      "purpose": "Niu-git 2.55.0.5 (native Windows git without MSYS; real git-for-windows C source built with MSVC, no POSIX layer). The full plugin distro (oh-my-bash, omb-theme-robbyrussell, bash-it, bash-completion, bash-preexec) installs every entry through git clone/pull, so a fresh machine without git.exe on PATH failed all five with 'failed to run git; is git.exe on PATH?' (niubash#209). Bundling niugit removes the hard dependency on the user's environment. 2.55.0.5 is layout=flat: the payload lands under <root>\\opt\\niugit (mingw64/ + etc/) and mingw64/bin/git.exe is mapped straight onto usr\\bin\\git.exe, so the git on PATH IS the git binary - no launcher, no winuxcmd dispatch hop, and git --version drops from 72-83 ms to ~14 ms (Git Bash: 45-103 ms). Requires WinuxCmd 1.1.9 or newer in the same release (wpm#1183: POSIX-unlink hardlink break, without which the flat mapping cannot replace the usr\\bin hardlink). It is schannel-only TLS with no bundled shell/perl (shell-script parts of git run on niubash's sh) and accepts POSIX-shaped (/d/...) path args."
     },
     {
       "name": "ripgrep",
