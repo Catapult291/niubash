@@ -53,16 +53,41 @@ lexically below it:
 namespace resolved to the real Windows temp directory (`TMPDIR`, else
 `%TEMP%`), so it stays writable under any install location
 (unixwin/niubash#94). `/var/tmp` resolves beside it as
-`<real temp>/var/tmp`. External command arguments are translated by the
-Rubash executor with the same rules — including `/mnt/X` drive spellings
-and `/dev/null` — so there is exactly one path-semantics owner and no
-host-side AST rewrite.
+`<real temp>/var/tmp`. For every child that is not a bundled WinuxCmd applet,
+external command arguments are translated by the Rubash executor with the same
+rules — including `/mnt/X` drive spellings and `/dev/null` — so there is
+exactly one path-semantics owner and no host-side AST rewrite.
 
 Command lookup and native child `PATH` use these real directories directly.
 Rubash does not merge a second provider directory, and WinuxCmd coreutils do
 not inspect Niubash variables. Existing flat installations remain usable when
 their directory is explicitly present on `PATH`; new installs use the tree
 above.
+
+## Shell Namespace Ownership
+
+A child process either resolves the shell namespace itself or receives native
+paths — never both, and never a guess about the child's capabilities:
+
+- **Bundled WinuxCmd applets own the shell tree** (unixwin/niubash#346). The
+  applets selected by the dispatcher route, the configured root, and the
+  `winuxcmd.exe` tree marker receive `/`, `/usr/bin`, `/etc`, `/tmp`,
+  `/home`, `/mnt/X`, the bare `/`, and `/dev/*` VERBATIM, and resolve them
+  through WinuxCmd's own shell-tree layer, which mirrors Rubash's root map.
+  They therefore render the POSIX face (`ls -d /usr/bin`, `realpath /etc`,
+  `readlink -f /tmp`) and stay consistent with the spelling-preserving `pwd`.
+  The executable-leaf convention is theirs too: `/usr/bin/seq` resolves to
+  the real `seq.exe` while `ls -d` keeps the operand spelling, so
+  `head -1 /usr/bin/seq` and `test -f /usr/bin/seq` agree (niubash#177).
+- **Every other child — a native Windows program, or a foreign POSIX runtime
+  such as MSYS2 or Cygwin — always receives native Windows paths.** There is
+  no per-child capability probe and no `MSYS_NO_PATHCONV`-style switch; a
+  foreign runtime is treated exactly like a native program.
+
+The boundary is structural rather than a rename of the "MSYS NO CONV"
+problem: the shell never asks a child what it can understand. The shipped
+toolchain's own resolution decides, and the engine compensates only for the
+child classes that cannot resolve the tree.
 
 ## Dispatcher Selection
 

@@ -2863,9 +2863,30 @@ fn winuxcmd_path_translation_mask(command_name: &str, words: &[String]) -> Vec<b
         ),
         "awk" => mask_first_positional_pattern(words, &mut mask, &[], &["-f", "--file"], &[]),
         "find" => mask_find_expression(words, &mut mask),
+        // basename/dirname are filesystem-blind string transforms: GNU
+        // dirname.c/basename.c never stat their operand, so a POSIX-shaped
+        // NAME is display text, not a slash-drive path (niubash#346:
+        // `dirname /a/b` must print `/a`, not the drive-form effect `A:`).
+        // Mask every positional, mirroring rubash's argv_data_primary_positions.
+        "basename" | "dirname" => mask_all_positionals(words, &mut mask),
         _ => {}
     }
     mask
+}
+
+/// Masks every non-switch word: for filesystem-blind string tools
+/// (basename/dirname) each positional — NAME and SUFFIX alike — is data.
+fn mask_all_positionals(words: &[String], mask: &mut [bool]) {
+    for (index, arg) in words.iter().enumerate() {
+        if index == 0 {
+            continue;
+        }
+        if !(arg.len() > 1 && arg.starts_with('-')) {
+            if let Some(slot) = mask.get_mut(index) {
+                *slot = false;
+            }
+        }
+    }
 }
 
 fn short_option_char(opts: &[&str]) -> Option<char> {
@@ -5219,6 +5240,26 @@ complete -F _envtooldyn_hook envtooldyn
             assert_eq!(ast.commands[7].words[3], "/h/");
             assert_eq!(ast.commands[8].words[1], "/e/");
         }
+    }
+
+    #[test]
+    fn filesystem_blind_string_tools_keep_slash_drive_operands_verbatim() {
+        // niubash#346(c): dirname/basename never stat their operand, so a
+        // POSIX-shaped NAME such as /a/b is display text, not a drive form.
+        // The host must not fold it to A:/b before rubash's own mask runs
+        // (rubash argv_data_primary_positions exempts the same two tools).
+        let tokens = tokenize(
+            "dirname /a/b; basename /a/b/c.txt; dirname -z /a/b /usr/bin/seq; dirname a/b",
+        );
+        let mut ast = parse(&tokens);
+        normalize_winuxcmd_slash_drive_args(&mut ast);
+
+        assert_eq!(ast.commands[0].words[1], "/a/b");
+        assert_eq!(ast.commands[1].words[1], "/a/b/c.txt");
+        assert_eq!(ast.commands[2].words[1], "-z");
+        assert_eq!(ast.commands[2].words[2], "/a/b");
+        assert_eq!(ast.commands[2].words[3], "/usr/bin/seq");
+        assert_eq!(ast.commands[3].words[1], "a/b");
     }
 
     #[test]
