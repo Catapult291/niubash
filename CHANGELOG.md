@@ -20,6 +20,14 @@ All notable changes to Niubash are documented in this file.
   `MSYS_NO_PATHCONV`-style switch (unixwin/niubash#346). This rides the
   WinuxCmd shell-tree layer, so the bundled WinuxCmd pin must be bumped in the
   same release.
+- **Windows releases bundle niu-git 2.55.0.5** (`scripts/release/preinstall.json`).
+  niu-git moves to `layout: flat`: the payload lands under `opt\niugit` and
+  `mingw64\bin\git.exe` is mapped straight onto `usr\bin\git.exe`, so the `git`
+  on PATH *is* the git binary — no winuxcmd dispatch hop, no launcher, no MSYS
+  runtime and no perl in the process tree. `git --version` drops from 72–83 ms
+  to ~14 ms (Git Bash: 45–103 ms) and `git status` to ~23 ms. Needs WinuxCmd
+  1.1.9 or newer (the POSIX-unlink hardlink break, unixwin/WinuxCmd#1183);
+  the release pin already carries 1.1.10.
 
 ## [1.4.0] - 2026-10-10
 

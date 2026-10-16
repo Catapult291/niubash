@@ -25,7 +25,13 @@
 Windows, the flagship platform, one `niu.exe` bundles everything: the
 [rubash](https://github.com/unixwin/rubash) language engine, real Unix
 commands from [winuxcmd](https://github.com/unixwin/winuxcmd), a git-aware
-prompt, and a permission-modeled plugin system. The Linux and macOS builds
+prompt, and a permission-modeled plugin system. Git comes from
+[niu-git](https://github.com/unixwin/niu-git): the real git-for-windows C
+source built with MSVC, so the `git` on PATH *is* the git binary — no MSYS
+runtime, no launcher hop, no bundled perl. `git --version` starts in **~14
+ms** where Git Bash's `git` takes 45-103 ms, and the shell-script parts of
+git (hooks, `git bisect`, `git mergetool`) run on niubash's own `sh`. The
+Linux and macOS builds
 are portable `niu` binaries that use your system's own tools. niu is not
 MSYS2, Cygwin, Git Bash, or WSL — there is no POSIX emulation layer and no
 path-translation machinery. The full per-platform contract, including the
