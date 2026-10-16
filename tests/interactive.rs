@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 //! Interactive-mode regression tests.
 //!
 //! These exercise behavior that only exists when niu runs as an interactive
