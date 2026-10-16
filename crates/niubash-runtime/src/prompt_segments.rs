@@ -807,6 +807,7 @@ mod tests {
 
     /// Minimal one-commit repository (clean index) — the shared fixture for
     /// the Vcs render matrix.
+    #[cfg(windows)]
     fn init_clean_repo(dir: &Path) -> git2::Repository {
         let repo = git2::Repository::init(dir).unwrap();
         let mut index = repo.index().unwrap();

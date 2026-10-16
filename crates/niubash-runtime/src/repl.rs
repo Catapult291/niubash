@@ -2476,6 +2476,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn default_keybindings_keep_ctrl_c_as_interrupt_and_add_ctrl_v_paste() {
         let mut emacs = default_emacs_keybindings();
@@ -2490,6 +2491,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn vi_insert_keybindings_add_ctrl_v_paste() {
         let mut insert = default_vi_insert_keybindings();
