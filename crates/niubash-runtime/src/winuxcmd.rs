@@ -22,6 +22,13 @@ pub fn find_winuxcmd() -> Option<PathBuf> {
 #[derive(Debug)]
 struct WinuxCmdSearchReport {
     found: Option<PathBuf>,
+    /// Installation root implied by the candidate that matched. A candidate
+    /// knows the layout it describes, so nothing has to probe the filesystem:
+    /// `<root>\usr\bin\winuxcmd.exe`, `<root>\winuxcmd.exe` and
+    /// `<root>\bin\winuxcmd.exe` (the PATH entry link) all imply their own
+    /// root, while `<x>\winuxcmd\usr\bin\winuxcmd.exe` implies
+    /// `<x>\winuxcmd`.
+    root: Option<PathBuf>,
     checked: Vec<String>,
 }
 
@@ -54,6 +61,7 @@ where
         if let Some(exe) = resolve_winuxcmd_override(path) {
             return WinuxCmdSearchReport {
                 found: Some(exe),
+                root: None,
                 checked,
             };
         }
@@ -62,10 +70,11 @@ where
     // 2/3/4. Relative to current executable
     if let Some(exe_dir) = exe_dir {
         for candidate in bundled_winuxcmd_candidates(exe_dir) {
-            checked.push(candidate.display().to_string());
-            if candidate.is_file() {
+            checked.push(candidate.path.display().to_string());
+            if candidate.path.is_file() {
                 return WinuxCmdSearchReport {
-                    found: Some(candidate),
+                    found: Some(candidate.path),
+                    root: Some(candidate.root),
                     checked,
                 };
             }
@@ -76,12 +85,14 @@ where
     if let Some(exe) = path_lookup(&mut checked) {
         return WinuxCmdSearchReport {
             found: Some(exe),
+            root: None,
             checked,
         };
     }
 
     WinuxCmdSearchReport {
         found: None,
+        root: None,
         checked,
     }
 }
@@ -124,22 +135,41 @@ pub fn ensure_on_path() -> Result<PathBuf> {
 /// Selection belongs to Niubash. Rubash receives the returned absolute path
 /// and must not independently discover another dispatcher from PATH.
 pub fn resolve_winuxcmd_with_override(override_path: Option<&Path>) -> Result<PathBuf> {
+    Ok(find_winuxcmd_report_with_override(override_path)?
+        .found
+        .expect("checked above"))
+}
+
+/// The search report for an explicit override or the default discovery, with
+/// the implied installation root when a bundled candidate matched.
+fn find_winuxcmd_report_with_override(
+    override_path: Option<&Path>,
+) -> Result<WinuxCmdSearchReport> {
     match override_path {
-        Some(path) => resolve_winuxcmd_override(path).ok_or_else(|| {
-            anyhow!(
-                "configured winuxcmd path '{}' does not point to winuxcmd.exe or a containing directory; checked: {}",
-                path.display(),
-                format_checked_paths(&override_search_descriptions(path))
-            )
-        }),
+        Some(path) => resolve_winuxcmd_override(path)
+            .map(|exe| WinuxCmdSearchReport {
+                found: Some(exe),
+                // An override names a file or a directory, not a layout: the
+                // root has to be derived from the path itself.
+                root: None,
+                checked: override_search_descriptions(path),
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "configured winuxcmd path '{}' does not point to winuxcmd.exe or a containing directory; checked: {}",
+                    path.display(),
+                    format_checked_paths(&override_search_descriptions(path))
+                )
+            }),
         None => {
             let report = find_winuxcmd_with_report();
-            report.found.ok_or_else(|| {
-                anyhow!(
-                    "winuxcmd.exe not found; checked: {}",
-                    format_checked_paths(&report.checked)
-                )
-            })
+            if report.found.is_some() {
+                return Ok(report);
+            }
+            Err(anyhow!(
+                "winuxcmd.exe not found; checked: {}",
+                format_checked_paths(&report.checked)
+            ))
         }
     }
 }
@@ -147,17 +177,35 @@ pub fn resolve_winuxcmd_with_override(override_path: Option<&Path>) -> Result<Pa
 /// Resolve the selected executable, activate its command links if needed, and
 /// prepend exactly its containing directory to the process PATH.
 pub fn prepare_winuxcmd_with_override(override_path: Option<&Path>) -> Result<PathBuf> {
-    let exe = resolve_winuxcmd_with_override(override_path)?;
+    let report = find_winuxcmd_report_with_override(override_path)?;
+    let exe = report.found.clone().expect("checked above");
+    let root = report
+        .root
+        .clone()
+        .unwrap_or_else(|| installation_root(&exe));
     auto_activate_bundled_winuxcmd(&exe);
-    prepend_exe_dir_to_path(&exe)?;
+    prepend_root_dirs_to_path(&root, &exe)?;
     Ok(exe)
+}
+
+/// The installation root for the selected executable, preferring the root
+/// implied by the layout that matched over re-deriving it from the path.
+fn installation_root_for_report(report: &WinuxCmdSearchReport, exe: &Path) -> PathBuf {
+    report
+        .root
+        .clone()
+        .unwrap_or_else(|| installation_root(exe))
 }
 
 /// Same as `ensure_on_path`, but an explicit config override takes precedence.
 /// The override may point either to `winuxcmd.exe` or to its containing dir.
 pub fn ensure_on_path_with_override(override_path: Option<&Path>) -> Result<PathBuf> {
-    let exe = prepare_winuxcmd_with_override(override_path)?;
-    Ok(installation_root(&exe).join("usr").join("bin"))
+    let report = find_winuxcmd_report_with_override(override_path)?;
+    let exe = report.found.clone().expect("checked above");
+    let root = installation_root_for_report(&report, &exe);
+    auto_activate_bundled_winuxcmd(&exe);
+    prepend_root_dirs_to_path(&root, &exe)?;
+    Ok(root.join("usr").join("bin"))
 }
 
 /// Return the real installation root for a selected WinuxCmd executable.
@@ -186,18 +234,61 @@ pub fn installation_root(exe: &Path) -> PathBuf {
     bin_dir.to_path_buf()
 }
 
-fn bundled_winuxcmd_candidates(exe_dir: &Path) -> Vec<PathBuf> {
-    [
-        "usr/bin/winuxcmd.exe",
-        "winuxcmd.exe",
-        "winuxcmd/usr/bin/winuxcmd.exe",
-        "winuxcmd/winuxcmd.exe",
-        "utils/winuxcmd/usr/bin/winuxcmd.exe",
-        "utils/winuxcmd/winuxcmd.exe",
-    ]
-    .into_iter()
-    .map(|rel| exe_dir.join(rel))
-    .collect()
+/// How far above the running executable the bundled tree may live. `niu.exe` is
+/// hardlinked into `<root>\bin` (the PATH entry directory), into the winuxcmd
+/// root's own `bin`, and - for the agent/editor entry points - one or two levels
+/// beside the installation, so a handful of levels covers every supported
+/// layout while keeping discovery deterministic and bounded.
+const MAX_BUNDLED_ANCESTOR_LEVELS: usize = 6;
+
+/// A WinuxCmd executable a bundled layout may contain, with the installation
+/// root that layout implies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BundledCandidate {
+    path: PathBuf,
+    root: PathBuf,
+}
+
+fn bundled_winuxcmd_candidates(exe_dir: &Path) -> Vec<BundledCandidate> {
+    // (relative path, installation root relative to the same base)
+    const RELATIVE: [(&str, &str); 7] = [
+        ("usr/bin/winuxcmd.exe", ""),
+        ("winuxcmd.exe", ""),
+        // The PATH entry link wpm creates: <root>\bin\winuxcmd.exe. Without
+        // this shape a shell hardlinked beside it would resolve winuxcmd.exe
+        // and then treat `bin` as the installation root, losing usr\bin.
+        ("bin/winuxcmd.exe", ""),
+        ("winuxcmd/usr/bin/winuxcmd.exe", "winuxcmd"),
+        ("winuxcmd/winuxcmd.exe", "winuxcmd"),
+        ("utils/winuxcmd/usr/bin/winuxcmd.exe", "utils/winuxcmd"),
+        ("utils/winuxcmd/winuxcmd.exe", "utils/winuxcmd"),
+    ];
+
+    let mut candidates = Vec::new();
+    let mut base = Some(exe_dir);
+    let mut level = 0;
+    while let Some(current) = base {
+        for (rel, root_rel) in RELATIVE {
+            candidates.push(BundledCandidate {
+                path: current.join(rel),
+                root: if root_rel.is_empty() {
+                    current.to_path_buf()
+                } else {
+                    current.join(root_rel)
+                },
+            });
+        }
+        if level >= MAX_BUNDLED_ANCESTOR_LEVELS {
+            break;
+        }
+        // `parent()` of a volume root is None, and of a relative dir like
+        // "bundle" is Some(""): both end the walk.
+        base = current
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty() && *parent != current);
+        level += 1;
+    }
+    candidates
 }
 
 fn override_search_descriptions(path: &Path) -> Vec<String> {
@@ -242,22 +333,28 @@ fn resolve_winuxcmd_override(path: &Path) -> Option<PathBuf> {
     None
 }
 
-fn prepend_exe_dir_to_path(exe: &Path) -> Result<PathBuf> {
-    let root = installation_root(exe);
+/// Directories one installation contributes to PATH, in POSIX order. A tree
+/// whose executable sits below the root injects all four; a portable layout
+/// that keeps `winuxcmd.exe` next to its tools injects only that directory.
+fn injected_path_dirs(root: &Path, exe: &Path) -> Vec<PathBuf> {
+    let exe_dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+    if root.as_os_str().is_empty() || root == exe_dir {
+        return vec![exe_dir];
+    }
+    vec![
+        root.join("usr/local/bin"),
+        root.join("usr/bin"),
+        root.join("bin"),
+        root.to_path_buf(),
+    ]
+}
+
+fn prepend_root_dirs_to_path(root: &Path, exe: &Path) -> Result<PathBuf> {
     let exe_dir = exe
         .parent()
         .ok_or_else(|| anyhow!("winuxcmd.exe has no parent directory"))?
         .to_path_buf();
-    let dirs = if exe_dir.ends_with(Path::new("usr/bin")) {
-        vec![
-            root.join("usr/local/bin"),
-            root.join("usr/bin"),
-            root.join("bin"),
-            root.clone(),
-        ]
-    } else {
-        vec![exe_dir.clone()]
-    };
+    let dirs = injected_path_dirs(root, exe);
 
     let current_path = std::env::var("PATH").unwrap_or_default();
     let new_path = path_with_dirs_prepended(&current_path, &dirs);
@@ -588,9 +685,77 @@ mod tests {
         let exe_dir = PathBuf::from("bundle");
         let candidates = bundled_winuxcmd_candidates(&exe_dir);
 
-        assert_eq!(candidates[0], exe_dir.join("usr/bin/winuxcmd.exe"));
-        assert_eq!(candidates[1], exe_dir.join("winuxcmd.exe"));
-        assert_eq!(candidates[2], exe_dir.join("winuxcmd/usr/bin/winuxcmd.exe"));
+        assert_eq!(candidates[0].path, exe_dir.join("usr/bin/winuxcmd.exe"));
+        assert_eq!(candidates[1].path, exe_dir.join("winuxcmd.exe"));
+        assert_eq!(candidates[2].path, exe_dir.join("bin/winuxcmd.exe"));
+        assert_eq!(
+            candidates[3].path,
+            exe_dir.join("winuxcmd/usr/bin/winuxcmd.exe")
+        );
+        assert_eq!(candidates[0].root, exe_dir);
+        assert_eq!(candidates[3].root, exe_dir.join("winuxcmd"));
+    }
+
+    #[test]
+    fn bundled_candidates_climb_to_ancestor_installations() {
+        // A shell hardlinked into the PATH entry directory finds the tree one
+        // level up, and the shared root is what gets injected - not `bin`.
+        let from_entry_bin = bundled_winuxcmd_candidates(Path::new(r"C:\tools\winuxcmd\bin"));
+        let found = from_entry_bin
+            .iter()
+            .find(|candidate| {
+                candidate.path == PathBuf::from(r"C:\tools\winuxcmd\usr\bin\winuxcmd.exe")
+            })
+            .expect("the installation one level up must be a candidate");
+        assert_eq!(found.root, PathBuf::from(r"C:\tools\winuxcmd"));
+
+        // A package payload deep in the tree still reaches the bundled tree.
+        let from_payload =
+            bundled_winuxcmd_candidates(Path::new(r"C:\tools\winuxcmd\opt\niugit\bin"));
+        assert!(from_payload
+            .iter()
+            .any(|candidate| candidate.path
+                == PathBuf::from(r"C:\tools\winuxcmd\usr\bin\winuxcmd.exe")));
+
+        // The niubash layout: `<x>\bin\bash.exe` finds `<x>\winuxcmd\...`.
+        let from_niubash_bin = bundled_winuxcmd_candidates(Path::new(r"C:\apps\Niubash\bin"));
+        let bundled = from_niubash_bin
+            .iter()
+            .find(|candidate| {
+                candidate.path == PathBuf::from(r"C:\apps\Niubash\winuxcmd\usr\bin\winuxcmd.exe")
+            })
+            .expect("the bundled tree must be a candidate");
+        assert_eq!(bundled.root, PathBuf::from(r"C:\apps\Niubash\winuxcmd"));
+    }
+
+    #[test]
+    fn injected_path_dirs_cover_the_installation_root() {
+        let root = Path::new(r"C:\tools\winuxcmd");
+        let expected = vec![
+            PathBuf::from(r"C:\tools\winuxcmd\usr/local/bin"),
+            PathBuf::from(r"C:\tools\winuxcmd\usr/bin"),
+            PathBuf::from(r"C:\tools\winuxcmd\bin"),
+            PathBuf::from(r"C:\tools\winuxcmd"),
+        ];
+        // The canonical location, the PATH entry link (whose parent is `bin`),
+        // and a copy that a package placed elsewhere in the tree all inject the
+        // same four directories.
+        for exe in [
+            r"C:\tools\winuxcmd\usr\bin\winuxcmd.exe",
+            r"C:\tools\winuxcmd\bin\winuxcmd.exe",
+            r"C:\tools\winuxcmd\opt\pkg\bin\winuxcmd.exe",
+        ] {
+            assert_eq!(injected_path_dirs(root, Path::new(exe)), expected, "{exe}");
+        }
+        // A portable layout keeps the executable beside its tools: only that
+        // directory is injected.
+        assert_eq!(
+            injected_path_dirs(
+                Path::new(r"C:\portable"),
+                Path::new(r"C:\portable\winuxcmd.exe")
+            ),
+            vec![PathBuf::from(r"C:\portable")]
+        );
     }
 
     #[test]
