@@ -3893,46 +3893,6 @@ fn install_windows_terminal_profile(_rest: &[String]) -> anyhow::Result<()> {
 ///   (the installer passes `{autodesktop}` / `{group}`); without them the
 ///   known-folder defaults are used
 #[cfg(windows)]
-/// Point every `bash.exe`/`sh.exe` name of this installation at the running
-/// `niu.exe`, replacing forwarding shims where hardlinks are available.
-fn relink_shell_faces(rest: &[String]) -> anyhow::Result<()> {
-    let mut force = false;
-    let mut quiet = false;
-    for arg in rest {
-        match arg.as_str() {
-            "--force" => force = true,
-            "--quiet" => quiet = true,
-            other => anyhow::bail!("--relink-shells: unknown argument '{other}'"),
-        }
-    }
-
-    let niu = std::env::current_exe()
-        .map_err(|error| anyhow::anyhow!("cannot determine the running niu.exe: {error}"))?;
-    let root = niubash_runtime::shell_links::find_installation_root(&niu);
-    let report = niubash_runtime::shell_links::link_shell_faces(&root, &niu, force);
-
-    if !quiet {
-        println!(
-            "niu: shell links under {}: {} created, {} already current, {} skipped, {} failed",
-            root.display(),
-            report.created.len(),
-            report.already_current.len(),
-            report.skipped.len(),
-            report.failed.len()
-        );
-        for (path, reason) in &report.skipped {
-            println!("  skipped {}: {reason}", path.display());
-        }
-    }
-    if !report.failed.is_empty() {
-        for (path, error) in &report.failed {
-            eprintln!("niu: failed to link {}: {error}", path.display());
-        }
-        anyhow::bail!("{} shell link(s) could not be created", report.failed.len());
-    }
-    Ok(())
-}
-
 fn install_windows_terminal_shortcuts(rest: &[String]) -> anyhow::Result<()> {
     let mut quiet = false;
     let mut update_only = false;
@@ -4520,4 +4480,44 @@ mod tests {
         invocation.script = Some("D:/repo/probe.sh".to_string());
         assert_eq!(invocation_source_name(&invocation), "D:/repo/probe.sh");
     }
+}
+
+/// Point every `bash.exe`/`sh.exe` name of this installation at the running
+/// `niu.exe`, replacing forwarding shims where hardlinks are available.
+fn relink_shell_faces(rest: &[String]) -> anyhow::Result<()> {
+    let mut force = false;
+    let mut quiet = false;
+    for arg in rest {
+        match arg.as_str() {
+            "--force" => force = true,
+            "--quiet" => quiet = true,
+            other => anyhow::bail!("--relink-shells: unknown argument '{other}'"),
+        }
+    }
+
+    let niu = std::env::current_exe()
+        .map_err(|error| anyhow::anyhow!("cannot determine the running niu.exe: {error}"))?;
+    let root = niubash_runtime::shell_links::find_installation_root(&niu);
+    let report = niubash_runtime::shell_links::link_shell_faces(&root, &niu, force);
+
+    if !quiet {
+        println!(
+            "niu: shell links under {}: {} created, {} already current, {} skipped, {} failed",
+            root.display(),
+            report.created.len(),
+            report.already_current.len(),
+            report.skipped.len(),
+            report.failed.len()
+        );
+        for (path, reason) in &report.skipped {
+            println!("  skipped {}: {reason}", path.display());
+        }
+    }
+    if !report.failed.is_empty() {
+        for (path, error) in &report.failed {
+            eprintln!("niu: failed to link {}: {error}", path.display());
+        }
+        anyhow::bail!("{} shell link(s) could not be created", report.failed.len());
+    }
+    Ok(())
 }

@@ -327,13 +327,23 @@ mod tests {
 
     #[test]
     fn planned_links_cover_every_path_directory() {
-        let root = Path::new(r"C:\apps\Niubash");
-        let links = planned_shell_links(root, Path::new(r"C:\apps\Niubash\niu.exe"));
+        // Built with `join` so the expectations hold whatever the platform
+        // separator is; the cross-target jobs compile these on unix hosts too.
+        let root = PathBuf::from("apps").join("Niubash");
+        let links = planned_shell_links(&root, &root.join("niu.exe"));
         assert_eq!(links.len(), 6);
-        assert!(links.contains(&PathBuf::from(r"C:\apps\Niubash\bin\bash.exe")));
-        assert!(links.contains(&PathBuf::from(r"C:\apps\Niubash\bin\sh.exe")));
-        assert!(links.contains(&PathBuf::from(r"C:\apps\Niubash\winuxcmd\bin\bash.exe")));
-        assert!(links.contains(&PathBuf::from(r"C:\apps\Niubash\winuxcmd\usr\bin\sh.exe")));
+        let cases: &[&[&str]] = &[
+            &["bin", "bash.exe"],
+            &["bin", "sh.exe"],
+            &["winuxcmd", "bin", "bash.exe"],
+            &["winuxcmd", "usr", "bin", "sh.exe"],
+        ];
+        for relative in cases {
+            let expected = relative
+                .iter()
+                .fold(root.clone(), |path, part| path.join(*part));
+            assert!(links.contains(&expected), "{expected:?} not in {links:?}");
+        }
     }
 
     #[test]
