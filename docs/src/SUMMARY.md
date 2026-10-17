@@ -2,6 +2,7 @@
 
 - [Niubash](index.md)
 - [Why Niubash](why-niubash.md)
+- [Coding agents on Windows](agents.md)
 - [Getting Started](getting-started.md)
 - [Advanced Usage](advanced-usage.md)
 - [Plugins & the Bash Ecosystem](plugins.md)

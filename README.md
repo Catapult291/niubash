@@ -30,7 +30,10 @@ prompt, and a permission-modeled plugin system. Git comes from
 source built with MSVC, so the `git` on PATH *is* the git binary — no MSYS
 runtime, no launcher hop, no bundled perl. `git --version` starts in **~14
 ms** where Git Bash's `git` takes 45-103 ms, and the shell-script parts of
-git (hooks, `git bisect`, `git mergetool`) run on niubash's own `sh`. The
+git (hooks, `git bisect`, `git mergetool`) run on niubash's own `sh`. Agents
+launched from a niu session inherit it as their shell through `SHELL`; see
+[Coding agents on Windows](docs/src/agents.md) for which shell each agent runs
+and how to point the rest at niu. The
 Linux and macOS builds
 are portable `niu` binaries that use your system's own tools. niu is not
 MSYS2, Cygwin, Git Bash, or WSL — there is no POSIX emulation layer and no
