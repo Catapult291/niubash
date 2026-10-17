@@ -30,12 +30,18 @@ C:\Program Files
   ledger](https://github.com/unixwin/rubash#compatibility-at-a-glance)).
 - **Windows-native.** One binary, one process. Native Windows paths
   (`C:\...` and `C:/...`), direct execution of `git.exe`, `node.exe`,
-  `cargo.exe`, `python.exe` — no VM, no emulation layer, and no
-  path-conversion machinery at all: the Windows-native path is the shell's
-  first-class representation, POSIX- and WSL-style spellings are understood
-  on input, and every process receives a native path. There is no
-  `MSYS_NO_PATHCONV` equivalent here because there is no converter to
-  disable.
+  `cargo.exe`, `python.exe` — no VM, no emulation layer. The Windows-native
+  path is the shell's first-class representation, POSIX- and WSL-style
+  spellings are understood on input, and the Rubash executor translates
+  POSIX-form arguments deterministically before a native child starts:
+  `/d/repo` arrives at `python.exe` as `D:\repo`, while shapes the
+  executor does not classify as paths (`/nonexistent` and `/fn main`)
+  arrive byte for byte.
+  The native command processor keeps its `/C`-style switch-position
+  operands verbatim. The full contract — the exact rules, the `cmd.exe`
+  carve-out, and the `__RUBASH_ARGV_DIALECT=legacy` pass-through switch —
+  is stated in the
+  [Windows Path Contract](windows-path-contract.md).
 - **Unix commands included.** WinuxCmd ships `ls`, `cat`, `grep`, `find`,
   `test`, `printf`, and friends as Windows command links, with no separate
   installation.

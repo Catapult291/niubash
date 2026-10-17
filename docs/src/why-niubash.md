@@ -113,9 +113,14 @@ documented admission that the conversion layer breaks real commands. Under
 MSYS, every native tool call is a game of path roulette, and the house
 provides the abort switch next to the wheel.
 
-Niubash has no such switch, because there is no such layer. The
-Windows-native path is not a format niubash converts *into* — it is the
-shell's internal representation. POSIX-style (`/c/...`, `/usr/bin`),
+Niubash keeps the boundary but changes its shape. The translation is
+deterministic and lives in niu's own Rubash executor, not in an emulator
+rewriting arguments behind the child's back: `/d/repo` reaches a native
+child as `D:\repo`, `/nonexistent` and `/fn main` pass through byte for
+byte, and the mapping does not check whether the path exists. The same
+principle holds for the rest of the path surface: the Windows-native path
+is not a format niubash converts *into* — it is the shell's internal
+representation. POSIX-style (`/c/...`, `/usr/bin`),
 WSL-style (`/mnt/c/...`), and Windows-style (`C:\...`) are input spellings
 that all resolve to that one native reality:
 
@@ -130,7 +135,12 @@ C:/Program Files
 ```
 
 Input in any dialect. Output always native. One representation, zero
-guessing, nothing to disable — for your fingers, and for your agent.
+guessing: the executor's POSIX→native argument mapping is fixed and
+documented ([windows-path-contract.md](windows-path-contract.md)), and the
+one switch is `__RUBASH_ARGV_DIALECT=legacy`, which hands argv to the
+child unwritten — a dialect selector for a documented mapping, not the
+abort switch of a heuristic that might guess wrong. That is the honest
+version for your fingers, and for your agent.
 
 ## The verdict
 
