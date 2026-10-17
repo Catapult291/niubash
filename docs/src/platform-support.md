@@ -401,9 +401,12 @@ exists so those gates open. It is a default, not a fact —
 (`uname -s` → `Windows_NT`, `$MACHTYPE` → `x86_64-pc-windows`).
 
 Under the labels there is **no MSYS2 runtime**: no `msys-2.0.dll`, no
-`cygwin1.dll`, and no POSIX→Windows argument-conversion layer. niu is a
-pure native Windows build; every process it starts is an ordinary Win32
-process. So the `uname` story on this page splits by platform: on unix
+`cygwin1.dll`, and nothing inside a child process that converts POSIX argv
+for Windows. niu is a pure native Windows build; every process it starts
+is an ordinary Win32 process, and the POSIX-form argv an MSYS runtime
+would rewrite in-child is instead rewritten by niu's own executor before
+that process starts — the distinction the behavioral boundary below
+states. So the `uname` story on this page splits by platform: on unix
 the builtin reports the kernel verbatim (see
 [`uname` on HarmonyOS](#uname-on-harmonyos)); on Windows it reports
 persona labels that name a runtime which is not there.
@@ -412,20 +415,25 @@ persona labels that name a runtime which is not there.
 
 | A script written for real MSYS assumes | niu does |
 | --- | --- |
-| The runtime rewrites POSIX-form argv before a native child sees it. | Arguments arrive **verbatim** — `niu -c 'cmd /c echo /d/repo'` prints `/d/repo`. |
-| `/d/...` reaches the child as `D:\...`. | `git -C /d/repo rev-parse --show-toplevel` fails with `cannot change to '/d/repo'` (exit 128). Pass `D:/repo`. |
-| An MSYS2 root: `/etc/fstab`, `/etc/profile`, MSYS2's `/usr`. | `/` is the current drive's root (`ls /` lists `C:\`); the Unix-shaped `/etc` resolves to a real Windows directory holding only winuxcmd's `mtab` shim. |
+| The runtime rewrites POSIX-form argv before a native child sees it. | It does — `/c/Users/cmx` reaches a native child as `C:\Users\cmx` (`python -c 'import sys; print(sys.argv[1])' /c/Users/cmx`). The exception is a native command processor: `cmd /c echo /d/repo` prints `/d/repo`, because `cmd` owns `/C`-style switches. |
+| `/d/...` reaches the child as `D:\...`. | For a native child, yes — `git -C /d/repo/niubash rev-parse --show-toplevel` prints `D:/repo/niubash`, and `python -c 'import sys; print(sys.argv[1])' /d/repo` prints `D:\repo`. A native command processor is again the exception (see above). |
+| An MSYS2 root: `/etc/fstab`, `/etc/profile`, MSYS2's `/usr`. | `/` is winuxcmd's installation root (`ls /` lists its `usr`, `bin`, `etc`, `opt`, …), not the current drive's root; the Unix-shaped `/etc` resolves inside that tree to a real Windows directory holding only winuxcmd's `mtab` shim. |
 | MSYS2's bundled perl/awk runtimes. | No perl at all; `awk` is winuxcmd's own native build, not MSYS2's. |
 
-The first two rows are the ones that bite. The shell itself accepts
-POSIX-drive spellings as input dialects — `cd /d/repo && pwd` prints
-`D:/repo` — but that is niu's own path parsing (the
-[Windows Path Contract](windows-path-contract.md)), not a conversion
-layer in front of child processes. Scripts that depend on **argv being
-rewritten on the way to a native program** therefore behave differently
-under niu than under Git Bash, and there is deliberately no
-`MSYS_NO_PATHCONV`-style escape hatch: nothing converts, so nothing
-needs switching off.
+The root row is the one that still bites: niu's `/` is the WinuxCmd
+installation root, so a script that walks out from `/` sees the winuxcmd
+tree (`usr`, `bin`, `etc`, `opt`, …) rather than a drive root, and there
+is no MSYS2 `/etc/profile` or `/etc/fstab`. On the argv rows niu now
+matches what an MSYS2-targeted script assumes: POSIX-form argv **is**
+rewritten for native children, and shell-namespace roots such as
+`/usr/bin`, `/etc`, and `/tmp` are mapped for every child class. The one
+carve-out is the native command processor, which keeps its slash-prefixed
+drive-form operands verbatim. Unlike an MSYS runtime, though, this is not
+a layer inside the child: it is niu's own path handling, applied by the
+Rubash executor at the child boundary and documented in the
+[Windows Path Contract](windows-path-contract.md) (the internal
+`__RUBASH_ARGV_DIALECT=legacy` switch restores the earlier
+existence-gated behaviour).
 
 One line of orientation: **Git Bash = MSYS2 runtime + GNU bash; niu =
 native engine + compatibility persona.** The labels match so ecosystem
