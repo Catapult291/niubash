@@ -683,7 +683,27 @@ fn run_shell_invocation(args: &[String]) -> anyhow::Result<()> {
             shell.source_non_interactive_env();
         }
         shell.set_script_name(&script_name);
-        let content = std::fs::read_to_string(script_arg_to_host_path(&script_name))?;
+        // niubash#406: a missing/unreadable script operand is the SHELL's
+        // diagnostic with the shell's statuses, not the launcher's raw
+        // `(os error 2)` + rc 1 — `niubash -- nosuch.sh` must answer like
+        // `bash -- nosuch.sh` (`bash: nosuch.sh: No such file or
+        // directory`, rc 127). The `_ =>` script branch below already does
+        // this; the `--`/ShellInvocation route reaches here instead.
+        let path = script_arg_to_host_path(&script_name);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => match error.kind() {
+                std::io::ErrorKind::NotFound => {
+                    eprintln!("niu: {script_name}: No such file or directory");
+                    piped_stdout::finish_and_exit(127);
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    eprintln!("niu: {script_name}: Permission denied");
+                    piped_stdout::finish_and_exit(126);
+                }
+                _ => return Err(error.into()),
+            },
+        };
         let code = shell.execute_script(&content)?;
         let code = shell.finish_with_exit_trap(code)?;
         finish_one_shot(&shell, code);
