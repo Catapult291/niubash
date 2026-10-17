@@ -135,8 +135,13 @@ fn run_main() -> ExitCode {
 
     // Expose the host binary path so rubash's bash shim can forward to niu.
     // WINUXSH_SHELL is a deprecated bridge for current rubash upstream.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(path) = exe.to_str() {
+    // Invoked through a `bash`/`sh` hardlink, `current_exe()` is that face; the
+    // contract these variables carry is the shell itself, so report the real
+    // `niu.exe` of this installation while `$BASH`/`$SHELL` keep following the
+    // invoked name (GNU: $BASH names the shell that is running).
+    if let Ok(invoked) = std::env::current_exe() {
+        let shell = niubash_runtime::shell_links::resolved_shell_path(&invoked);
+        if let Some(path) = shell.to_str() {
             std::env::set_var("NIU_SHELL", path);
             std::env::set_var("WINUXSH_SHELL", path);
         }
@@ -245,65 +250,80 @@ fn run(args: &[String]) -> anyhow::Result<()> {
         // `niu -c -l cmd` shape kept above): dispatch on argv[1].
         return dispatch_launcher_word(args, 1);
     }
-    match first.as_str() {
-        "setup" | "configure" => {
-            // niubash#195: `--help`/`-h` is a usage request, never a wizard
-            // run — always answer in plain text so piped output stays clean.
-            if args[2..].iter().any(|arg| arg == "-h" || arg == "--help") {
-                show_setup_usage();
-                return Ok(());
-            }
-            match setup_preset_arg(&args[2..]) {
-                Some(name) => niubash_runtime::setup_wizard::apply_preset(&name),
-                None => niubash_runtime::setup_wizard::rerun_wizard(),
-            }
-        }
-        "font" => niubash_runtime::fonts::run_font_command(),
-        "doctor" => niubash_runtime::doctor::run_doctor(skill::SKILL_FILES),
-        "config" => run_config_command(&args[2..]),
-        "plugin" => run_plugin_command(args),
-        "skill" => skill::run_skill_command(args),
-        _ => {
-            // Treat as a script file to execute
-            let mut shell = niubash_runtime::Shell::new()?;
-            // GNU shell.c:1572-1601 (open_shell_script): the script name is
-            // tried as given; when that fails and the name has no path
-            // separator it is searched in $PATH (findcmd.c find_path_file) —
-            // that is how `bash ls` finds and then refuses the binary
-            // /usr/bin/ls.
-            let mut script = script_arg_to_host_path(first);
-            if !script.exists() && !first.contains('/') && !first.contains('\\') {
-                if let Some(found) = shell.executor.find_script_on_path(first) {
-                    script = found;
+    if shell_face_name(args).is_none() {
+        match first.as_str() {
+            "setup" | "configure" => {
+                // niubash#195: `--help`/`-h` is a usage request, never a wizard
+                // run — always answer in plain text so piped output stays clean.
+                if args[2..].iter().any(|arg| arg == "-h" || arg == "--help") {
+                    show_setup_usage();
+                    return Ok(());
                 }
+                return match setup_preset_arg(&args[2..]) {
+                    Some(name) => niubash_runtime::setup_wizard::apply_preset(&name),
+                    None => niubash_runtime::setup_wizard::rerun_wizard(),
+                };
             }
-            if !script.exists() {
-                // shell.c shell_execve on a name that is neither option,
-                // builtin, nor file: ENOENT surface, EX_NOTFOUND (127).
-                eprintln!("niu: {}: No such file or directory", first);
-                piped_stdout::finish_and_exit(127);
-            }
-            // general.c:718-741 check_binary_file: NUL in the first line(s)
-            // or an ELF image is refused with EX_BINARY_FILE (126).
-            let bytes = std::fs::read(&script)?;
-            if rubash::script_driver::check_binary_file(&bytes)
-                || std::str::from_utf8(&bytes).is_err()
-            {
-                eprintln!("cannot execute binary file");
-                piped_stdout::finish_and_exit(126);
-            }
-            let content = String::from_utf8(bytes).unwrap_or_default();
-            shell.set_script_name(first);
-            shell.executor.inherit_process_stdin();
-            shell.enable_process_stdin_pipeline_bridge();
-            shell.source_non_interactive_env();
-            shell.executor.set_positional_params(args[2..].to_vec());
-            let code = shell.execute_script(&content)?;
-            let code = shell.finish_with_exit_trap(code)?;
-            finish_one_shot(&shell, code);
-            Ok(())
+            "font" => return niubash_runtime::fonts::run_font_command(),
+            "doctor" => return niubash_runtime::doctor::run_doctor(skill::SKILL_FILES),
+            "config" => return run_config_command(&args[2..]),
+            "plugin" => return run_plugin_command(args),
+            "skill" => return skill::run_skill_command(args),
+            // Anything else is a script name, for every face.
+            _ => {}
         }
     }
+    // Treat as a script file to execute
+    {
+        let mut shell = niubash_runtime::Shell::new()?;
+        // GNU shell.c:1572-1601 (open_shell_script): the script name is
+        // tried as given; when that fails and the name has no path
+        // separator it is searched in $PATH (findcmd.c find_path_file) —
+        // that is how `bash ls` finds and then refuses the binary
+        // /usr/bin/ls.
+        let mut script = script_arg_to_host_path(first);
+        if !script.exists() && !first.contains('/') && !first.contains('\\') {
+            if let Some(found) = shell.executor.find_script_on_path(first) {
+                script = found;
+            }
+        }
+        if !script.exists() {
+            // shell.c shell_execve on a name that is neither option,
+            // builtin, nor file: ENOENT surface, EX_NOTFOUND (127).
+            eprintln!("niu: {}: No such file or directory", first);
+            piped_stdout::finish_and_exit(127);
+        }
+        // general.c:718-741 check_binary_file: NUL in the first line(s)
+        // or an ELF image is refused with EX_BINARY_FILE (126).
+        let bytes = std::fs::read(&script)?;
+        if rubash::script_driver::check_binary_file(&bytes) || std::str::from_utf8(&bytes).is_err()
+        {
+            eprintln!("cannot execute binary file");
+            piped_stdout::finish_and_exit(126);
+        }
+        let content = String::from_utf8(bytes).unwrap_or_default();
+        shell.set_script_name(first);
+        shell.executor.inherit_process_stdin();
+        shell.enable_process_stdin_pipeline_bridge();
+        shell.source_non_interactive_env();
+        shell.executor.set_positional_params(args[2..].to_vec());
+        let code = shell.execute_script(&content)?;
+        let code = shell.finish_with_exit_trap(code)?;
+        finish_one_shot(&shell, code);
+        Ok(())
+    }
+}
+
+/// The shell face of this invocation, when `argv[0]` (or the forwarding shim's
+/// `NIU_INVOKED_AS`) names one. A shell reached as `bash`/`sh`/`ash`/`rbash`
+/// must behave like one: Niubash's product verbs are not shell words, and GNU
+/// bash reads the first non-option word as the script to run - `bash setup`
+/// runs a file named `setup`, it does not open a wizard (unixwin/niubash#377).
+fn shell_face_name(args: &[String]) -> Option<String> {
+    let invoked = std::env::var("NIU_INVOKED_AS")
+        .ok()
+        .or_else(|| args.first().cloned());
+    rubash::usage::invocation_help_name(invoked.as_deref())
 }
 
 /// Index of the launcher-owned word among the leading option words of `args`
@@ -324,6 +344,7 @@ fn launcher_dispatch_index(args: &[String]) -> Option<usize> {
         "--completion-probe",
         "--install-wt-profile",
         "--install-wt-shortcuts",
+        "--relink-shells",
         "--self-update",
         "--encoded-command",
     ];
@@ -360,10 +381,7 @@ fn dispatch_launcher_word(args: &[String], index: usize) -> anyhow::Result<()> {
     // for byte what the engine binary prints, while every niu-face
     // invocation keeps the product surfaces. -h/-V are deliberately NOT
     // forked (GNU -h is hashall, not help - rubash#596's oracle finding).
-    let invocation_face = std::env::var("NIU_INVOKED_AS")
-        .ok()
-        .or_else(|| args.first().cloned());
-    let face_name = rubash::usage::invocation_help_name(invocation_face.as_deref());
+    let face_name = shell_face_name(args);
     match word {
         "--help" if face_name.is_some() => {
             rubash::usage::show_shell_help(face_name.as_deref().unwrap_or("bash"), None);
@@ -391,6 +409,14 @@ fn dispatch_launcher_word(args: &[String], index: usize) -> anyhow::Result<()> {
         }
         "--install-wt-shortcuts" => {
             install_windows_terminal_shortcuts(rest)?;
+            Ok(())
+        }
+        "--relink-shells" => {
+            // The installer, the WinuxCmd link provider and a portable unzip
+            // call this after laying the tree down, and after an update
+            // replaced niu.exe: the shell faces become hardlinks to the real
+            // binary instead of forwarding shims (unixwin/niubash#377).
+            relink_shell_faces(rest)?;
             Ok(())
         }
         "--self-update" => self_update::run(rest),
@@ -4454,4 +4480,44 @@ mod tests {
         invocation.script = Some("D:/repo/probe.sh".to_string());
         assert_eq!(invocation_source_name(&invocation), "D:/repo/probe.sh");
     }
+}
+
+/// Point every `bash.exe`/`sh.exe` name of this installation at the running
+/// `niu.exe`, replacing forwarding shims where hardlinks are available.
+fn relink_shell_faces(rest: &[String]) -> anyhow::Result<()> {
+    let mut force = false;
+    let mut quiet = false;
+    for arg in rest {
+        match arg.as_str() {
+            "--force" => force = true,
+            "--quiet" => quiet = true,
+            other => anyhow::bail!("--relink-shells: unknown argument '{other}'"),
+        }
+    }
+
+    let niu = std::env::current_exe()
+        .map_err(|error| anyhow::anyhow!("cannot determine the running niu.exe: {error}"))?;
+    let root = niubash_runtime::shell_links::find_installation_root(&niu);
+    let report = niubash_runtime::shell_links::link_shell_faces(&root, &niu, force);
+
+    if !quiet {
+        println!(
+            "niu: shell links under {}: {} created, {} already current, {} skipped, {} failed",
+            root.display(),
+            report.created.len(),
+            report.already_current.len(),
+            report.skipped.len(),
+            report.failed.len()
+        );
+        for (path, reason) in &report.skipped {
+            println!("  skipped {}: {reason}", path.display());
+        }
+    }
+    if !report.failed.is_empty() {
+        for (path, error) in &report.failed {
+            eprintln!("niu: failed to link {}: {error}", path.display());
+        }
+        anyhow::bail!("{} shell link(s) could not be created", report.failed.len());
+    }
+    Ok(())
 }
