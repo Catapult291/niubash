@@ -34,7 +34,7 @@ git (hooks, `git bisect`, `git mergetool`) run on niubash's own `sh`. The
 Linux and macOS builds
 are portable `niu` binaries that use your system's own tools. niu is not
 MSYS2, Cygwin, Git Bash, or WSL — there is no POSIX emulation layer and no
-path-translation machinery. The full per-platform contract, including the
+path-conversion heuristics. The full per-platform contract, including the
 honest status of every target, lives in
 [platform-support.md](docs/src/platform-support.md).
 

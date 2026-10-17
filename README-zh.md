@@ -25,7 +25,7 @@
 来自 [winuxcmd](https://github.com/unixwin/winuxcmd) 的真 Unix 命令、
 带 git 状态的 prompt，以及带权限模型的插件系统。Linux 与 macOS 构建是
 便携 `niu` 二进制，直接用系统自带的工具。niu 不是 MSYS2、Cygwin、Git Bash，
-也不是 WSL——没有 POSIX 模拟层，也没有路径转换机器。每个平台的完整契约
+也不是 WSL——没有 POSIX 模拟层，也没有启发式的路径转换。每个平台的完整契约
 （包括每个目标的诚实状态）见
 [platform-support.md](docs/src/platform-support.md)。
 
