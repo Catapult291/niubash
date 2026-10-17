@@ -1,0 +1,88 @@
+name: pin-freshness
+
+# `scripts/release/preinstall.json` and `scripts/release/winuxcmd-pin.json` are
+# release policy: the release workflow refuses to bundle an engine or a
+# pre-install package whose digest does not match its pin. That check cannot
+# notice a pin that is merely *old* - the digest still matches the release it
+# names - so a stale pin quietly ships an older engine and nothing fails.
+#
+# This is the detector. Weekly, and on demand, it compares the pins with the
+# index a release consumes, and turns drift into a tracking issue instead of a
+# surprise. Run it before cutting a release, or with --fail-on-stale anywhere a
+# stale pin should block.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays, 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the checker
+        run: python scripts/release/check-pins.py --self-test
+
+      - name: Compare the pins with the published index
+        id: check
+        run: |
+          set +e
+          python scripts/release/check-pins.py --fail-on-stale | tee pin-report.txt
+          echo "stale=$?" >> "$GITHUB_OUTPUT"
+
+      - name: File or update the tracking issue
+        if: steps.check.outputs.stale != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create pin-stale \
+            --description "A release pin lags the published wpm index" \
+            --color FBCA04 2>/dev/null || true
+          {
+            echo "The release pins lag the published wpm index, so the next release would bundle an older engine or package."
+            echo
+            echo '```'
+            cat pin-report.txt
+            echo '```'
+            echo
+            echo "Bump them in \`scripts/release/\` (measure the digests from the published assets), or re-run this workflow:"
+            echo
+            echo '\`gh workflow run pin-freshness.yml\`'
+          } > pin-body.md
+          number=$(gh issue list --label pin-stale --state open --json number -q '.[0].number')
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body-file pin-body.md
+          else
+            gh issue create \
+              --title "release pins lag the published wpm index" \
+              --label pin-stale \
+              --body-file pin-body.md
+          fi
+
+      - name: Close the tracking issue when the pins are current again
+        if: steps.check.outputs.stale == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          number=$(gh issue list --label pin-stale --state open --json number -q '.[0].number')
+          if [ -n "$number" ]; then
+            gh issue close "$number" --comment "Pins match the published index again."
+          fi
+
+      - name: Keep the report as an artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pin-report
+          path: pin-report.txt
+          if-no-files-found: ignore
