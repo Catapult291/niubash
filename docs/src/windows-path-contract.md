@@ -55,8 +55,11 @@ namespace resolved to the real Windows temp directory (`TMPDIR`, else
 (unixwin/niubash#94). `/var/tmp` resolves beside it as
 `<real temp>/var/tmp`. For every child that is not a bundled WinuxCmd applet,
 external command arguments are translated by the Rubash executor with the same
-rules — including `/mnt/X` drive spellings and `/dev/null` — so there is
-exactly one path-semantics owner and no host-side AST rewrite.
+rules — including `/mnt/X` drive spellings — so there is
+exactly one path-semantics owner and no host-side AST rewrite. Device spellings
+such as `/dev/null` are not part of that set; as arguments they reach the child
+verbatim. One child class is exempt from the drive-form rewrite, described under
+Shell Namespace Ownership.
 
 Command lookup and native child `PATH` use these real directories directly.
 Rubash does not merge a second provider directory, and WinuxCmd coreutils do
@@ -80,9 +83,19 @@ paths — never both, and never a guess about the child's capabilities:
   the real `seq.exe` while `ls -d` keeps the operand spelling, so
   `head -1 /usr/bin/seq` and `test -f /usr/bin/seq` agree (niubash#177).
 - **Every other child — a native Windows program, or a foreign POSIX runtime
-  such as MSYS2 or Cygwin — always receives native Windows paths.** There is
+  such as MSYS2 or Cygwin — receives native Windows paths.** There is
   no per-child capability probe and no `MSYS_NO_PATHCONV`-style switch; a
   foreign runtime is treated exactly like a native program.
+- **One exception, and it is not a capability probe: `cmd.exe`.** A
+  single-letter drive form such as `/d/repo` or `/c/Users` reaches `cmd.exe`
+  verbatim, because `/d` and `/c` are indistinguishable from `cmd`'s own
+  switches. Root forms and `/mnt/X` spellings are still translated, so
+  `cmd /c echo /usr/bin` and `cmd /c echo /mnt/c/Users` arrive native while
+  `cmd /c echo /d/repo` does not. The exemption is pinned in Rubash
+  (`is_windows_command_processor`, and the
+  `windows_cmd_switches_are_not_mapped_into_shell_root` test) and applies to
+  `cmd.exe` alone: a native program that is not `cmd` receives `/d/repo` as
+  `D:\repo`.
 
 The boundary is structural rather than a rename of the "MSYS NO CONV"
 problem: the shell never asks a child what it can understand. The shipped
@@ -105,6 +118,7 @@ It must not implement Rubash builtins such as `cd`, `export`, `set`, `read`,
 `~` is `USERPROFILE`, the same directory used by PowerShell. Windows paths
 such as `C:/work/file` and `/c/work/file` remain host paths.
 
-The only device spelling currently supported is `/dev/null`, mapped to the
-native `NUL` endpoint. Other `/dev` entries do not become ordinary files until
-their fd or terminal capability is implemented.
+The only device spelling currently supported is `/dev/null`. As a redirect
+target it is mapped to the native `NUL` endpoint; as an external-command
+argument it reaches the child verbatim, like the other `/dev` entries, which do
+not become ordinary files until their fd or terminal capability is implemented.
