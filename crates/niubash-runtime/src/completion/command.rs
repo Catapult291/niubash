@@ -58,9 +58,10 @@ impl CommandCompleter {
             "fg".to_string(),
             "bg".to_string(),
             "set".to_string(),
-            "setopt".to_string(),
+            // rubash#759 item 4 dropped the zsh setopt/unsetopt aliases;
+            // option management is the bash-aligned `shopt` builtin now.
+            "shopt".to_string(),
             "unset".to_string(),
-            "unsetopt".to_string(),
             "export".to_string(),
             "env".to_string(),
             "help".to_string(),
@@ -161,9 +162,10 @@ impl CommandCompleter {
             "fg".to_string(),
             "bg".to_string(),
             "set".to_string(),
-            "setopt".to_string(),
+            // rubash#759 item 4 dropped the zsh setopt/unsetopt aliases;
+            // option management is the bash-aligned `shopt` builtin now.
+            "shopt".to_string(),
             "unset".to_string(),
-            "unsetopt".to_string(),
             "export".to_string(),
             "env".to_string(),
             "help".to_string(),
@@ -402,8 +404,12 @@ mod tests {
     fn test_get_builtin_commands() {
         let commands = CommandCompleter::get_builtin_commands();
         assert!(commands.contains(&"cd".to_string()));
-        assert!(commands.contains(&"setopt".to_string()));
-        assert!(commands.contains(&"unsetopt".to_string()));
+        // The inventory is delegated live from rubash, whose #759 item 4
+        // dropped the zsh setopt/unsetopt aliases; option management is
+        // served by the bash-aligned shopt builtin.
+        assert!(commands.contains(&"shopt".to_string()));
+        assert!(!commands.contains(&"setopt".to_string()));
+        assert!(!commands.contains(&"unsetopt".to_string()));
         assert!(!commands.contains(&"ls".to_string()));
         assert!(!commands.contains(&"cp".to_string()));
         assert!(!commands.contains(&"self-update".to_string()));

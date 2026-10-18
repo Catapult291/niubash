@@ -829,8 +829,8 @@ fn temporary_assignment_reaches_nested_niubash_child() {
 }
 
 #[test]
-fn rubash_setopt_is_visible_when_sourcing_startup_rc() {
-    let temp = unique_temp_dir("niubash-host-setopt");
+fn rubash_shopt_is_visible_when_sourcing_startup_rc() {
+    let temp = unique_temp_dir("niubash-host-shopt");
     let home = temp.join("home");
     let start = temp.join("start");
     std::fs::create_dir_all(&home).unwrap();
@@ -844,38 +844,51 @@ plugins=(
     git
     completion
 )
-setopt hist_ignore_dups
-setopt hist_ignore_space prompt_subst prompt_percent brace_expand tilde_expand variable_expand command_subst arith_expand monitor
-unsetopt prompt_percent
-export SETOPT_RC_OK=ok
+shopt -s extglob
+shopt -s cmdhist dotglob checkwinsize expand_aliases
+shopt -u dotglob
+export SHOPT_RC_OK=ok
 "#,
     )
     .unwrap();
 
     let output = run_niu(
         &format!(
-            "source {}; echo $SETOPT_RC_OK; setopt",
+            "source {}; echo $SHOPT_RC_OK; shopt",
             shell_quote(&shell_path(&rc))
         ),
         &start,
         &home,
         &[],
     );
-    assert_success(&output, "source .winshrc setopt");
+    assert_success(&output, "source .winshrc shopt");
     assert_eq!(normalize_text(&output.stderr), "");
 
     let stdout = stdout_lines(&output);
     assert!(stdout.contains(&"ok".to_string()), "stdout was {stdout:?}");
+
+    // The contract pinned here is that option builtins are visible while the
+    // startup rc is sourced and that the state they set survives into the
+    // live shell. rubash#759 item 4 dropped the zsh `setopt`/`unsetopt`
+    // aliases, so this rides the bash-aligned `shopt` surface: bare `shopt`
+    // lists every option with its state, and `extglob`/`expand_aliases` are
+    // off by default, so "on" here proves the rc's `-s` actually landed; the
+    // set-then-unset `dotglob` plus the empty-stderr gate prove both the `-s`
+    // batch form and `-u` parsed and ran inside the sourced rc.
+    let state_of = |name: &str| -> String {
+        stdout
+            .iter()
+            .find(|line| line.starts_with(name))
+            .unwrap_or_else(|| panic!("shopt output missing {name}: {stdout:?}"))
+            .clone()
+    };
+    assert!(state_of("extglob").ends_with("on"), "stdout was {stdout:?}");
     assert!(
-        stdout.contains(&"hist_ignore_dups".to_string()),
+        state_of("expand_aliases").ends_with("on"),
         "stdout was {stdout:?}"
     );
     assert!(
-        stdout.contains(&"hist_ignore_space".to_string()),
-        "stdout was {stdout:?}"
-    );
-    assert!(
-        !stdout.contains(&"prompt_percent".to_string()),
+        state_of("dotglob").ends_with("off"),
         "stdout was {stdout:?}"
     );
 
