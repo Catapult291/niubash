@@ -279,6 +279,7 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
 /// replaces the default System32-only PATH (extra tools a driven subcommand
 /// needs, e.g. git for the wizard's collection install).
 fn niu_command(
+    binary: &Path,
     home: &Path,
     start: &Path,
     extra_env: &[(String, String)],
@@ -290,7 +291,7 @@ fn niu_command(
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
     let system32 = system_root.join("System32");
 
-    let mut command = CommandBuilder::new(niu_binary());
+    let mut command = CommandBuilder::new(binary);
     command.cwd(start);
     command.env_clear();
     command.env("SystemRoot", system_root.clone());
@@ -345,17 +346,28 @@ fn try_spawn_inner(
     timeout: Duration,
 ) -> Option<NiuSession> {
     let root = unique_temp_dir(prefix);
-    try_spawn_in_root(root, rc, args, extra_env, path_dirs, size, timeout)
+    try_spawn_in_root(
+        root,
+        niu_binary().as_path(),
+        rc,
+        args,
+        extra_env,
+        path_dirs,
+        size,
+        timeout,
+    )
 }
 
 /// The spawn core over a root the caller manages: the niubash#180 journey
 /// runs `niu setup` as a child of the live session, so the wizard child and
 /// the parent REPL must share one HOME (the caller stages rc, sources, and
 /// trust state into `root/home` before spawning). The root is still removed
-/// on drop.
+/// on drop. `binary` is the executable the session runs (the niu binary,
+/// or a copy staged under an invocation face).
 #[allow(clippy::too_many_arguments)]
 fn try_spawn_in_root(
     root: PathBuf,
+    binary: &Path,
     rc: Option<&str>,
     args: &[String],
     extra_env: &[(String, String)],
@@ -383,7 +395,7 @@ fn try_spawn_in_root(
     let master = pair.master;
     let slave = pair.slave;
 
-    let command = niu_command(&home, &start, extra_env, args, path_dirs);
+    let command = niu_command(binary, &home, &start, extra_env, args, path_dirs);
     let child = slave.spawn_command(command).ok()?;
     // The parent holds only the master side; dropping the slave closes the
     // fd/handle that would otherwise keep the pty alive after the child exits.
@@ -558,6 +570,7 @@ impl NiuSession {
     ) -> NiuSession {
         try_spawn_in_root(
             root.to_path_buf(),
+            niu_binary().as_path(),
             Some(rc),
             &[],
             extra_env,
@@ -569,6 +582,38 @@ impl NiuSession {
             panic!(
                 "niu session over {root:?} could not be spawned under a pseudo \
                  terminal after a successful probe"
+            )
+        })
+    }
+
+    /// Spawn `niu <args>` over a home the test staged beforehand, like
+    /// [`spawn_shared_home`] with the argv the login/startup tests need:
+    /// the niubash#399 cases stage `.bash_profile`/`.bash_login`/`.profile`
+    /// into `root/home` before the process exists, then run `-l` command or
+    /// script faces over that exact home.
+    pub fn spawn_shared_home_with_args(
+        root: &Path,
+        rc: &str,
+        args: &[&str],
+        extra_env: &[(String, String)],
+        size: (u16, u16),
+        timeout: Duration,
+    ) -> NiuSession {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        try_spawn_in_root(
+            root.to_path_buf(),
+            niu_binary().as_path(),
+            Some(rc),
+            &args,
+            extra_env,
+            &[],
+            size,
+            timeout,
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "niu session {args:?} over {root:?} could not be spawned under a \
+                 pseudo terminal after a successful probe"
             )
         })
     }

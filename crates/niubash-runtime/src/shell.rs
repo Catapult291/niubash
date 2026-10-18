@@ -1039,6 +1039,84 @@ impl Shell {
         exit
     }
 
+    /// True when this session is a login shell: `--login`/`-l` (the engine's
+    /// `apply_to_executor` records the flag) or an argv[0] whose basename
+    /// starts with `-' (shell.c set_shell_name; Shell::new records the same
+    /// marker), so the login profile chain replaces the rc / BASH_ENV
+    /// branches of the startup path (niubash#399).
+    pub fn login_shell_active(&self) -> bool {
+        self.executor.get_env("__RUBASH_LOGIN_SHELL").as_deref() == Some("1")
+    }
+
+    /// The login profile chain (GNU shell.c:1836-1880
+    /// run_login_profile_files, the same order the engine's
+    /// `invocation::login_profile_files` implements): /etc/profile —
+    /// resolved through the shell root on Windows, so the winuxcmd tree's
+    /// `etc` directory answers when one ships — then the FIRST EXISTING of
+    /// ~/.bash_profile, ~/.bash_login, ~/.profile. A missing candidate is
+    /// skipped silently (open_startup_file's failed fopen is not an error).
+    fn login_profile_paths(&self) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let system_profile = self.executor.resolve_shell_path("/etc/profile");
+        if system_profile.is_file() {
+            files.push(system_profile);
+        }
+        for name in [".bash_profile", ".bash_login", ".profile"] {
+            let candidate = self.home_dir.join(name);
+            if candidate.is_file() {
+                files.push(candidate);
+                break;
+            }
+        }
+        files
+    }
+
+    /// The login branch of the startup path (niubash#399): source the
+    /// profile chain with the same maybe_execute_file discipline and
+    /// exit-jump plumbing as the rc (niubash#402), then run the same
+    /// REPL-only tail. `--noprofile` skips the files but keeps the branch:
+    /// a login shell never falls through to the rc / BASH_ENV alternatives
+    /// (GNU shell.c:1833). Returns `Some(status)` when a profile ended with
+    /// a top-level `exit`.
+    fn run_login_startup(&mut self, repl: bool) -> Option<i32> {
+        if repl {
+            self.executor.set_env("NIU_REPL_STARTUP", "1");
+        }
+        let exit = self.source_login_profile_files();
+        if let Some(status) = exit {
+            // niubash#402 discipline: the jump's status must survive the
+            // marker cleanup, and none of the remaining startup steps run.
+            if repl {
+                self.executor.unset_env("NIU_REPL_STARTUP");
+            }
+            return Some(status);
+        }
+        if repl {
+            let _ = self.execute_script("unset NIU_REPL_STARTUP");
+        }
+        self.update_completion_state();
+        if repl {
+            self.finish_startup();
+            self.run_greeting_hooks();
+        }
+        None
+    }
+
+    /// Source the login profile chain (see [`Self::login_profile_paths`]),
+    /// honouring `--noprofile`. Returns `Some(status)` when a profile ended
+    /// with a top-level `exit` (the niubash#402 unwind, niubash#399).
+    fn source_login_profile_files(&mut self) -> Option<i32> {
+        if self.no_profile {
+            return None;
+        }
+        for path in self.login_profile_paths() {
+            if let Some(status) = self.source_startup_file(&path) {
+                return Some(status);
+            }
+        }
+        None
+    }
+
     fn run_startup_files(&mut self, repl: bool) -> Option<i32> {
         // niubash#180 baseline: this session sources the current rc right
         // now, so a marker left by a setup that ran before this session
@@ -1049,14 +1127,24 @@ impl Shell {
         normalize_executor_home_env(&mut self.executor, &self.home_dir);
         ensure_windows_profile_env(&mut self.executor, &self.home_dir);
         ensure_prompt_terminal_env(&mut self.executor);
+        // GNU shell.c:1833 run_startup_files: the login branch is checked
+        // first and replaces the interactive-rc alternative entirely — a
+        // login shell sources the profile chain whether or not it is
+        // interactive, and --rcfile (a bashrc_file concept) is never
+        // consulted on it. niubash#399: an `exit` in a profile ends the
+        // invocation with the profile's status before any prompt or command
+        // line, like every other startup file (niubash#402).
+        if self.login_shell_active() {
+            return self.run_login_startup(repl);
+        }
         // GNU shell.c:1241-1246 (bash --posix) and shell.c:1238-1239 (invoked
         // as sh, which Shell::new turns into posix mode): the interactive
         // startup file is `$ENV`, not the bash rc file, and an unset `$ENV`
         // sources nothing. --rcfile is a bashrc_file concept and is ignored
-        // in this branch.
+        // in this branch. An `exit` in the file ends the invocation with its
+        // status (niubash#399).
         if self.posix_mode_active() {
-            self.execute_env_file("ENV");
-            return None;
+            return self.execute_env_file("ENV");
         }
         if self.no_rc {
             return None;
@@ -1135,7 +1223,10 @@ impl Shell {
     /// GNU shell.c:1103 execute_env_file: an unset or empty variable sources
     /// nothing; otherwise the value is expanded and the file executed with
     /// FEVAL_ENOENTOK (a missing file is silently skipped, evalfile.c:120).
-    fn execute_env_file(&mut self, name: &str) {
+    /// Returns `Some(status)` when the file ended with a top-level `exit`
+    /// (niubash#399: GNU ends the shell with that status — an `exit` in a
+    /// posix `$ENV` file under `-i -c` terminates the invocation).
+    fn execute_env_file(&mut self, name: &str) -> Option<i32> {
         // GNU get_string_value reads the shell variable table, which at
         // startup-file time is the inherited environment; prefer the
         // executor table so an earlier startup file could export it.
@@ -1146,33 +1237,42 @@ impl Shell {
             .or_else(|| std::env::var(name).ok())
             .filter(|value| !value.trim().is_empty());
         let Some(raw) = raw else {
-            return;
+            return None;
         };
 
         normalize_executor_home_env(&mut self.executor, &self.home_dir);
         let path = self.resolve_non_interactive_env_path(&raw);
         if !path.exists() {
             // GNU evalfile.c:120: ENOENT with FEVAL_ENOENTOK is silent.
-            return;
+            return None;
         }
         if !path.is_file() {
             eprintln!("niu: {}: Is a directory", path.display());
-            return;
+            return None;
         }
-        self.source_startup_file(&path);
+        let exit = self.source_startup_file(&path);
         self.update_completion_state();
+        exit
     }
 
-    /// Source the non-interactive environment file if one is configured.
+    /// Source the non-interactive startup files. GNU shell.c:722
+    /// run_startup_files: a login shell sources the login profile chain —
+    /// never BASH_ENV — whether or not a command string follows
+    /// (niubash#399); the BASH_ENV / NIU_ENV file is the non-login
+    /// alternative (shell.c:1214-1220). Returns `Some(status)` when a
+    /// startup file ended with a top-level `exit` (the niubash#402 unwind):
+    /// the caller must end the invocation with that status instead of
+    /// running its command line or script — GNU ends the shell for a
+    /// profile `exit` and for a BASH_ENV `exit` alike.
     ///
-    /// Mirrors GNU bash's BASH_ENV behavior (shell.c:1214-1220): a
-    /// non-interactive, non-posix, bash-mode shell sources the file named by
-    /// the environment variable before running its command or script. POSIX
-    /// mode and sh-invoked shells source no environment file at all —
-    /// `$ENV` is interactive-only under POSIX (shell.c:1244). Niubash adds a
-    /// dedicated NIU_ENV variable that takes precedence over BASH_ENV in
-    /// every mode, so an agent shell can point at a dedicated init file
-    /// without touching the bash-compatible name.
+    /// The env-file branch mirrors GNU bash's BASH_ENV behavior
+    /// (shell.c:1214-1220): a non-interactive, non-posix, bash-mode shell
+    /// sources the file named by the environment variable before running
+    /// its command or script. POSIX mode and sh-invoked shells source no
+    /// environment file at all — `$ENV` is interactive-only under POSIX
+    /// (shell.c:1244). Niubash adds a dedicated NIU_ENV variable that takes
+    /// precedence over BASH_ENV in every mode, so an agent shell can point
+    /// at a dedicated init file without touching the bash-compatible name.
     ///
     /// GNU's sshd/rshd special case (shell.c:1156-1180, `-c` over ssh
     /// sourcing the bashrc file) does not apply: its `SSH_CLIENT`/
@@ -1187,12 +1287,17 @@ impl Shell {
     /// that keeps `niu -c` fast and deterministic. Only the user's single init
     /// file is sourced: no plugins, prompts, or completion machinery is loaded,
     /// so interactive-only content stays out of the one-shot execution path.
-    pub fn source_non_interactive_env(&mut self) {
-        self.source_non_interactive_startup_file();
+    pub fn source_non_interactive_env(&mut self) -> Option<i32> {
+        let exit = if self.login_shell_active() {
+            self.source_login_profile_files()
+        } else {
+            self.source_non_interactive_startup_file()
+        };
         self.finish_startup();
+        exit
     }
 
-    fn source_non_interactive_startup_file(&mut self) {
+    fn source_non_interactive_startup_file(&mut self) -> Option<i32> {
         let niu_raw = std::env::var(NIU_ENV_VAR)
             .ok()
             .filter(|value| !value.trim().is_empty());
@@ -1207,7 +1312,7 @@ impl Shell {
                 .filter(|value| !value.trim().is_empty())
         };
         let Some(raw) = niu_raw.or(bash_raw) else {
-            return;
+            return None;
         };
 
         normalize_executor_home_env(&mut self.executor, &self.home_dir);
@@ -1216,14 +1321,18 @@ impl Shell {
             // GNU maybe_execute_file passes FEVAL_ENOENTOK (evalfile.c:345):
             // a missing BASH_ENV file is skipped silently, keeping `-c`
             // stdout/stderr byte-stable for one-shot agents.
-            return;
+            return None;
         }
         if !path.is_file() {
             eprintln!("niu: {}: Is a directory", path.display());
-            return;
+            return None;
         }
-        self.source_startup_file(&path);
+        // niubash#399: an `exit` in the env file is a jump like any other
+        // startup file's (GNU ends the shell with its status); propagate it
+        // so the invoker terminates before the command line runs.
+        let exit = self.source_startup_file(&path);
         self.update_completion_state();
+        exit
     }
 
     /// Resolve a non-interactive environment file path from the raw value of
@@ -4175,7 +4284,7 @@ alias hello='echo from-alias'
 
         let mut shell = test_shell(HookConfig::default());
         shell.home_dir = home.clone();
-        shell.source_non_interactive_env();
+        let _ = shell.source_non_interactive_env();
 
         assert!(shell.executor.get_env("NIU_AGENT_ENV").is_none());
 
@@ -4202,7 +4311,7 @@ alias hello='echo from-alias'
 
         let mut shell = test_shell(HookConfig::default());
         shell.home_dir = home;
-        shell.source_non_interactive_env();
+        let _ = shell.source_non_interactive_env();
 
         assert_eq!(shell.executor.get_env("NIU_AGENT_ENV"), Some("loaded"));
         // Aliases defined in the env file work in subsequent commands.
@@ -4227,7 +4336,7 @@ alias hello='echo from-alias'
 
         let mut shell = test_shell(HookConfig::default());
         shell.home_dir = home;
-        shell.source_non_interactive_env();
+        let _ = shell.source_non_interactive_env();
 
         assert_eq!(shell.executor.get_env("NIU_AGENT_ENV"), Some("bash-loaded"));
 
@@ -4252,7 +4361,7 @@ alias hello='echo from-alias'
 
         let mut shell = test_shell(HookConfig::default());
         shell.home_dir = home;
-        shell.source_non_interactive_env();
+        let _ = shell.source_non_interactive_env();
 
         assert_eq!(shell.executor.get_env("NIU_AGENT_ENV"), Some("from-niu"));
 
@@ -4278,7 +4387,7 @@ alias hello='echo from-alias'
 
         let mut shell = test_shell(HookConfig::default());
         shell.home_dir = home;
-        shell.source_non_interactive_env();
+        let _ = shell.source_non_interactive_env();
 
         assert_eq!(
             shell.executor.get_env("NIU_AGENT_ENV"),
@@ -4307,7 +4416,7 @@ alias hello='echo from-alias'
 
         let mut shell = test_shell(HookConfig::default());
         shell.home_dir = home;
-        shell.source_non_interactive_env();
+        let _ = shell.source_non_interactive_env();
 
         assert!(shell.executor.get_env("NIU_AGENT_ENV").is_none());
 
@@ -4571,7 +4680,7 @@ complete -F _envtooldyn_hook envtooldyn
 
         let mut shell = Shell::new().unwrap();
         shell.home_dir = home;
-        shell.source_non_interactive_env();
+        let _ = shell.source_non_interactive_env();
 
         // Issue #307: `complete` registrations from NIU_ENV land in the
         // engine compspec registry — the state `--completion-probe` serves

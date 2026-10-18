@@ -2169,3 +2169,323 @@ fn empty_line_paste_under_claimed_prompt_executes_both_lines() {
     s.expect(PASTE_MARKER_A_OUT);
     s.expect(PASTE_MARKER_B_OUT);
 }
+
+// ---------------------------------------------------------------------------
+// niubash#399: the login profile chain (and every remaining startup-file
+// face) honors a top-level `exit` by ending the invocation with its status.
+// Oracle: WSL GNU Bash 5.3.0 over stdin (`bash -l -c ...` against a scratch
+// HOME): a profile `exit 9` prints the profile's marker and exits 9, the
+// command line never runs; /etc/profile precedes the FIRST EXISTING of
+// ~/.bash_profile > ~/.bash_login > ~/.profile; --noprofile skips the
+// chain; a login shell never sources the rc or BASH_ENV; a BASH_ENV or
+// posix-$ENV `exit` ends the shell the same way.
+// ---------------------------------------------------------------------------
+
+/// Unique sandbox root the test stages login profiles into before the
+/// session exists (mirrors the driver's own temp-dir discipline).
+fn login_sandbox(label: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("niu-login-{label}-{}-{nanos}", std::process::id()))
+}
+
+/// Stage `content` at `root/home/<name>`, creating the home first.
+fn stage_login_file(root: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let path = home.join(name);
+    std::fs::write(&path, content).unwrap();
+    path
+}
+
+/// A profile `exit` ends a `-l -c` invocation with the profile's status
+/// before the command string runs (GNU: `bash -l -c` over a scratch HOME
+/// with `.bash_profile` = "echo marker; exit 9" prints the marker, rc 9).
+#[test]
+fn issue399_login_profile_exit_terminates_command_line() {
+    if !require_pty_or_skip("issue399_login_profile_exit_terminates_command_line") {
+        return;
+    }
+    let root = login_sandbox("bp-exit");
+    stage_login_file(&root, ".bash_profile", "echo BP-RAN-$((40/4))\nexit 9\n");
+    let mut s = NiuSession::spawn_shared_home_with_args(
+        &root,
+        &driver::default_rc(),
+        &["-l", "-c", "echo AFTER-$((3*3))"],
+        &[],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("BP-RAN-10");
+    let code = s.wait_exit();
+    assert_eq!(
+        code, 9,
+        "the profile's exit status is the invocation status"
+    );
+    s.expect_absent("AFTER-9", ABSENT_WINDOW);
+}
+
+/// The chain sources only the FIRST EXISTING candidate: `.bash_profile`
+/// beats `.bash_login` beats `.profile` (GNU shell.c:1863-1880).
+#[test]
+fn issue399_login_profile_chain_first_existing_wins() {
+    if !require_pty_or_skip("issue399_login_profile_chain_first_existing_wins") {
+        return;
+    }
+    let root = login_sandbox("chain-bp");
+    stage_login_file(&root, ".bash_profile", "echo FROM-BP-$((5*2))\n");
+    stage_login_file(&root, ".bash_login", "echo FROM-BL\n");
+    stage_login_file(&root, ".profile", "echo FROM-PROF\n");
+    let mut s = NiuSession::spawn_shared_home_with_args(
+        &root,
+        &driver::default_rc(),
+        &["-l", "-c", "echo AFTER-$((2*5))"],
+        &[],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("FROM-BP-10");
+    s.expect("AFTER-10");
+    s.expect_absent("FROM-BL", ABSENT_WINDOW);
+    s.expect_absent("FROM-PROF", ABSENT_WINDOW);
+    assert_eq!(s.wait_exit(), 0);
+}
+
+/// Fallback: with no `.bash_profile`/`.bash_login`, `.profile` is sourced.
+#[test]
+fn issue399_login_profile_chain_falls_back_to_profile() {
+    if !require_pty_or_skip("issue399_login_profile_chain_falls_back_to_profile") {
+        return;
+    }
+    let root = login_sandbox("chain-prof");
+    stage_login_file(&root, ".profile", "echo FROM-PROF-$((9-3))\n");
+    let mut s = NiuSession::spawn_shared_home_with_args(
+        &root,
+        &driver::default_rc(),
+        &["-l", "-c", "echo AFTER-OK"],
+        &[],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("FROM-PROF-6");
+    s.expect("AFTER-OK");
+    assert_eq!(s.wait_exit(), 0);
+}
+
+/// `--noprofile` skips the chain entirely (GNU: nothing sourced, the
+/// command still runs), while the plain non-login face never sources it.
+#[test]
+fn issue399_login_noprofile_skips_chain_and_nonlogin_ignores_it() {
+    if !require_pty_or_skip("issue399_login_noprofile_skips_chain_and_nonlogin_ignores_it") {
+        return;
+    }
+    let root = login_sandbox("noprofile");
+    stage_login_file(&root, ".bash_profile", "echo FROM-BP-$((8-8))\n");
+    let mut s = NiuSession::spawn_shared_home_with_args(
+        &root,
+        &driver::default_rc(),
+        // GNU 5.3 parses `-l --noprofile` as `--` (option-word quirk); the
+        // working order is the long flag first.
+        &["--noprofile", "-l", "-c", "echo AFTER-$((4+4))"],
+        &[],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("AFTER-8");
+    s.expect_absent("FROM-BP-0", ABSENT_WINDOW);
+    assert_eq!(s.wait_exit(), 0);
+
+    let root2 = login_sandbox("nonlogin-control");
+    stage_login_file(&root2, ".bash_profile", "echo FROM-BP-$((8-8))\n");
+    let mut s2 = NiuSession::spawn_shared_home_with_args(
+        &root2,
+        &driver::default_rc(),
+        &["-c", "echo AFTER-$((4+4))"],
+        &[],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s2.expect("AFTER-8");
+    s2.expect_absent("FROM-BP-0", ABSENT_WINDOW);
+    assert_eq!(s2.wait_exit(), 0);
+}
+
+/// A login shell sources the profile chain INSTEAD of the rc file and
+/// BASH_ENV, interactive or not (GNU shell.c:1833 — L1/L11 oracles: `-l -i`
+/// sources /etc/profile + the profile, never ~/.bashrc; BASH_ENV stays
+/// unread).
+#[test]
+fn issue399_login_sources_profile_not_rc_or_bash_env() {
+    if !require_pty_or_skip("issue399_login_sources_profile_not_rc_or_bash_env") {
+        return;
+    }
+    let root = login_sandbox("login-exclusive");
+    let profile = stage_login_file(&root, ".bash_profile", "echo FROM-BP-$((6+6))\n");
+    let env_file = stage_login_file(&root, "env.src", "echo FROM-BASH-ENV\n");
+    let bash_env = (
+        "BASH_ENV".to_string(),
+        env_file.to_string_lossy().into_owned(),
+    );
+    let mut s = NiuSession::spawn_shared_home_with_args(
+        &root,
+        // The rc content must not run on the login face.
+        "echo FROM-RC\nPS1='P1> '\nPS2='P2> '\nNIU_DISABLE_DEFAULT_PLUGINS=1\n",
+        &["-l", "-i", "-c", "echo AFTER-$((2*6))"],
+        &[bash_env],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    let _ = profile;
+    s.expect("FROM-BP-12");
+    s.expect("AFTER-12");
+    s.expect_absent("FROM-RC", ABSENT_WINDOW);
+    s.expect_absent("FROM-BASH-ENV", ABSENT_WINDOW);
+    assert_eq!(s.wait_exit(), 0);
+}
+
+/// A profile `exit` also ends a `-l script` invocation before the script
+/// body runs (GNU L4: marker, rc 9, script never executed).
+#[test]
+fn issue399_login_profile_exit_terminates_before_script() {
+    if !require_pty_or_skip("issue399_login_profile_exit_terminates_before_script") {
+        return;
+    }
+    let root = login_sandbox("bp-script");
+    stage_login_file(&root, ".bash_profile", "echo BP-X-$((9+8))\nexit 9\n");
+    let script = stage_login_file(&root, "late.sh", "echo SCRIPT-RAN\n");
+    let mut s = NiuSession::spawn_shared_home_with_args(
+        &root,
+        &driver::default_rc(),
+        &["-l", script.to_string_lossy().as_ref()],
+        &[],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("BP-X-17");
+    let code = s.wait_exit();
+    assert_eq!(
+        code, 9,
+        "the profile's exit status is the invocation status"
+    );
+    s.expect_absent("SCRIPT-RAN", ABSENT_WINDOW);
+}
+
+/// The argv[0] login marker (a leading `-`, the same face the shims
+/// forward) sources the profile chain too — GNU 5.2 honors the marker
+/// (`-bash`); the niu contract carries it through `__RUBASH_LOGIN_SHELL`.
+#[test]
+fn issue399_login_argv0_marker_sources_profile() {
+    if !require_pty_or_skip("issue399_login_argv0_marker_sources_profile") {
+        return;
+    }
+    let root = login_sandbox("argv0-marker");
+    stage_login_file(&root, ".bash_profile", "echo FROM-BP-$((7+7))\n");
+    let marker = ("NIU_INVOKED_AS".to_string(), "-niu".to_string());
+    let mut s = NiuSession::spawn_shared_home_with_args(
+        &root,
+        &driver::default_rc(),
+        &["-c", "echo AFTER-$((3*4))"],
+        &[marker],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("FROM-BP-14");
+    s.expect("AFTER-12");
+    assert_eq!(s.wait_exit(), 0);
+}
+
+/// A BASH_ENV `exit` ends a non-interactive `-c` invocation with its status
+/// (GNU L5: marker, rc 6, command never runs).
+#[test]
+fn issue399_bash_env_exit_terminates_command_line() {
+    if !require_pty_or_skip("issue399_bash_env_exit_terminates_command_line") {
+        return;
+    }
+    let root = login_sandbox("bashenv-exit");
+    let env_file = stage_login_file(&root, "env.src", "echo ENV-RAN-$((4+4))\nexit 6\n");
+    let bash_env = (
+        "BASH_ENV".to_string(),
+        env_file.to_string_lossy().into_owned(),
+    );
+    let mut s = NiuSession::spawn_shared_home_with_args(
+        &root,
+        &driver::default_rc(),
+        &["-c", "echo AFTER-$((11-11))"],
+        &[bash_env],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("ENV-RAN-8");
+    let code = s.wait_exit();
+    assert_eq!(
+        code, 6,
+        "the env file's exit status is the invocation status"
+    );
+    s.expect_absent("AFTER-0", ABSENT_WINDOW);
+}
+
+/// An `exit` in a posix `$ENV` file under `-i -c` ends the invocation with
+/// its status (GNU L6: marker, rc 5, command never runs).
+#[test]
+fn issue399_posix_env_exit_terminates_interactive_command() {
+    if !require_pty_or_skip("issue399_posix_env_exit_terminates_interactive_command") {
+        return;
+    }
+    let root = login_sandbox("posix-env-exit");
+    let env_file = stage_login_file(&root, "env2.src", "echo ENV2-RAN-$((2+3))\nexit 5\n");
+    let env = ("ENV".to_string(), env_file.to_string_lossy().into_owned());
+    let mut s = NiuSession::spawn_shared_home_with_args(
+        &root,
+        &driver::default_rc(),
+        &["--posix", "-i", "-c", "echo AFTER-$((5*5))"],
+        &[env],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("ENV2-RAN-5");
+    let code = s.wait_exit();
+    assert_eq!(
+        code, 5,
+        "the ENV file's exit status is the invocation status"
+    );
+    s.expect_absent("AFTER-25", ABSENT_WINDOW);
+}
+
+/// The REPL login face: the profile chain replaces the rc, runs before the
+/// first prompt, and a profile `exit` kills the session with its status.
+#[test]
+fn issue399_login_repl_profile_exit_ends_session_before_prompt() {
+    if !require_pty_or_skip("issue399_login_repl_profile_exit_ends_session_before_prompt") {
+        return;
+    }
+    let root = login_sandbox("repl-login");
+    stage_login_file(&root, ".bash_profile", "echo BP-REPL-$((20-20))\nexit 4\n");
+    let marker = ("NIU_INVOKED_AS".to_string(), "-niu".to_string());
+    let mut s = NiuSession::spawn_shared_home(
+        &root,
+        "echo FROM-RC\nPS1='P1> '\nPS2='P2> '\nNIU_DISABLE_DEFAULT_PLUGINS=1\n",
+        &[marker],
+        &[],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("Niubash");
+    s.expect("BP-REPL-0");
+    let code = s.wait_exit();
+    let transcript = s.transcript();
+    assert_eq!(
+        code, 4,
+        "the profile's exit status is the session status: {transcript}"
+    );
+    assert_eq!(
+        transcript.matches(driver::PROMPT1).count(),
+        0,
+        "no prompt may render after a profile exit jump: {transcript}"
+    );
+    assert!(
+        !transcript.contains("FROM-RC"),
+        "the login face replaces the rc: {transcript}"
+    );
+}

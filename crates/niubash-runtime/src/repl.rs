@@ -1965,7 +1965,12 @@ pub fn run_repl(shell: Shell) -> anyhow::Result<()> {
     // iteration for the pre-prompt stretch.
     let mut typeahead = crate::typeahead_guard::TypeaheadGuard::disarmed();
     typeahead.arm();
-    if let Some(status) = shell.borrow_mut().run_startup_rc() {
+    // niubash#399: bind the Option BEFORE the `if let` — the scrutinee's
+    // `borrow_mut` temporary would otherwise live to the end of the `if
+    // let` (edition 2021), and the inner `borrow_mut` for the EXIT trap
+    // panicked with "RefCell already borrowed" on every rc/profile exit.
+    let startup_exit = shell.borrow_mut().run_startup_rc();
+    if let Some(status) = startup_exit {
         // niubash#402: the startup rc executed `exit` — end the session with
         // its status before the first prompt, the same shape as the
         // PROMPT_COMMAND jump handled in the loop below (GNU
