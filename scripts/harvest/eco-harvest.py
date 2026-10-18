@@ -548,7 +548,16 @@ class Manifest:
 
 def raw_url(repo: str, commit: str | None, path: str) -> str:
     ref = commit or "HEAD"
-    return f"{RAW}/{repo}/{ref}/{path}"
+    # #408: path segments go on the wire percent-encoded, one segment at a
+    # time (keeps '/' separators). Literal spaces and '&' in filenames made
+    # raw.githubusercontent reject the request — 74 space-bearing and 4
+    # ampersand-bearing rows all landed FETCH-FAILED while the encoded form
+    # of the same URL fetches 200. Raw URLs carry no query today; if one
+    # ever appears it must not be encoded here (eco-test's fetch-time
+    # encoder passes everything from '?' on through untouched).
+    quoted = "/".join(urllib.parse.quote(seg, safe="")
+                      for seg in path.split("/"))
+    return f"{RAW}/{repo}/{ref}/{quoted}"
 
 
 # ---------------------------------------------------------------------------

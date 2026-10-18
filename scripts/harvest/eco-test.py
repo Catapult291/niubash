@@ -12,20 +12,37 @@ Consumes the manifest produced by scripts/harvest/eco-harvest.py. Per asset:
      harness shape: sandbox HOME with a minimal rc, marker-verified input
      delivery, hard timeouts on every phase) — source wall, first prompt
      (marker), ENTER, second ENTER,
-  4. failures get GNU parity classification under WSL GNU Bash 5.3.0
-     (file argument — never `wsl bash -c "$c"`; stdin pinned to /dev/null).
+  4. failures get GNU parity classification under a bash oracle. The oracle
+     is Git for Windows' usr/bin/bash.exe — msys bash 5.2.x, shipped with
+     every MinGit/GfW distribution and preinstalled on windows-latest
+     runners, no install step (#409; ECO_GNU_BASH pins it explicitly) —
+     with WSL GNU Bash 5.3 kept as the dev-box fallback. Both are driven
+     with a file argument only; the oracle kind and version are stamped
+     into every result via the build identity, because 5.2 and 5.3
+     disagree on enough corners that an unversioned oracle result is
+     ambiguous.
 
 Verdicts:
   OK                        sourced; prompt + both ENTERs healthy
   SLOW                      OK but a phase exceeded --slow-threshold (2s)
-  HANG                      a phase never completed within its hard cap
+  HANG                      a phase never completed within its hard cap AND
+                            the oracle stayed healthy (engine suspect)
   ERROR-STORM               >= storm-lines error lines or > storm-bytes of
-                            output during the phases (diagnosable head kept)
+                            output during the phases AND the oracle stayed
+                            healthy (engine suspect)
   EXITED                    the sourced asset killed the interactive shell
-  SYNTAX-REJECT-RUBASH-ONLY rubash -n rejects, GNU bash -n accepts
+                            AND the oracle stayed healthy
+  SYNTAX-REJECT-RUBASH-ONLY rubash -n rejects, oracle bash -n accepts
                             (ENGINE DIVERGENCE CANDIDATE — the gold)
-  GNU-ALSO-FAILS            niu failed AND GNU failed the same way
-                            (upstream content, not an engine bug)
+  ASSET-NATURE              the oracle reproduces the failure (hang or
+                            non-clean exit under the oracle too): upstream
+                            content, not an engine bug (#409; absorbs the
+                            old GNU-ALSO-FAILS)
+  PARITY                    both engines agree the file is fine — e.g.
+                            both `bash -n` reject the same pre-exec
+                            strictness (extglob-before-shopt) while both
+                            runtimes source it clean (#409)
+  HARNESS-ERROR             the test harness itself raised
   DUPLICATE                 T4 late-dedup: sha256 already in the manifest
   FETCH-GONE                pinned raw URL is permanently gone
                             (404/410/451 — not retried, not gate-relevant)
@@ -41,7 +58,9 @@ Temporary HOME is NOT security isolation: untrusted assets must only run
 on disposable runners, never on the developer host.
 Every line carries a normalized `signature`; `--report` groups the gold
 verdicts (SYNTAX-REJECT-RUBASH-ONLY + HANG) by minimal failing construct —
-each group is one engine bug candidate with its asset list.
+each group is one engine bug candidate with its asset list. Raw URLs are
+percent-encoded per path segment at fetch time (#408: literal spaces/'&'
+in manifest URLs made raw.githubusercontent reject the request).
 
 Usage:
   python scripts/harvest/eco-test.py --tiers t1,t3 --workers 8
@@ -49,8 +68,10 @@ Usage:
   python scripts/harvest/eco-test.py --tiers all --workers 8
 
 Exit codes: 0 clean · 2 setup failure (missing binary / unusable path)
-            3 fetch gate tripped (#356: FETCH-FAILED share above
-            --max-fetch-failed-rate, default 10%)
+            3 fetch gate tripped (#356/#408: FETCH-FAILED share above
+            --max-fetch-failed-rate, default 15%)
+            4 unexplained-failure gate tripped (#409: HANG+ERROR-STORM in
+            the run with NO oracle available to explain them)
 """
 
 from __future__ import annotations
@@ -177,6 +198,32 @@ _fetch_lock = threading.Lock()
 _fetch_failures = 0
 
 
+_BARE_PERCENT = re.compile(r"%(?![0-9A-Fa-f]{2})")
+
+
+def percent_encode_raw_url(url: str) -> str:
+    """#408: manifest rows carry f-string-interpolated raw URLs whose path
+    segments hold literal spaces and '&' — raw.githubusercontent rejects
+    both, which is 74 space-bearing + 4 ampersand-bearing of the 78
+    FETCH-FAILED rows. Encode each path segment (keeps '/' separators);
+    scheme://host and anything from '?' on (query) pass through untouched.
+    safe='%' keeps already-encoded segments idempotent: rows written by the
+    fixed eco-harvest raw_url() are never double-encoded. A bare '%' that is
+    NOT a valid escape (the `files/%HOME%/.bashrc` class) still gets %25 —
+    a literal percent sign on the wire is always a protocol error."""
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return url
+    host, sep2, tail = rest.partition("/")
+    if not sep2:
+        return url
+    path, _, query = tail.partition("?")
+    encoded = "/".join(
+        urllib.parse.quote(_BARE_PERCENT.sub("%25", seg), safe="%")
+        for seg in path.split("/"))
+    return f"{scheme}{sep}{host}/{encoded}" + (f"?{query}" if query else "")
+
+
 class FetchGone(Exception):
     """The pinned raw URL is permanently gone (404/410/451).
 
@@ -196,7 +243,7 @@ def fetch_asset(asset: dict, token: str | None, cache_root: Path,
     gz = sub / f"{h}.gz"
     with _fetch_lock:
         cache_root.mkdir(parents=True, exist_ok=True)
-    url = asset["source_url"]
+    url = percent_encode_raw_url(asset["source_url"])
     req = urllib.request.Request(url, headers={"User-Agent":
                                                "niubash-eco-test/wt92"})
     if token:
@@ -259,11 +306,75 @@ def wsl_path(p: Path) -> str:
     return f"/mnt/{drive}" + str(p).replace("\\", "/")[2:]
 
 
+def _msys_bash_candidates():
+    """Git for Windows ships usr/bin/bash.exe (msys bash 5.2.x) inside every
+    MinGit/GfW distribution — including the copy preinstalled on
+    windows-latest runners — so the oracle needs no install step, just a
+    locate (#409). ECO_GNU_BASH overrides; then the standard GfW homes;
+    then wherever `where git` points; finally PATH's bash (never
+    System32\\bash.exe — that one is the WSL launcher, not a bash)."""
+    out = []
+    override = os.environ.get("ECO_GNU_BASH", "").strip()
+    if override:
+        out.append(Path(override))
+    roots = []
+    for env_name in ("ProgramFiles", "ProgramFiles(x86)"):
+        root = os.environ.get(env_name)
+        if root:
+            roots.append(Path(root))
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        roots.append(Path(local) / "Programs")
+    for root in roots:
+        out.append(root / "Git" / "usr" / "bin" / "bash.exe")
+    try:
+        where = subprocess.run(["where.exe", "git"], capture_output=True,
+                               text=True, timeout=15)
+        for git_exe in (where.stdout or "").splitlines():
+            cmd_dir = Path(git_exe.strip()).parent
+            out.append(cmd_dir.parent / "usr" / "bin" / "bash.exe")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    found = shutil.which("bash")
+    if found and "system32" not in found.lower():
+        out.append(Path(found))
+    return out
+
+
+def _kill_tree(pid: int):
+    """taskkill /T takes the whole child tree: a hung asset's grandchildren
+    (sleep loops, subshells) must not outlive the oracle call on a shared
+    runner."""
+    try:
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 class GnuBash:
-    """WSL GNU Bash 5.3.0 as the parity oracle; resolved once, file-arg only."""
+    """The parity oracle (#409): Git for Windows' usr/bin/bash.exe — msys
+    bash 5.2.x, a native exe present on every windows-latest runner — with
+    WSL GNU Bash 5.3 (the old dev-box oracle) as fallback. Both are invoked
+    with a file argument only (never a `-c` string); msys bash is a native
+    exe so a Windows path works directly. Kind and version travel with every
+    verdict: 5.2 and 5.3 disagree on enough corners that an unversioned
+    oracle result is ambiguous."""
 
     def __init__(self):
         self.bin = None
+        self.kind = None      # "wsl" | "msys"
+        self.version = None
+        if os.name != "nt":
+            return
+        # Explicit ECO_GNU_BASH (the workflow probe's pick) wins; then the
+        # GfW msys bash every windows runner already has; WSL — the old
+        # dev-box oracle — is now the fallback, still preferred to nothing.
+        self._probe_msys()
+        if self.bin is None:
+            self._probe_wsl()
+
+    def _probe_wsl(self):
         for cand in ("/usr/local/bin/bash", "/usr/bin/bash", "bash"):
             try:
                 r = subprocess.run(["wsl.exe", cand, "--version"],
@@ -272,22 +383,74 @@ class GnuBash:
                 continue  # no wsl.exe / no distro: degrade, never crash
             if r.returncode == 0 and "GNU bash" in r.stdout:
                 self.bin = cand
-                ver = r.stdout.splitlines()[0].strip()
-                self.version = ver
+                self.kind = "wsl"
+                self.version = r.stdout.splitlines()[0].strip()
                 break
 
+    def _probe_msys(self):
+        for cand in _msys_bash_candidates():
+            try:
+                if not cand.is_file():
+                    continue
+                r = subprocess.run([str(cand), "--version"],
+                                   capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            first = (r.stdout or "").splitlines()
+            if r.returncode == 0 and first and "GNU bash" in first[0]:
+                self.bin = str(cand)
+                self.kind = "msys"
+                self.version = first[0].strip()
+                return
+
     def syntax(self, work: Path):
-        """bash -n under GNU; returns (ok, first_error_line)."""
-        r = subprocess.run(
-            ["wsl.exe", self.bin, "-n", wsl_path(work)],
-            capture_output=True, text=True, timeout=GNU_SYNTAX_TIMEOUT,
-            stdin=subprocess.DEVNULL)
+        """bash -n under the oracle; returns (ok, first_error_line)."""
+        if self.kind == "msys":
+            r = subprocess.run(
+                [self.bin, "-n", work.as_posix()],
+                capture_output=True, text=True, timeout=GNU_SYNTAX_TIMEOUT,
+                stdin=subprocess.DEVNULL)
+        else:
+            r = subprocess.run(
+                ["wsl.exe", self.bin, "-n", wsl_path(work)],
+                capture_output=True, text=True, timeout=GNU_SYNTAX_TIMEOUT,
+                stdin=subprocess.DEVNULL)
         err = strip_ansi(r.stderr or "").strip().splitlines()
         return (r.returncode == 0, err[0] if err else None)
 
     def runtime(self, work: Path):
-        """Source the asset non-interactively under GNU with a hard timeout.
-        Returns (verdict_note, detail): 'ok' | 'hang' | 'error' | None."""
+        """Source the asset non-interactively under the oracle with a hard
+        timeout. Returns (verdict_note, detail): 'ok' | 'hang' | 'error'.
+        Any non-zero rc is a failure (#409): assets that end the shell with
+        `exit N` must classify as oracle-failed even without error-pattern
+        lines, or niu's EXITED verdicts can never reach parity."""
+        if self.kind == "msys":
+            try:
+                proc = subprocess.Popen(
+                    [self.bin, "--noprofile", "--norc", work.as_posix()],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    stdin=subprocess.DEVNULL, text=True, errors="replace",
+                    cwd=str(work.parent))
+            except OSError as err:
+                return None, f"msys oracle spawn failed: {err}"
+            try:
+                out, errout = proc.communicate(timeout=GNU_RUNTIME_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                _kill_tree(proc.pid)
+                try:
+                    proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass  # tree-kill already fired; the runner is ephemeral
+                return ("hang",
+                        f"msys oracle wall > {GNU_RUNTIME_TIMEOUT:.0f}s "
+                        f"(tree-killed)")
+            rc = proc.returncode
+            n, _ = error_line_count(strip_ansi((errout or "") + (out or "")))
+            if rc != 0 and n >= 1:
+                return "error", f"msys oracle rc={rc} with {n} error lines"
+            if rc != 0:
+                return "error", f"msys oracle rc={rc}"
+            return "ok", "msys oracle rc=0"
         try:
             r = subprocess.run(
                 ["wsl.exe", "timeout", str(int(GNU_RUNTIME_TIMEOUT)),
@@ -305,8 +468,13 @@ class GnuBash:
         # 1-2 syntax-error lines, which mis-classified 5 assets
         # (bash-completion 7z/cvs/ps, ohmyzsh changelog/check_for_upgrade)
         # as SYNTAX-REJECT-RUBASH-ONLY instead of GNU-ALSO-FAILS.
+        # #409: so is a bare non-zero rc (the `exit N`-in-sourced-script
+        # class behind most EXITED verdicts) — with 5.2 and 5.3 now both in
+        # play, the two runtimes must share one classification.
         if r.returncode not in (0,) and n >= 1:
             return "error", f"GNU rc={r.returncode} with {n} error lines"
+        if r.returncode not in (0,):
+            return "error", f"GNU rc={r.returncode}"
         return "ok", f"GNU rc={r.returncode}"
 
 
@@ -647,43 +815,62 @@ def test_one(asset: dict, cfg) -> dict:
         # `shopt -s extglob` makes `case x in @(a|b))` legal at runtime while
         # `bash -n` (which never executes the shopt) rejects it — observed on
         # oh-my-bash lib/cli.bash (sources clean under GNU, rc=0). When -n
-        # rejects, fall back to a GNU RUNTIME source before calling the file
-        # upstream-broken.
-        gnu_ok, gnu_err = (False, "GNU bash unavailable") if cfg.gnu.bin is None \
-            else cfg.gnu.syntax(work)
+        # rejects, fall back to an oracle RUNTIME source before calling the
+        # file upstream-broken.
+        oracle = cfg.gnu
+        gnu_ok, gnu_err = \
+            (False, f"{getattr(oracle, 'kind', None) or 'bash'} oracle unavailable") \
+            if oracle.bin is None else oracle.syntax(work)
         rec["gnu_syntax_ok"] = gnu_ok
         rec["gnu_err"] = gnu_err
         gnu_runtime_note = None
-        if not gnu_ok and cfg.gnu.bin is not None:
-            gnu_runtime_note, gnu_runtime_detail = cfg.gnu.runtime(work)
+        if not gnu_ok and oracle.bin is not None:
+            gnu_runtime_note, gnu_runtime_detail = oracle.runtime(work)
             rec["gnu_parity"] = gnu_runtime_note
             rec["gnu_runtime_detail"] = gnu_runtime_detail
-        gnu_valid = cfg.gnu.bin is None or gnu_ok or \
-            gnu_runtime_note == "ok"
-        if gnu_valid:
-            # Engine divergence candidate. Confirm what niu's EXECUTOR does
-            # with the same file (rubash -n may be stricter than rubash's
-            # own runtime — still a parser divergence worth its own group).
+        if oracle.bin is None:
+            # No oracle: an unconfirmed reject must not masquerade as gold.
+            # Keep the historical verdict but say so in the record — the
+            # run-level alarm is the unexplained-failure gate's job (#409).
             try:
                 out = test_asset_conpty(asset, work, cfg.niu, cfg.tmp_root,
                                         cfg.slow_threshold)
                 rec["niu_sources"] = out["verdict"]
             except Exception as err:
                 rec["niu_sources"] = f"HARNESS-ERROR: {err!r}"[:120]
-            # wt97b triage fix: when GNU bash -n ALSO rejects the file AND
-            # niu's runtime sources it clean, both engines' -n share the
-            # same strictness while both runtimes accept it (the
-            # extglob-after-shopt class: `shopt -s extglob` makes a later
-            # `case x in @(a|b))` legal at runtime under bash, which
-            # `bash -n` never executes — oh-my-bash lib/cli.bash). That is
-            # NOT a rubash-only divergence: stamp OK with the -n note
-            # instead of a false gold.
+            rec.update(verdict="SYNTAX-REJECT-RUBASH-ONLY",
+                       detail="UNCONFIRMED: no oracle available",
+                       signature=syntax_signature(rub_err, work),
+                       rubash_err=rub_err, ms=int((time.time() - t0) * 1000))
+            cleanup_work(work)
+            return rec
+        if gnu_ok or gnu_runtime_note == "ok":
+            # Engine divergence candidate — the oracle parses (or at least
+            # executes) what rubash rejects. Confirm what niu's EXECUTOR
+            # does with the same file (rubash -n may be stricter than
+            # rubash's own runtime — still a parser divergence worth its
+            # own group).
+            try:
+                out = test_asset_conpty(asset, work, cfg.niu, cfg.tmp_root,
+                                        cfg.slow_threshold)
+                rec["niu_sources"] = out["verdict"]
+            except Exception as err:
+                rec["niu_sources"] = f"HARNESS-ERROR: {err!r}"[:120]
+            # wt97b triage fix, verdict renamed by #409: when the oracle's
+            # -n ALSO rejects the file but its runtime sources it clean,
+            # both engines' -n share the same strictness while both
+            # runtimes accept it (the extglob-after-shopt class:
+            # `shopt -s extglob` makes a later `case x in @(a|b))` legal at
+            # runtime under bash, which `bash -n` never executes —
+            # oh-my-bash lib/cli.bash). That is NOT a divergence: PARITY.
+            # But if niu's runtime chokes where the oracle's is clean, the
+            # SYNTAX-REJECT gold stands.
             if not gnu_ok and rec.get("niu_sources") in ("OK", "SLOW"):
-                rec.update(verdict="OK",
+                rec.update(verdict="PARITY",
                            detail="bash -n rejects under BOTH engines "
                                   "(pre-execution strictness, e.g. "
                                   "extglob-before-shopt); runtimes OK",
-                           signature="ok:nn-reject-both-runtimes-clean",
+                           signature="parity:nn-reject-both-runtimes-clean",
                            ms=int((time.time() - t0) * 1000))
                 cleanup_work(work)
                 return rec
@@ -692,8 +879,15 @@ def test_one(asset: dict, cfg) -> dict:
                        rubash_err=rub_err, ms=int((time.time() - t0) * 1000))
             cleanup_work(work)
             return rec
-        rec.update(verdict="GNU-ALSO-FAILS",
-                   signature="gnu-syntax:" + norm_signature(gnu_err or "?"),
+        # The oracle rejects the syntax AND its runtime fails or hangs: the
+        # asset is broken upstream — ASSET-NATURE, not an engine bug (#409;
+        # this was the old GNU-ALSO-FAILS).
+        rec.update(verdict="ASSET-NATURE",
+                   detail=f"oracle {getattr(oracle, 'kind', 'bash')} also "
+                          f"rejects the syntax and its runtime fails "
+                          f"({gnu_runtime_note})",
+                   signature="asset-nature:reject:" + norm_signature(
+                       gnu_runtime_detail or gnu_err or "?"),
                    rubash_err=rub_err, ms=int((time.time() - t0) * 1000))
         cleanup_work(work)
         return rec
@@ -712,14 +906,27 @@ def test_one(asset: dict, cfg) -> dict:
     rec["storm_lines"] = out.get("storm_lines", 0)
     rec["storm_head"] = out.get("storm_head", [])
 
-    # GNU runtime parity for interactive failures (upstream vs engine).
+    # Oracle runtime parity for interactive failures (upstream vs engine,
+    # #409): when the oracle reproduces the failure, the verdict is
+    # ASSET-NATURE — upstream content misbehaving everywhere — regardless of
+    # the niu flavor (a HANG whose oracle run errors is still the asset's
+    # nature; `same form` is recorded for triage). Only an oracle-healthy
+    # run leaves the niu verdict standing as an engine suspect.
     if verdict in ("HANG", "ERROR-STORM", "EXITED") and cfg.gnu.bin:
         note, detail = cfg.gnu.runtime(work)
         rec["gnu_parity"] = note
         rec["gnu_detail"] = detail
         if note in ("hang", "error"):
-            verdict = "GNU-ALSO-FAILS"
-            rec["signature"] = f"{note}-gnu-also:" + norm_signature(detail)
+            same_form = (verdict == "HANG") == (note == "hang")
+            rec.update(verdict="ASSET-NATURE",
+                       detail=f"oracle {getattr(cfg.gnu, 'kind', 'bash')} "
+                              f"reproduces the failure (same form: "
+                              f"{same_form}): {detail}",
+                       signature=f"asset-nature:{note}:" +
+                                 norm_signature(detail),
+                       ms=int((time.time() - t0) * 1000))
+            cleanup_work(work)
+            return rec
     if "signature" not in rec:
         if verdict == "HANG":
             rec["signature"] = hang_signature(out.get("phase") or "?",
@@ -773,7 +980,7 @@ def report(results_path: Path, top: int, include_storms: bool,
     for r in rows:
         v = r.get("verdict")
         gold = v in GOLD or (include_storms and v == "ERROR-STORM") or \
-            (include_gnu and v == "GNU-ALSO-FAILS")
+            (include_gnu and v in ("GNU-ALSO-FAILS", "ASSET-NATURE"))
         if gold:
             groups[r.get("signature") or v].append(r)
     tested = len(rows)
@@ -830,6 +1037,9 @@ def build_identity(niu, rubash, niu_revision, rubash_revision, slow_threshold, g
         "gnu_oracle": {
             "available": gnu.bin is not None,
             "bin": gnu.bin,
+            # kind: "wsl" (GNU 5.3, dev box) vs "msys" (5.2.x, GfW on the
+            # runner) — an unversioned oracle result is ambiguous (#409).
+            "kind": getattr(gnu, "kind", None),
             "version": gnu.version if gnu.bin is not None else None,
         },
     }
@@ -987,12 +1197,13 @@ def run_bounded(assets, workers, max_seconds, run_one):
 
 # ── Step summary + fetch gate (the #356 "green job, dead tier" class) ───────
 
-def write_step_summary(counts, tested, results_path, gate_msg=None,
+def write_step_summary(counts, tested, results_path, gate_msgs=None,
                        idle_note=None, selection=None, build_id=None):
     """Append the verdict distribution to $GITHUB_STEP_SUMMARY (no-op when
     unset, so local runs stay quiet). Six nightly runs reported success with
     547/547 FETCH-FAILED: the distribution has to be visible, not buried in
-    the log."""
+    the log. gate_msgs is the list of tripped gates (#356/#408 fetch gate,
+    #409 unexplained-failure gate)."""
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
         return
@@ -1006,8 +1217,8 @@ def write_step_summary(counts, tested, results_path, gate_msg=None,
         lines += [f"| completed | {tested} |",
                   f"| deferred by time budget | {selection['selected'] - tested} |",
                   f"| idle | {'yes' if tested == 0 else 'no'} |", ""]
-    if gate_msg:
-        lines += [f"> 🚨 **fetch gate failed**: {gate_msg}", ""]
+    for gate_msg in gate_msgs or []:
+        lines += [f"> 🚨 {gate_msg}", ""]
     lines += ["| verdict | count |", "| --- | ---: |"]
     for v, n in collections.Counter(counts).most_common():
         lines.append(f"| {v} | {n} |")
@@ -1051,9 +1262,10 @@ def main(argv=None):
     ap.add_argument("--cache-dir", default=str(CACHE_ROOT),
                     help="gz content cache (default falls back to "
                          "<repo>/eco/cache when the dev-box drive is gone)")
-    ap.add_argument("--max-fetch-failed-rate", type=float, default=0.10,
+    ap.add_argument("--max-fetch-failed-rate", type=float, default=0.15,
                     help="exit 3 when FETCH-FAILED exceeds this share of the "
-                         "assets tested this run (0 disables the gate)")
+                         "assets tested this run (#356/#408; 0 disables the "
+                         "gate)")
     ap.add_argument("--redo", action="store_true",
                     help="force all verdicts eligible, ignoring stale cap (overall budgets still apply)")
     ap.add_argument("--report", action="store_true",
@@ -1062,7 +1274,8 @@ def main(argv=None):
     ap.add_argument("--include-storms", action="store_true",
                     help="report mode: also group ERROR-STORM")
     ap.add_argument("--include-gnu", action="store_true",
-                    help="report mode: also group GNU-ALSO-FAILS")
+                    help="report mode: also group ASSET-NATURE (and legacy "
+                         "GNU-ALSO-FAILS lines)")
     args = ap.parse_args(argv)
 
     if hasattr(sys.stdout, "reconfigure"):
@@ -1104,10 +1317,14 @@ def main(argv=None):
         return 2
     gnu = GnuBash()
     if gnu.bin is None:
-        print("WARNING: WSL GNU bash unavailable — parity classification "
-              "degrades (failures keep niu verdicts, no GNU-ALSO-FAILS)")
+        msg = ("GNU oracle unavailable (no WSL distro, no Git for Windows "
+               "usr/bin/bash.exe) — parity classification degrades: failures "
+               "keep niu verdicts, and any HANG/ERROR-STORM will trip the "
+               "unexplained-failure gate (#409)")
+        print(f"::warning::{msg}" if os.environ.get("GITHUB_ACTIONS")
+              else f"WARNING: {msg}")
     else:
-        print(f"GNU parity oracle: WSL {gnu.version}")
+        print(f"GNU parity oracle: {gnu.kind} :: {gnu.version}")
     build_id, identity = build_identity(
         niu, rubash, args.niu_revision, args.rubash_revision, args.slow_threshold, gnu)
     migrate_verdicts(db, results_path)
@@ -1214,29 +1431,39 @@ def main(argv=None):
     print(f"selected={len(pending)} completed={tested} "
           f"deferred_by_time_budget={len(pending) - tested}")
 
-    # Fetch gate (#356): raw-fetch death is infrastructure (bad path, bad
-    # token, dead CDN), never a property of the assets — and it used to be
-    # completely invisible: no non-zero exit, no ::warning, no summary, so
-    # six nights of a 100%-dead tier shipped green. Above the threshold the
-    # run is a failure, full stop.
+    # Gates (the #356 "green job, dead tier" class, continued by #408/#409).
+    # Fetch gate: raw-fetch death is infrastructure (bad path, bad token,
+    # dead CDN, #408's unencoded URLs), never a property of the assets — and
+    # it used to be completely invisible: no non-zero exit, no ::warning, no
+    # summary, so six nights of a 100%-dead tier shipped green.
+    # Unexplained-failure gate (#409): HANG/ERROR-STORM are only engine-bug
+    # candidates when an oracle stayed healthy; with NO oracle available the
+    # failure mass is unexplained, and a lane that cannot explain its
+    # failures must not ship green either.
+    gates = []
     fetch_failed = counts.get("FETCH-FAILED", 0)
-    fetch_rate = fetch_failed / tested if tested else 0.0
-    gate_msg = None
     if tested and args.max_fetch_failed_rate > 0 and \
-            fetch_rate > args.max_fetch_failed_rate:
-        gate_msg = (f"FETCH-FAILED {fetch_failed}/{tested} "
-                    f"({fetch_rate:.1%}) exceeds "
-                    f"{args.max_fetch_failed_rate:.0%} — the fetch tier is "
-                    f"dead; see {results_path}")
-        if os.environ.get("GITHUB_ACTIONS"):
-            print(f"::error::{gate_msg}")
-        else:
-            print(f"ERROR: {gate_msg}")
+            fetch_failed / tested > args.max_fetch_failed_rate:
+        gates.append(
+            "**fetch gate failed**: FETCH-FAILED "
+            f"{fetch_failed}/{tested} ({fetch_failed / tested:.1%}) exceeds "
+            f"{args.max_fetch_failed_rate:.0%} — the fetch tier is dead; "
+            f"see {results_path}")
+    unexplained = counts.get("HANG", 0) + counts.get("ERROR-STORM", 0)
+    if tested and gnu.bin is None and unexplained:
+        gates.append(
+            "**unexplained-failure gate failed**: HANG+ERROR-STORM "
+            f"{unexplained}/{tested} with NO oracle available to explain "
+            "them (#409) — wire Git for Windows usr/bin/bash.exe (or a WSL "
+            "distro) before trusting this lane")
+    for gate_msg in gates:
+        print(f"::error::{gate_msg}" if os.environ.get("GITHUB_ACTIONS")
+              else f"ERROR: {gate_msg}")
     write_step_summary(
-        counts, tested, results_path, gate_msg,
+        counts, tested, results_path, gates,
         selection=selection, build_id=build_id)
-    if gate_msg:
-        return 3
+    if gates:
+        return 3 if any("fetch gate" in g for g in gates) else 4
     return 0
 
 

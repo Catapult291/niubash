@@ -211,12 +211,22 @@ class ResumeTests(unittest.TestCase):
         def identity(oracle):
             return ECO.build_identity(niu, rubash, "niu-a", "rubash-a", 2.0, oracle)
         missing_id, missing = identity(SimpleNamespace(bin=None))
-        available_id, available = identity(SimpleNamespace(bin="/usr/bin/bash", version="GNU bash 5.3"))
-        upgraded_id, _ = identity(SimpleNamespace(bin="/usr/bin/bash", version="GNU bash 5.4"))
+        available_id, available = identity(SimpleNamespace(
+            bin="/usr/bin/bash", kind="wsl", version="GNU bash 5.3"))
+        upgraded_id, _ = identity(SimpleNamespace(
+            bin="/usr/bin/bash", kind="wsl", version="GNU bash 5.4"))
+        msys_id, msys = identity(SimpleNamespace(
+            bin="C:/Program Files/Git/usr/bin/bash.exe", kind="msys",
+            version="GNU bash, version 5.2.26(1)-release (x86_64-pc-msys)"))
         self.assertNotEqual(missing_id, available_id)
         self.assertNotEqual(available_id, upgraded_id)
-        self.assertEqual(missing["gnu_oracle"], dict(available=False, bin=None, version=None))
+        # #409: the oracle flavor is part of the identity — msys 5.2 and
+        # WSL 5.3 results must never be compared across builds silently.
+        self.assertNotEqual(available_id, msys_id)
+        self.assertEqual(missing["gnu_oracle"],
+                         dict(available=False, bin=None, kind=None, version=None))
         self.assertEqual(available["gnu_oracle"]["version"], "GNU bash 5.3")
+        self.assertEqual(msys["gnu_oracle"]["kind"], "msys")
 
     def test_oracle_recovery_retests_degraded_verdict_without_redo(self):
         self.asset("degraded", "t5")
@@ -233,7 +243,7 @@ class ResumeTests(unittest.TestCase):
                 "--cache-dir", str(self.root / "cache")]
         def fixture(asset, cfg):
             return dict(content_hash=asset["content_hash"],
-                        verdict="HANG" if cfg.gnu.bin is None else "GNU-ALSO-FAILS")
+                        verdict="HANG" if cfg.gnu.bin is None else "ASSET-NATURE")
         output = io.StringIO()
         with mock.patch.object(ECO, "load_pty", return_value=object()), \
              mock.patch.object(ECO, "GnuBash", return_value=SimpleNamespace(bin=None)) as oracle, \
@@ -241,19 +251,24 @@ class ResumeTests(unittest.TestCase):
              mock.patch.object(ECO.subprocess, "run", side_effect=AssertionError("no subprocess permitted")), \
              mock.patch.dict(os.environ, GH_TOKEN="fixture-token",
                              GITHUB_STEP_SUMMARY=str(self.root / "summary.md")), contextlib.redirect_stdout(output):
-            self.assertEqual(ECO.main(args), 0)
+            # #409: a HANG with NO oracle is exactly the unexplained-failure
+            # gate — the run must go red (exit 4), not ship green.
+            self.assertEqual(ECO.main(args), 4)
+            self.assertEqual(tester.call_count, 1)
             self.assertEqual(ECO.main(args), 0)
             self.assertEqual(tester.call_count, 1)
-            oracle.return_value = SimpleNamespace(bin="/usr/bin/bash", version="GNU bash 5.3")
+            oracle.return_value = SimpleNamespace(bin="/usr/bin/bash", kind="wsl",
+                                                  version="GNU bash 5.3")
             self.assertEqual(ECO.main(args), 0)
             self.assertEqual(tester.call_count, 2)
             self.assertEqual(ECO.main(args), 0)
             self.assertEqual(tester.call_count, 2)
         records = [json.loads(line) for line in self.results.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual([record["verdict"] for record in records], ["HANG", "GNU-ALSO-FAILS"])
+        self.assertEqual([record["verdict"] for record in records], ["HANG", "ASSET-NATURE"])
         self.assertNotEqual(records[0]["build_id"], records[1]["build_id"])
         self.assertFalse(records[0]["build_identity"]["gnu_oracle"]["available"])
         self.assertTrue(records[1]["build_identity"]["gnu_oracle"]["available"])
+        self.assertIn("unexplained-failure gate", output.getvalue())
         with contextlib.closing(sqlite3.connect(db_path)) as disk:
             self.assertEqual(disk.execute("SELECT COUNT(*) FROM eco_test_verdicts").fetchone()[0], 2)
 

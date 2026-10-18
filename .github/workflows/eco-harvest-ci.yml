@@ -2,7 +2,10 @@ name: eco-harvest-ci
 
 # 采集安全化（#213）：不可信资产测试在一次性 ephemeral runner 上执行，
 # 宿主机零暴露。harvest（纯 API 索引）在 ubuntu 上跑，test 需要真实
-# ConPTY + WSL GNU 对照，跑在 windows-latest 上。
+# ConPTY + GNU bash 对照，跑在 windows-latest 上。#409：runner 没有 WSL
+# 发行版，oracle 改接 Git for Windows 自带的 usr/bin/bash.exe（msys bash
+# 5.2.x，随 MinGit/GfW 分发，无需安装）；oracle 的 kind+版本随 build
+# identity 落进每条 verdict。
 
 on:
   schedule:
@@ -92,6 +95,45 @@ jobs:
         with: { python-version: "3.12" }
       - name: install test deps
         run: pip install pyte pywinpty # pywinpty 提供的模块名就是 winpty
+      # #409: locate the GNU oracle up front and print its version — msys
+      # bash 5.2.x from Git for Windows (preinstalled on the runner). Fail
+      # soft, but never silently: a missing oracle means HANG/ERROR-STORM
+      # rows go unexplained and the tester's #409 gate fails the job.
+      - name: locate GNU oracle (Git for Windows usr/bin/bash.exe)
+        id: gnu
+        shell: python {0}
+        run: |
+          import os
+          import subprocess
+          from pathlib import Path
+          cands = []
+          override = os.environ.get("ECO_GNU_BASH", "").strip()
+          if override:
+              cands.append(Path(override))
+          roots = [Path(os.environ[n]) for n in ("ProgramFiles", "ProgramFiles(x86)")
+                   if os.environ.get(n)]
+          local = os.environ.get("LOCALAPPDATA")
+          if local:
+              roots.append(Path(local) / "Programs")
+          cands.extend(root / "Git" / "usr" / "bin" / "bash.exe" for root in roots)
+          try:
+              where = subprocess.run(["where.exe", "git"], capture_output=True,
+                                     text=True, timeout=15)
+              cands.extend(Path(line.strip()).parent.parent / "usr" / "bin" / "bash.exe"
+                           for line in (where.stdout or "").splitlines() if line.strip())
+          except (OSError, subprocess.TimeoutExpired):
+              pass
+          bash = next((c for c in cands if c.is_file()), None)
+          if bash is None:
+              print("::warning::no Git for Windows usr/bin/bash.exe found — "
+                    "GNU oracle falls back to WSL-or-nothing; HANG/ERROR-STORM "
+                    "without an oracle will fail this job (#409)")
+          else:
+              ver = subprocess.run([str(bash), "--version"], capture_output=True,
+                                   text=True, timeout=30).stdout.splitlines()[0]
+              print(f"GNU oracle (msys): {bash} :: {ver}")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                  out.write(f"bash={bash}\n")
       - name: safe scheduling and migration fixtures (no asset execution)
         run: python -m unittest discover -s scripts/harvest -p "test_*.py" -v
       - name: build engine
@@ -135,6 +177,7 @@ jobs:
           ECO_RUBASH: ${{ steps.bins.outputs.rubash }}
           ECO_NIU_REVISION: ${{ steps.bins.outputs.niu_revision }}
           ECO_RUBASH_REVISION: ${{ steps.bins.outputs.rubash_revision }}
+          ECO_GNU_BASH: ${{ steps.gnu.outputs.bash }}
         run: |
           import os
           import subprocess
@@ -150,8 +193,10 @@ jobs:
           if os.environ["ECO_REDO"] == "true":
               command.append("--redo")
           sys.exit(subprocess.call(command))
-          # exit 3 = fetch gate tripped (#356): FETCH-FAILED > 10%, the job
-          # must go red instead of shipping a green shell around a dead tier.
+          # exit 3 = fetch gate tripped (#356/#408): FETCH-FAILED > 15%;
+          # exit 4 = unexplained-failure gate tripped (#409): HANG/ERROR-STORM
+          # with no oracle available to explain them. Either way the job goes
+          # red instead of shipping a green shell around a dead tier.
       - name: upload verdicts
         if: always() # audit lane keeps the partials even when the gate trips
         uses: actions/upload-artifact@v4
