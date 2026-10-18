@@ -3390,6 +3390,70 @@ mod tests {
         }
     }
 
+    /// A `\r\r\r` run — a line break followed by TWO empty lines — folds
+    /// correctly and survives the protocol byte for byte at every slice
+    /// cut: the probe consumes the first pair as two breaks, and the third
+    /// CR (no partner behind it) submits what preceded it. The boundary the
+    /// pair-fold must not over- or under-count.
+    #[test]
+    fn wt_bare_cr_paste_survives_triple_cr_run_341() {
+        let script = "a=1\r\r\recho ok\r";
+        let events: Vec<crossterm29::event::Event> = script
+            .chars()
+            .map(|ch| match ch {
+                '\r' => cr_key_event(),
+                other => char_key_event(other),
+            })
+            .collect();
+        for cut in 0..events.len() {
+            let (mut detector, queue) = paste_detector_and_queue(Vec::new());
+            let mut slices = VecDeque::from(vec![events[..cut].to_vec(), events[cut..].to_vec()]);
+            let (submitted, final_buffer) =
+                run_reedline_batch_protocol(&mut detector, &queue, &mut slices);
+            let expected = script.replace('\r', "\n");
+            let expected = expected.strip_suffix('\n').expect("script ends in a CR");
+            assert_eq!(
+                reassemble_protocol_text(&submitted, &final_buffer),
+                expected,
+                "slice cut at event {cut} lost or altered bytes across the \\r\\r\\r run"
+            );
+        }
+    }
+
+    /// The owner's shape under a THREE-write feed: every pair of independent
+    /// slice cuts on a short script — the two-cut generalization of the
+    /// sweep above. No delivery split may lose or reorder a byte.
+    #[test]
+    fn wt_bare_cr_paste_survives_every_two_cut_split_341() {
+        let script = "x=1\r\rif true; then\r\techo branch\rfi\r";
+        let events: Vec<crossterm29::event::Event> = script
+            .chars()
+            .map(|ch| match ch {
+                '\r' => cr_key_event(),
+                other => char_key_event(other),
+            })
+            .collect();
+        let expected = script.replace('\r', "\n");
+        let expected = expected.strip_suffix('\n').expect("script ends in a CR");
+        for cut1 in 0..events.len() {
+            for cut2 in cut1..events.len() {
+                let (mut detector, queue) = paste_detector_and_queue(Vec::new());
+                let mut slices = VecDeque::from(vec![
+                    events[..cut1].to_vec(),
+                    events[cut1..cut2].to_vec(),
+                    events[cut2..].to_vec(),
+                ]);
+                let (submitted, final_buffer) =
+                    run_reedline_batch_protocol(&mut detector, &queue, &mut slices);
+                assert_eq!(
+                    reassemble_protocol_text(&submitted, &final_buffer),
+                    expected,
+                    "slice cuts at events {cut1}/{cut2} lost or altered bytes"
+                );
+            }
+        }
+    }
+
     /// Age the burst clock so the next parsed event starts a new burst.
     fn expire_burst(detector: &mut PasteChunkEditMode) {
         detector.last_event = Some(Instant::now() - PASTE_CHUNK_GAP - Duration::from_millis(1));

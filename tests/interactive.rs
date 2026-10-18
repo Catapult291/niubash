@@ -1117,20 +1117,31 @@ fn paste_with_same_burst_enter_submits_on_first_enter() {
 
 /// The owner's niubash#341 pasted script (2026-10-14), sent with the
 /// Windows Terminal KEY_EVENT line-break shape: a bare CR per line break,
-/// `\r\r` for empty lines, no LF anywhere — exactly the records ConPTY
-/// synthesizes for a real WT paste (probe-verified against
-/// ReadConsoleInputW; the CRLF feeds earlier paste regressions use carry an
-/// additional VK_CONTROL sandwich plus the Ctrl+J partner, the shape #252
-/// modeled, which is why four rounds of CRLF-shaped fixes never saw this).
+/// `\r\r` for empty lines, no LF anywhere — the record shape a real WT
+/// paste synthesizes behind ConPTY (record-level evidence and method:
+/// `tests/keyevent_record_probe.rs`; the CRLF feeds earlier paste
+/// regressions use carry an additional VK_CONTROL sandwich plus the Ctrl+J
+/// partner, the shape #252 modeled, which is why four rounds of
+/// CRLF-shaped fixes never saw this).
 ///
-/// Markers are the script's printed OUTPUTS; the two `if is_even` branch
-/// outputs are the exact corruption witnesses — pre-fix, the line after an
-/// empty line lost its first bytes at a reedline batch boundary (`if
-/// is_even 10; then` executing as `_even 10; then`) and the branch output
-/// never appeared. Expected outputs pinned from GNU bash running the same
-/// script: identical except the `$RANDOM` section (nondeterministic) and
-/// the `原串` line (a pre-existing non-interactive engine quirk on this
-/// path's sibling, unrelated to paste).
+/// HONEST SCOPE: this test is a REGRESSION GUARD, not the reproduction —
+/// it also PASSES on unpatched master. The live channel's delivery (one
+/// big ConPTY write, plus the TypeaheadGuard's sweep/reinjection cycles
+/// around every prompt rebuild splicing the queue) does not reproduce the
+/// probe-pushback/batch-boundary interleaving the corruption needs. The
+/// deterministic RED/GREEN reproduction lives at the protocol layer:
+/// `wt_bare_cr_paste_survives_reedline_batch_protocol_341` and the slice
+/// sweeps in `crates/niubash-runtime/src/repl.rs` go red on 6332f99 and
+/// pin the mechanism byte for byte.
+///
+/// What this guard pins: the full script runs end to end over the
+/// KEY_EVENT shape, and the two `if is_even` branch outputs
+/// (`10 是偶数，函数返回成功` / `7 不是偶数，函数返回失败`) — the exact
+/// lines the owner saw shredded — keep printing. Markers are the script's
+/// printed OUTPUTS, never echoed-input substrings. Expected outputs pinned
+/// from GNU bash running the same script: identical except the `$RANDOM`
+/// section (nondeterministic) and the `原串` line (a pre-existing
+/// non-interactive engine quirk, unrelated to paste).
 #[test]
 fn wt_paste_bare_cr_key_event_shape_runs_owner_script_341() {
     if !cfg!(windows) {
@@ -1147,6 +1158,12 @@ fn wt_paste_bare_cr_key_event_shape_runs_owner_script_341() {
         HEAVY_TIMEOUT,
     );
     s.wait_ready();
+    // One write, as the earlier paste regressions feed. (Chunked writes
+    // were tried and are WORSE here: this dev box routinely carries a
+    // dozen-plus live interactive niu sessions, and the extra batch
+    // boundaries multiply exposure to that host noise — the same family
+    // as the continuation/ctrl_d cases this host fails on master too.
+    // CI's clean runner is the gate for this guard.)
     let paste = OWNER_SCRIPT_341.replace('\n', "\r");
     s.send(&paste);
     // Execution-level markers in paste order: printed output lines of a
