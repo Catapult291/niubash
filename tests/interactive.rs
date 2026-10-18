@@ -300,6 +300,14 @@ fn ctrl_d_on_empty_line_exits() {
 }
 
 /// Ctrl-D with text typed must not exit; the line stays editable.
+///
+/// Echo-proof assertion discipline (niubash#367/#368): the expected marker
+/// must not appear verbatim in the submitted input, or the terminal echo of
+/// the typed text satisfies `expect` even when the completed line never
+/// executes. The probe therefore types `echo half-typed`, survives the
+/// Ctrl-D, extends the word in place (`-ok`), and only `half-typed-ok` —
+/// a string the input never contains — proves the line both survived the
+/// EOF key and executed.
 #[test]
 fn ctrl_d_midline_does_not_exit() {
     if !require_pty_or_skip("ctrl_d_midline_does_not_exit") {
@@ -310,9 +318,10 @@ fn ctrl_d_midline_does_not_exit() {
     s.send("echo half-typed");
     s.send(EOF_KEY);
     std::thread::sleep(ABSENT_WINDOW);
-    // The shell is still alive: finish the line and it must execute.
-    s.send("\r");
-    s.expect("half-typed");
+    // The shell is still alive and the line stayed editable: extend it and
+    // the completed command must run.
+    s.send("-ok\r");
+    s.expect("half-typed-ok");
     s.expect_prompt();
 }
 
