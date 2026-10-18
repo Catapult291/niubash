@@ -84,12 +84,34 @@ Type: files; Name: "{app}\niubash.exe"
 ; Self-update-era stray rollback backups observed on real machines; dead
 ; weight once a full installer payload replaces the tree.
 Type: files; Name: "{app}\niu.exe.old-*"
+; niubash#376 (hygiene rule): {app}\winuxcmd\bin is THE PATH entry directory,
+; and dead payloads inside it make the active entry set unauditable. Earlier
+; updaters parked retired faces aside and never swept them (observed live:
+; bash.exe.bak-1.4.0, sh.exe.old-shposix, 226,816 B each); the current
+; relinker parks as <name>.niu-old-<pid> and drops it, but a crash between
+; the two steps leaves the parked shape behind. PATHEXT matches none of
+; these, so nothing is shadowed — sweep the retired-name shapes anyway,
+; never the live entry names. The wildcards match generated shapes only;
+; a user file deliberately named with one of these suffixes inside these
+; two app-owned directories would be swept with them.
+Type: files; Name: "{app}\winuxcmd\bin\*.bak-*"
+Type: files; Name: "{app}\winuxcmd\bin\*.old-*"
+Type: files; Name: "{app}\winuxcmd\bin\*.niu-old-*"
+Type: files; Name: "{app}\winuxcmd\usr\bin\*.bak-*"
+Type: files; Name: "{app}\winuxcmd\usr\bin\*.old-*"
+Type: files; Name: "{app}\winuxcmd\usr\bin\*.niu-old-*"
 
 ; niubash#313 (R4): the same strays must not survive uninstall — processed
 ; after the uninstall log replay, so they cannot pin {app} behind.
 [UninstallDelete]
 Type: files; Name: "{app}\niubash.exe"
 Type: files; Name: "{app}\niu.exe.old-*"
+Type: files; Name: "{app}\winuxcmd\bin\*.bak-*"
+Type: files; Name: "{app}\winuxcmd\bin\*.old-*"
+Type: files; Name: "{app}\winuxcmd\bin\*.niu-old-*"
+Type: files; Name: "{app}\winuxcmd\usr\bin\*.bak-*"
+Type: files; Name: "{app}\winuxcmd\usr\bin\*.old-*"
+Type: files; Name: "{app}\winuxcmd\usr\bin\*.niu-old-*"
 
 ; niubash#211: these are the conhost-baseline forms (direct niu.exe — what
 ; Win10 hosts with conhost). When WT is detected after install, the
