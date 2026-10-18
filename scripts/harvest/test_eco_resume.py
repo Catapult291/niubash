@@ -17,6 +17,11 @@ SPEC = importlib.util.spec_from_file_location(
 ECO = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ECO)
 
+HARVEST_SPEC = importlib.util.spec_from_file_location(
+    "eco_harvest", Path(__file__).with_name("eco-harvest.py"))
+HARVEST = importlib.util.module_from_spec(HARVEST_SPEC)
+HARVEST_SPEC.loader.exec_module(HARVEST)
+
 SCHEMA = """
 CREATE TABLE assets (
     content_hash TEXT PRIMARY KEY, hash_kind TEXT, source_url TEXT,
@@ -204,6 +209,145 @@ class ResumeTests(unittest.TestCase):
         with mock.patch.object(ECO, "__file__", str(harness)):
             self.assertNotEqual(original, identity())
 
+    # ── #408 URL encoding (CR #410 F5: the PR's core claim, now tested) ──
+
+    def test_percent_encode_raw_url_fixes_both_408_classes(self):
+        enc = ECO.percent_encode_raw_url
+        # the two #408 classes, together in one URL (74 space + 4 amp rows)
+        self.assertEqual(
+            enc("https://raw.githubusercontent.com/o/r/abc/a b&c.sh"),
+            "https://raw.githubusercontent.com/o/r/abc/a%20b%26c.sh")
+
+    def test_percent_encode_raw_url_bare_percent_becomes_25(self):
+        enc = ECO.percent_encode_raw_url
+        # the files/%HOME%/ class: bare % is a protocol error on the wire
+        self.assertEqual(
+            enc("https://raw.githubusercontent.com/o/r/files/%HOME%/.bashrc"),
+            "https://raw.githubusercontent.com/o/r/files/%25HOME%25/.bashrc")
+        # 100%2 is not a valid escape either; once encoded, stable
+        once = enc("https://raw.githubusercontent.com/o/r/100%2.sh")
+        self.assertEqual(once,
+                         "https://raw.githubusercontent.com/o/r/100%252.sh")
+        self.assertEqual(enc(once), once)
+
+    def test_percent_encode_raw_url_leaves_valid_forms_alone(self):
+        enc = ECO.percent_encode_raw_url
+        # already-encoded segments are idempotent (no %2520 double-encoding)
+        self.assertEqual(
+            enc("https://raw.githubusercontent.com/o/r/a%20b.sh"),
+            "https://raw.githubusercontent.com/o/r/a%20b.sh")
+        # unreserved characters survive
+        self.assertEqual(
+            enc("https://raw.githubusercontent.com/o/r/a~b.c-d_e.f"),
+            "https://raw.githubusercontent.com/o/r/a~b.c-d_e.f")
+        # query passes through untouched (nothing after '?' is encoded)
+        self.assertEqual(
+            enc("https://raw.githubusercontent.com/o/r/x.sh?a b&c d"),
+            "https://raw.githubusercontent.com/o/r/x.sh?a b&c d")
+
+    def test_percent_encode_raw_url_non_ascii_and_shape(self):
+        enc = ECO.percent_encode_raw_url
+        self.assertEqual(
+            enc("https://raw.githubusercontent.com/o/r/深/x.sh"),
+            "https://raw.githubusercontent.com/o/r/%E6%B7%B1/x.sh")
+        # separators survive: '/' in the path is never encoded
+        self.assertEqual(
+            enc("https://raw.githubusercontent.com/a/b/c/d e/f.sh"),
+            "https://raw.githubusercontent.com/a/b/c/d%20e/f.sh")
+
+    def test_raw_url_producer_output_is_consumer_stable(self):
+        # what the fixed producer writes must pass through the fetch-time
+        # encoder untouched — legacy rows heal, fresh rows never double-encode
+        for path in ("a b&c.sh", "files/%HOME%/.bashrc", "100%2.sh",
+                     "深/x.sh", "a%20b.sh", "plain.sh"):
+            with self.subTest(path=path):
+                url = HARVEST.raw_url("o/r", "abc123", path)
+                self.assertEqual(ECO.percent_encode_raw_url(url), url)
+
+    # ── #409 oracle probe (CR #410 F1: never elect our own forwarder) ──
+
+    def test_msys_candidates_drop_self_forwarder_paths(self):
+        # winuxcmd is niubash's own shim layout: `where git` and PATH resolve
+        # to it on dev boxes, and it must never enter the candidate chain
+        winux = (r"C:\Users\x\AppData\Local\Programs\Niubash"
+                 r"\winuxcmd\usr\bin\bash.exe")
+        with mock.patch.dict(os.environ, {"ECO_GNU_BASH": ""}), \
+             mock.patch.object(ECO.subprocess, "run",
+                               return_value=SimpleNamespace(stdout="")), \
+             mock.patch.object(ECO.shutil, "which", return_value=winux):
+            cands = [str(c).lower() for c in ECO._msys_bash_candidates()]
+        self.assertFalse(any("winuxcmd" in c for c in cands))
+
+    def test_msys_candidates_keep_real_bash_from_path(self):
+        with mock.patch.dict(os.environ, {"ECO_GNU_BASH": ""}), \
+             mock.patch.object(ECO.subprocess, "run",
+                               return_value=SimpleNamespace(stdout="")), \
+             mock.patch.object(ECO.shutil, "which",
+                               return_value=r"C:\Program Files\Git\bin\bash.exe"):
+            cands = [str(c) for c in ECO._msys_bash_candidates()]
+        self.assertIn(r"C:\Program Files\Git\bin\bash.exe", cands)
+
+    def test_eco_gnu_bash_pin_inside_self_layout_is_dropped(self):
+        # an explicit ECO_GNU_BASH pin into our own shim layout is refused
+        # too — loud, not silent (a functional niu forwarder would pass any
+        # output check, so the path filter is the authoritative guard)
+        winux = r"C:\x\Niubash\winuxcmd\usr\bin\bash.exe"
+        with mock.patch.dict(os.environ, {"ECO_GNU_BASH": winux}), \
+             mock.patch.object(ECO.subprocess, "run",
+                               return_value=SimpleNamespace(stdout="")), \
+             mock.patch.object(ECO.shutil, "which", return_value=None):
+            cands = [str(c) for c in ECO._msys_bash_candidates()]
+        self.assertFalse(any("winuxcmd" in c for c in cands))
+
+    def _fake_bash_tree(self):
+        tree = tempfile.TemporaryDirectory()
+        self.addCleanup(tree.cleanup)
+        fake = Path(tree.name) / "Git" / "usr" / "bin" / "bash.exe"
+        fake.parent.mkdir(parents=True)
+        fake.write_text("not a real executable")
+        return tree.name, fake
+
+    @staticmethod
+    def _fake_bash_run(script_rc, script_out):
+        class Completed:
+            def __init__(self, rc, out):
+                self.returncode, self.stdout, self.stderr = rc, out, ""
+        def fake_run(cmd, **kwargs):
+            if cmd and cmd[0] == "wsl.exe":
+                return Completed(1, "")          # no distro on this box
+            if "--version" in cmd:
+                # the forwarder signature: version banner talks fine
+                return Completed(
+                    0, "GNU bash, version 5.3.0(1)-release (x86_64-pc-msys)\n")
+            return Completed(script_rc, script_out)
+        return fake_run
+
+    def _probe_with_fake_bash(self, script_rc, script_out):
+        td, fake = self._fake_bash_tree()
+        env = {"ECO_GNU_BASH": "", "ProgramFiles": td,
+               "ProgramFiles(x86)": "", "LOCALAPPDATA": ""}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(ECO.shutil, "which", return_value=None), \
+             mock.patch.object(ECO.subprocess, "run",
+                               side_effect=self._fake_bash_run(script_rc,
+                                                               script_out)):
+            return ECO.GnuBash(), fake
+
+    def test_probe_rejects_shim_that_cannot_run_a_script(self):
+        # CR #410 F1: --version alone must not crown the oracle. A forwarder
+        # that answers --version but fails a marker script (rc=1, no output —
+        # the observed `niu: 拒绝访问` shape) is not bash; the probe must
+        # fall through (here: to WSL, which the fake reports as absent).
+        gnu, fake = self._probe_with_fake_bash(1, "")
+        self.assertIsNone(gnu.bin)
+        self.assertNotEqual(str(fake), (gnu.bin or ""))
+
+    def test_probe_accepts_bash_that_runs_the_marker_script(self):
+        gnu, fake = self._probe_with_fake_bash(0, "ECO-ORACLE-SMOKE-OK\n")
+        self.assertEqual(gnu.bin, str(fake))
+        self.assertEqual(gnu.kind, "msys")
+        self.assertIn("5.3.0", gnu.version)
+
     def test_oracle_availability_and_version_change_identity(self):
         niu, rubash = self.root / "niu.exe", self.root / "rubash.exe"
         niu.write_bytes(b"inert niu")
@@ -211,12 +355,22 @@ class ResumeTests(unittest.TestCase):
         def identity(oracle):
             return ECO.build_identity(niu, rubash, "niu-a", "rubash-a", 2.0, oracle)
         missing_id, missing = identity(SimpleNamespace(bin=None))
-        available_id, available = identity(SimpleNamespace(bin="/usr/bin/bash", version="GNU bash 5.3"))
-        upgraded_id, _ = identity(SimpleNamespace(bin="/usr/bin/bash", version="GNU bash 5.4"))
+        available_id, available = identity(SimpleNamespace(
+            bin="/usr/bin/bash", kind="wsl", version="GNU bash 5.3"))
+        upgraded_id, _ = identity(SimpleNamespace(
+            bin="/usr/bin/bash", kind="wsl", version="GNU bash 5.4"))
+        msys_id, msys = identity(SimpleNamespace(
+            bin="C:/Program Files/Git/usr/bin/bash.exe", kind="msys",
+            version="GNU bash, version 5.2.26(1)-release (x86_64-pc-msys)"))
         self.assertNotEqual(missing_id, available_id)
         self.assertNotEqual(available_id, upgraded_id)
-        self.assertEqual(missing["gnu_oracle"], dict(available=False, bin=None, version=None))
+        # #409: the oracle flavor is part of the identity — msys 5.2 and
+        # WSL 5.3 results must never be compared across builds silently.
+        self.assertNotEqual(available_id, msys_id)
+        self.assertEqual(missing["gnu_oracle"],
+                         dict(available=False, bin=None, kind=None, version=None))
         self.assertEqual(available["gnu_oracle"]["version"], "GNU bash 5.3")
+        self.assertEqual(msys["gnu_oracle"]["kind"], "msys")
 
     def test_oracle_recovery_retests_degraded_verdict_without_redo(self):
         self.asset("degraded", "t5")
@@ -233,7 +387,7 @@ class ResumeTests(unittest.TestCase):
                 "--cache-dir", str(self.root / "cache")]
         def fixture(asset, cfg):
             return dict(content_hash=asset["content_hash"],
-                        verdict="HANG" if cfg.gnu.bin is None else "GNU-ALSO-FAILS")
+                        verdict="HANG" if cfg.gnu.bin is None else "ASSET-NATURE")
         output = io.StringIO()
         with mock.patch.object(ECO, "load_pty", return_value=object()), \
              mock.patch.object(ECO, "GnuBash", return_value=SimpleNamespace(bin=None)) as oracle, \
@@ -241,19 +395,24 @@ class ResumeTests(unittest.TestCase):
              mock.patch.object(ECO.subprocess, "run", side_effect=AssertionError("no subprocess permitted")), \
              mock.patch.dict(os.environ, GH_TOKEN="fixture-token",
                              GITHUB_STEP_SUMMARY=str(self.root / "summary.md")), contextlib.redirect_stdout(output):
-            self.assertEqual(ECO.main(args), 0)
+            # #409: a HANG with NO oracle is exactly the unexplained-failure
+            # gate — the run must go red (exit 4), not ship green.
+            self.assertEqual(ECO.main(args), 4)
+            self.assertEqual(tester.call_count, 1)
             self.assertEqual(ECO.main(args), 0)
             self.assertEqual(tester.call_count, 1)
-            oracle.return_value = SimpleNamespace(bin="/usr/bin/bash", version="GNU bash 5.3")
+            oracle.return_value = SimpleNamespace(bin="/usr/bin/bash", kind="wsl",
+                                                  version="GNU bash 5.3")
             self.assertEqual(ECO.main(args), 0)
             self.assertEqual(tester.call_count, 2)
             self.assertEqual(ECO.main(args), 0)
             self.assertEqual(tester.call_count, 2)
         records = [json.loads(line) for line in self.results.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual([record["verdict"] for record in records], ["HANG", "GNU-ALSO-FAILS"])
+        self.assertEqual([record["verdict"] for record in records], ["HANG", "ASSET-NATURE"])
         self.assertNotEqual(records[0]["build_id"], records[1]["build_id"])
         self.assertFalse(records[0]["build_identity"]["gnu_oracle"]["available"])
         self.assertTrue(records[1]["build_identity"]["gnu_oracle"]["available"])
+        self.assertIn("unexplained-failure gate", output.getvalue())
         with contextlib.closing(sqlite3.connect(db_path)) as disk:
             self.assertEqual(disk.execute("SELECT COUNT(*) FROM eco_test_verdicts").fetchone()[0], 2)
 
