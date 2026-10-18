@@ -842,6 +842,119 @@ fn case_359_12_retired_writers_have_no_verb_call_sites() {
     }
 }
 
+/// CR F2-prime, side A (fail-safe): an unpaired begin marker — the write
+/// era's `end_missing` state — with executable content below it holds the
+/// loader OFF. Both markers are bash comments; the body below executes
+/// unconditionally, so the pairing requirement must not open a
+/// double-execution hole. The loader comes back only after the stray
+/// marker is gone.
+#[test]
+fn lone_begin_with_executable_content_holds_the_loader_off() {
+    let sandbox = Sandbox::new("f2p-side-a");
+    install_trusted_omb(&sandbox);
+    assert_success(&sandbox.run(&["plugin", "enable", "git"]), "enable");
+    let loader = sandbox.loader();
+    let marked = loader.replace(
+        "# --- niu plugin source: oh-my-bash ---",
+        "# --- niu plugin source: oh-my-bash ---\nexport NIU_LOADER_MARK=loader",
+    );
+    fs::write(sandbox.loader_path(), marked).unwrap();
+
+    // The end_missing state: begin marker, orphan body, NO end marker.
+    fs::write(
+        sandbox.rc_path(),
+        "# >>> niu source oh-my-bash >>>\nexport NIU_RC_MARK=rcblock\n",
+    )
+    .unwrap();
+
+    let probe = r#"printf '%s' "${NIU_LOADER_MARK-}|${NIU_RC_MARK-}""#;
+    let out = sandbox.run_interactive(probe);
+    assert_success(&out, "probe with an unpaired begin");
+    assert_eq!(
+        stdout_text(&out).trim_end(),
+        "|rcblock",
+        "an unpaired begin with executable content must hold the loader OFF \
+         (no double execution): {}",
+        stdout_text(&out)
+    );
+    // Both surfaces agree it is held off and name the line.
+    let migrate = sandbox.run(&["plugin", "migrate-rc"]);
+    assert_success(&migrate, "migrate-rc");
+    let report = stdout_text(&migrate);
+    assert!(
+        !report.contains("clean:"),
+        "an end_missing rc must not read as clean: {report}"
+    );
+    let doctor = sandbox.run(&["doctor"]);
+    assert_success(&doctor, "doctor");
+    let doctor_report = stdout_text(&doctor);
+    assert!(
+        doctor_report.contains("stays OFF"),
+        "the doctor must report the held-off state: {doctor_report}"
+    );
+
+    // Deleting the stray marker by hand releases the loader — exactly one
+    // live path again. (Re-mark the generation: the migrate-rc run above
+    // republished it, which is exactly the regeneration behavior under
+    // test.)
+    let regenerated = sandbox.loader();
+    let remarked = regenerated.replace(
+        "# --- niu plugin source: oh-my-bash ---",
+        "# --- niu plugin source: oh-my-bash ---\nexport NIU_LOADER_MARK=loader",
+    );
+    fs::write(sandbox.loader_path(), remarked).unwrap();
+    fs::write(sandbox.rc_path(), "# my rc\nexport MY_OWN=1\n").unwrap();
+    let out2 = sandbox.run_interactive(probe);
+    assert_success(&out2, "probe after hand removal");
+    assert_eq!(
+        stdout_text(&out2).trim_end(),
+        "loader|",
+        "the loader takes over after the removal: {}",
+        stdout_text(&out2)
+    );
+}
+
+/// CR F2-prime, side B (inert stays inert): a lone marker followed only by
+/// comments and blanks executes nothing — the loader must keep loading,
+/// and migrate-rc reads the rc as clean. This is the direction CASE-1
+/// (the marker-shaped remark) already pinned; the unpaired-begin rule
+/// must not re-tighten it.
+#[test]
+fn lone_begin_with_only_comments_keeps_the_loader_on() {
+    let sandbox = Sandbox::new("f2p-side-b");
+    install_trusted_omb(&sandbox);
+    assert_success(&sandbox.run(&["plugin", "enable", "git"]), "enable");
+    let loader = sandbox.loader();
+    let marked = loader.replace(
+        "# --- niu plugin source: oh-my-bash ---",
+        "# --- niu plugin source: oh-my-bash ---\nexport NIU_LOADER_MARK=loader",
+    );
+    fs::write(sandbox.loader_path(), marked).unwrap();
+
+    fs::write(
+        sandbox.rc_path(),
+        "# >>> niu source >>>\n# historical note: blocks were removed by hand\n\n",
+    )
+    .unwrap();
+
+    let probe = r#"printf '%s' "${NIU_LOADER_MARK-}|${NIU_RC_MARK-}""#;
+    let out = sandbox.run_interactive(probe);
+    assert_success(&out, "probe with an inert lone marker");
+    assert_eq!(
+        stdout_text(&out).trim_end(),
+        "loader|",
+        "a comment-only stray marker must NOT hold the loader off: {}",
+        stdout_text(&out)
+    );
+    let migrate = sandbox.run(&["plugin", "migrate-rc"]);
+    assert_success(&migrate, "migrate-rc on an inert rc");
+    assert!(
+        stdout_text(&migrate).contains("clean:"),
+        "an inert rc reads as clean: {}",
+        stdout_text(&migrate)
+    );
+}
+
 /// Startup with a legacy-block rc keeps the config dir write to the
 /// documented hint marker ONLY (the R1-class exception), and the marker
 /// makes the hint one-shot.

@@ -330,17 +330,26 @@ pub fn startup_decision(rc_text: Option<&str>, loader_text: Option<&str>) -> Sta
 /// every surface shares (gate case 359.8 + CR F2: the guard, migrate-rc and
 /// the doctor must never disagree about whether the loader is held off).
 ///
-/// The rc "trips" the guard — the loader stays OFF — exactly when a
-/// managed-marker PAIR wraps at least one line that actually executes:
-/// a begin-shaped comment line (`# >>> niu source …`, exact or near, any
-/// id — plus any exact line the current loader generation recorded as
-/// superseded) followed by a later end-shaped line, with a non-blank,
-/// non-comment line between the two. Marker lines are comments; without
-/// executable content between them nothing runs, so a stray marker-shaped
-/// remark (`# >>> niu source blocks were removed by hand … <<<` on one
-/// line, a lone marker, a comment-only pair) is INERT and never trips.
-/// Returns the 1-based line number and text of each tripping BEGIN line
-/// (empty = the loader may load).
+/// The rc "trips" the guard — the loader stays OFF — in exactly two
+/// situations, both "content that executes under a marker this product
+/// wrote" (gate case 359.8, fail-safe direction):
+///
+/// 1. a managed-marker PAIR wraps executable content: a begin-shaped
+///    comment line (`# >>> niu source …`, exact or near, any id — plus any
+///    exact line the current loader generation recorded as superseded)
+///    followed by a later end-shaped line, with a non-blank, non-comment
+///    line between the two;
+/// 2. an UNPAIRED begin (the write era's `end_missing` state) with ANY
+///    executable line below it: both markers are bash comments, so the
+///    block body below executes unconditionally — a missing end marker
+///    cannot make the content inert, and niu cannot attribute the
+///    following lines, so rather off than double-execute (CR F2-prime).
+///
+/// Everything that cannot execute stays inert: the single-line remark
+/// (`# >>> niu source blocks were removed by hand … <<<`), a lone marker
+/// followed only by comments and blanks, and comment-only pairs. Returns
+/// the 1-based line number and text of each tripping BEGIN line (empty =
+/// the loader may load).
 ///
 /// Read-only by definition: this only looks at bytes the caller already
 /// read. The direction is deliberately fail-safe (rather off than
@@ -379,6 +388,10 @@ pub fn guard_trip_lines(rc_text: &str) -> Vec<(usize, String)> {
         }
         None
     };
+    let executes = |line: &str| {
+        let trimmed = line.trim();
+        !trimmed.is_empty() && !trimmed.starts_with('#')
+    };
     let lines: Vec<&str> = rc_text.lines().collect();
     let mut trips: Vec<(usize, String)> = Vec::new();
     let mut index = 0;
@@ -387,18 +400,23 @@ pub fn guard_trip_lines(rc_text: &str) -> Vec<(usize, String)> {
             if let Some(stop) =
                 (index + 1..lines.len()).find(|&i| classify(lines[i]) == Some(false))
             {
-                let body_executes = lines[index + 1..stop].iter().any(|line| {
-                    let trimmed = line.trim();
-                    !trimmed.is_empty() && !trimmed.starts_with('#')
-                });
+                let body_executes = lines[index + 1..stop].iter().any(|line| executes(line));
                 if body_executes {
                     trips.push((index + 1, lines[index].trim().to_string()));
                 }
                 index = stop + 1;
                 continue;
             }
-            // An unpaired begin is an inert comment; the id-anchored scan
-            // (migrate-rc/doctor) still reports it for hand cleanup.
+            // CR F2-prime: an unpaired begin (the write era's `end_missing`
+            // state) is still just a comment — but the block body BELOW it
+            // executes unconditionally, and niu cannot attribute those
+            // lines. Any executable line after it holds the loader off
+            // (fail-safe, gate 359.8); only comments and blanks below keep
+            // it inert. The id-anchored scan (migrate-rc/doctor) reports
+            // the same line as an `end_missing` block for hand cleanup.
+            if lines[index + 1..].iter().any(|line| executes(line)) {
+                trips.push((index + 1, lines[index].trim().to_string()));
+            }
         }
         index += 1;
     }
@@ -958,6 +976,17 @@ mod tests {
         // Lone markers and ordinary user lines never trip it.
         assert!(!rc_carries_superseded_markers(
             "# a comment\ngrep '>>>' file\nalias ll='ls -la'\n# <<< niu source stray <<<\n"
+        ));
+        // CR F2-prime: an unpaired begin with executable content below is
+        // the `end_missing` state — the body executes unconditionally, so
+        // the guard holds the loader off (fail-safe).
+        assert!(rc_carries_superseded_markers(
+            "# >>> niu source oh-my-bash >>>\nexport LEFTOVER=1\n"
+        ));
+        // ...but a lone begin followed only by comments and blanks is
+        // inert — nothing below it executes.
+        assert!(!rc_carries_superseded_markers(
+            "# >>> niu source oh-my-bash >>>\n# the block was removed\n\n"
         ));
         // A recorded superseded marker with an arbitrary spelling is
         // honored — same pair-with-content rule.

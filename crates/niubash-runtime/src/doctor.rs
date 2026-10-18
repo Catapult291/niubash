@@ -183,14 +183,18 @@ pub fn run_doctor(skill_files: &[crate::skill::SkillFile]) -> anyhow::Result<()>
         .as_deref()
         .and_then(|text| crate::plugins::loader::scan_legacy_blocks(text).ok())
         .filter(|blocks| !blocks.is_empty());
-    // CR F2: the doctor reports the guard's OWN evidence — a held-off
-    // loader is never diagnosed as clean.
+    // CR F2/F2-prime: the doctor reports the guard's OWN evidence, and the
+    // "stays OFF" claim is keyed on the guard's verdict (guard_trips), not
+    // on the block scan — a held-off loader is never diagnosed as clean,
+    // and an inert (comment-only) legacy pair is never claimed to hold the
+    // loader off.
     let guard_trips: Vec<(usize, String)> = rc_text_read
         .as_deref()
         .map(crate::plugins::loader::guard_trip_lines)
         .unwrap_or_default();
-    let legacy_held = rc_legacy_blocks.is_some() || !guard_trips.is_empty();
-    match (&loader_text, legacy_held) {
+    let held_off = !guard_trips.is_empty();
+    let legacy_seen = rc_legacy_blocks.is_some() || held_off;
+    match (&loader_text, legacy_seen) {
         (None, false) => {
             writeln!(
                 out,
@@ -211,15 +215,21 @@ pub fn run_doctor(skill_files: &[crate::skill::SkillFile]) -> anyhow::Result<()>
                 .iter()
                 .map(|b| format!("{} (lines {}-{})", b.id, b.start_line, b.end_line))
                 .collect();
-            // CR F2: guard trips the block scan does not attribute are
-            // named by line, so the held-off state is always explainable.
+            // Guard trips the block scan does not attribute are named by
+            // line, so the state is always explainable.
             for (line, text) in &guard_trips {
                 lines.push(format!("guard trip at line {line}: {text}"));
             }
+            // The hold verdict comes from the guard itself (F2-prime).
+            let state = if held_off {
+                "the generated loader stays OFF while they execute"
+            } else {
+                "inert (comments only — nothing executes, the loader is unaffected)"
+            };
             writeln!(
                 out,
-                "  {warn} legacy rc blocks   {} — the generated loader stays OFF while they \
-                 execute; remove them BY HAND after reviewing: `niu plugin migrate-rc`",
+                "  {warn} legacy rc blocks   {} — {state}; remove them BY HAND after \
+                 reviewing: `niu plugin migrate-rc`",
                 lines.join(", ")
             )?;
             if loader.is_none() {
