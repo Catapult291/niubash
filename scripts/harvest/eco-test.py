@@ -70,8 +70,9 @@ Usage:
 Exit codes: 0 clean · 2 setup failure (missing binary / unusable path)
             3 fetch gate tripped (#356/#408: FETCH-FAILED share above
             --max-fetch-failed-rate, default 15%)
-            4 unexplained-failure gate tripped (#409: HANG+ERROR-STORM in
-            the run with NO oracle available to explain them)
+            4 unexplained-failure gate tripped (#409: HANG+ERROR-STORM —
+            and, without an oracle, unconfirmed SYNTAX-REJECT-RUBASH-ONLY —
+            with NO oracle available to explain them)
 """
 
 from __future__ import annotations
@@ -88,6 +89,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -306,13 +308,20 @@ def wsl_path(p: Path) -> str:
     return f"/mnt/{drive}" + str(p).replace("\\", "/")[2:]
 
 
+_SELF_FORWARDER_MARKER = "winuxcmd"
+
+
 def _msys_bash_candidates():
     """Git for Windows ships usr/bin/bash.exe (msys bash 5.2.x) inside every
     MinGit/GfW distribution — including the copy preinstalled on
     windows-latest runners — so the oracle needs no install step, just a
     locate (#409). ECO_GNU_BASH overrides; then the standard GfW homes;
     then wherever `where git` points; finally PATH's bash (never
-    System32\\bash.exe — that one is the WSL launcher, not a bash)."""
+    System32\\bash.exe — that one is the WSL launcher, not a bash).
+    Candidates inside niubash's own winuxcmd shim layout are dropped
+    unconditionally (#410 CR F1): on a dev box `where git` resolves to our
+    own install, and grading the engine under test against a forwarder of
+    itself is exactly the oracle we must not elect."""
     out = []
     override = os.environ.get("ECO_GNU_BASH", "").strip()
     if override:
@@ -338,7 +347,20 @@ def _msys_bash_candidates():
     found = shutil.which("bash")
     if found and "system32" not in found.lower():
         out.append(Path(found))
-    return out
+    # The self-layout filter is the authoritative defense (CR #410 F1): a
+    # FUNCTIONAL niu forwarder passes the script smoke too — the product is
+    # deliberately bash-compatible — so no output check can separate them.
+    # It applies to the ECO_GNU_BASH pin as well: an operator pinning into
+    # our own shim layout is either a mistake or a self-test, and both must
+    # be refused loudly instead of grading niu against niu.
+    kept = [c for c in out
+            if _SELF_FORWARDER_MARKER not in str(c).lower()]
+    dropped = [c for c in out if c not in kept]
+    for cand in dropped:
+        print(f"WARNING: oracle candidate dropped — inside the niubash shim "
+              f"layout (would grade the engine under test against itself): "
+              f"{cand}")
+    return kept
 
 
 def _kill_tree(pid: int):
@@ -397,11 +419,42 @@ class GnuBash:
             except (OSError, subprocess.TimeoutExpired):
                 continue
             first = (r.stdout or "").splitlines()
-            if r.returncode == 0 and first and "GNU bash" in first[0]:
-                self.bin = str(cand)
-                self.kind = "msys"
-                self.version = first[0].strip()
-                return
+            if r.returncode != 0 or not first or "GNU bash" not in first[0]:
+                continue
+            if not self._script_smoke(str(cand)):
+                continue
+            self.bin = str(cand)
+            self.kind = "msys"
+            self.version = first[0].strip()
+            return
+
+    def _script_smoke(self, bash_exe: str) -> bool:
+        """--version only proves the binary talks (#410 CR F1): niu's own
+        winuxcmd forwarder passes it and then fails — or worse, *is* — the
+        engine under test. A real oracle must actually execute a script:
+        rc=0 AND the marker on stdout, or the candidate is not bash and the
+        probe moves on (WSL stays next in line, exactly like the pre-#409
+        lane). Note this smoke alone cannot catch a FUNCTIONAL forwarder —
+        niu runs marker scripts too — that class is cut by the winuxcmd
+        layout filter in _msys_bash_candidates; the smoke catches the
+        broken-shim class (version banner talks, script exec fails). An
+        explicit ECO_GNU_BASH pin OUTSIDE the self layout is honored as
+        operator authority even if it turns out to be a shim — the layout
+        filter and the smoke cannot second-guess a deliberate pin, and no
+        output check can: the product is deliberately bash-compatible."""
+        marker = "ECO-ORACLE-SMOKE-OK"
+        try:
+            with tempfile.TemporaryDirectory(
+                    prefix="eco-oracle-smoke-") as smoke_dir:
+                script = Path(smoke_dir) / "smoke.sh"
+                script.write_text(f"printf '%s\\n' '{marker}'\n", newline="\n")
+                r = subprocess.run(
+                    [bash_exe, "--noprofile", "--norc", script.as_posix()],
+                    capture_output=True, text=True, timeout=30,
+                    stdin=subprocess.DEVNULL, cwd=smoke_dir)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return r.returncode == 0 and marker in (r.stdout or "")
 
     def syntax(self, work: Path):
         """bash -n under the oracle; returns (ok, first_error_line)."""
@@ -1436,10 +1489,18 @@ def main(argv=None):
     # dead CDN, #408's unencoded URLs), never a property of the assets — and
     # it used to be completely invisible: no non-zero exit, no ::warning, no
     # summary, so six nights of a 100%-dead tier shipped green.
-    # Unexplained-failure gate (#409): HANG/ERROR-STORM are only engine-bug
-    # candidates when an oracle stayed healthy; with NO oracle available the
-    # failure mass is unexplained, and a lane that cannot explain its
-    # failures must not ship green either.
+    # Threshold (F6): 15% is the owner's directive for the #408 fix round,
+    # and the observed nightly distribution backs it — healthy runs sit at
+    # ~1% (nightly 38982913268: 4/400), the worst real bug class (#408's
+    # unencoded URLs) landed at 19.5% (nightly 39078222286: 78/400), a dead
+    # tier at ~100%. 15% keeps >15x headroom over healthy noise while still
+    # tripping on every observed failure mode.
+    # Unexplained-failure gate (#409, aligned with the UNCONFIRMED stamping
+    # per #410 CR F7): HANG/ERROR-STORM are only engine-bug candidates when
+    # an oracle stayed healthy, and a SYNTAX-REJECT-RUBASH-ONLY stamped with
+    # no oracle is UNCONFIRMED — when NO oracle exists none of these can be
+    # explained, and a lane that cannot explain its failures must not ship
+    # green either.
     gates = []
     fetch_failed = counts.get("FETCH-FAILED", 0)
     if tested and args.max_fetch_failed_rate > 0 and \
@@ -1450,9 +1511,12 @@ def main(argv=None):
             f"{args.max_fetch_failed_rate:.0%} — the fetch tier is dead; "
             f"see {results_path}")
     unexplained = counts.get("HANG", 0) + counts.get("ERROR-STORM", 0)
+    if gnu.bin is None:
+        unexplained += counts.get("SYNTAX-REJECT-RUBASH-ONLY", 0)
     if tested and gnu.bin is None and unexplained:
         gates.append(
-            "**unexplained-failure gate failed**: HANG+ERROR-STORM "
+            "**unexplained-failure gate failed**: HANG+ERROR-STORM"
+            "+unconfirmed-SYNTAX-REJECT "
             f"{unexplained}/{tested} with NO oracle available to explain "
             "them (#409) — wire Git for Windows usr/bin/bash.exe (or a WSL "
             "distro) before trusting this lane")
