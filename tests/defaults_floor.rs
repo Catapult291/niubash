@@ -81,6 +81,18 @@ impl Sandbox {
     fn rc(&self) -> String {
         fs::read_to_string(self.home.join(".niubashrc")).unwrap_or_default()
     }
+
+    /// The generated loader's text (niubash#359: the activation plane the
+    /// verbs publish; the user rc is never written).
+    fn loader(&self) -> String {
+        fs::read_to_string(
+            self.home
+                .join(".niubash")
+                .join("generated")
+                .join("plugins.niu"),
+        )
+        .unwrap_or_default()
+    }
 }
 
 impl Drop for Sandbox {
@@ -223,9 +235,9 @@ fn example_rc_sells_no_retired_stack_fields() {
 }
 
 /// A freshly enabled oh-my-bash theme claims the prompt end-to-end: the
-/// guarded managed block in the rc loads `oh-my-bash.sh`, the theme sets
-/// PS1, and the boot shell carries the claim — the product floor never
-/// overwrites it.
+/// generated loader (host-sourced before the rc, niubash#359) loads
+/// `oh-my-bash.sh`, the theme sets PS1, and the boot shell carries the
+/// claim — the product floor never overwrites it.
 #[test]
 fn omb_theme_claims_the_prompt_slot_end_to_end() {
     let sandbox = Sandbox::new("omb-claim");
@@ -234,8 +246,9 @@ fn omb_theme_claims_the_prompt_slot_end_to_end() {
         let enable = run_niu_with_env(&["plugin", "enable", target], &sandbox.envs);
         assert_success(&enable, &format!("enable {target}"));
     }
-    let rc = sandbox.rc();
-    assert!(rc.contains("OSH_THEME='agnoster'"), "{rc}");
+    let loader = sandbox.loader();
+    assert!(loader.contains("OSH_THEME='agnoster'"), "{loader}");
+    assert!(!sandbox.rc().contains("OSH_THEME"), "{}", sandbox.rc());
 
     let output = boot_interactive(&sandbox, "echo CLAIM=[$PS1]\n");
     assert_success(&output, "boot with enabled OMB theme");
@@ -282,41 +295,40 @@ fn disabling_the_source_releases_the_prompt_slot() {
     );
 }
 
-/// rc order contract (§14.5): the niu floor knobs live early in the user's
-/// rc, the framework enable block is appended after all existing lines, and
-/// enable/disable never rewrite anything outside the marker pair.
+/// rc order contract (§14.5), read-only edition (niubash#359): enable never
+/// rewrites the user's rc at all — floor knobs and user lines stay exactly
+/// where the user put them, byte for byte — and the framework activation
+/// lands in the generated loader, which the host sources BEFORE the rc so
+/// the user's file still wins the ordering.
 #[test]
-fn managed_block_lands_after_floor_config_and_user_lines() {
+fn enable_never_rewrites_the_rc_and_the_loader_carries_the_framework() {
     let sandbox = Sandbox::new("rc-order");
     install_trusted_omb(&sandbox);
-    fs::write(
-        sandbox.home.join(".niubashrc"),
-        "# my rc\nNIU_PROMPT_CWD_STYLE='home'\nalias ll='ls -la'\n",
-    )
-    .unwrap();
+    let user_rc = "# my rc\nNIU_PROMPT_CWD_STYLE='home'\nalias ll='ls -la'\n";
+    fs::write(sandbox.home.join(".niubashrc"), user_rc).unwrap();
 
     let enable = run_niu_with_env(&["plugin", "enable", "oh-my-bash"], &sandbox.envs);
     assert_success(&enable, "enable oh-my-bash");
     let rc = sandbox.rc();
-    let floor_pos = rc
-        .find("NIU_PROMPT_CWD_STYLE=")
-        .expect("floor knob still present");
-    let user_pos = rc.find("alias ll=").expect("user line still present");
-    let block_pos = rc
-        .find(">>> niu source oh-my-bash")
-        .expect("managed block appended");
+    assert_eq!(rc, user_rc, "enable must not touch the rc (niubash#359)");
+    let loader = sandbox.loader();
     assert!(
-        floor_pos < block_pos && user_pos < block_pos,
-        "managed block must load after floor config and user lines:\n{rc}"
+        loader.contains("oh-my-bash.sh"),
+        "the framework activation is in the loader: {loader}"
     );
 
     let disable = run_niu_with_env(&["plugin", "disable", "oh-my-bash"], &sandbox.envs);
     assert_success(&disable, "disable oh-my-bash");
-    let rc = sandbox.rc();
-    assert!(rc.contains("# my rc"), "{rc}");
-    assert!(rc.contains("NIU_PROMPT_CWD_STYLE='home'"), "{rc}");
-    assert!(rc.contains("alias ll='ls -la'"), "{rc}");
-    assert!(!rc.contains(">>> niu source"), "{rc}");
+    assert_eq!(
+        sandbox.rc(),
+        user_rc,
+        "disable must not touch the rc either"
+    );
+    assert!(
+        !sandbox.loader().contains("oh-my-bash.sh"),
+        "the loader section is dropped: {}",
+        sandbox.loader()
+    );
 }
 
 /// The real oh-my-bash checkout (82 themes, full lib chain) must keep the

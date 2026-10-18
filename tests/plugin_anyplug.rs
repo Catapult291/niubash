@@ -108,8 +108,16 @@ impl Sandbox {
         }
     }
 
+    /// The generated loader's text (niubash#359: the activation plane the
+    /// verbs publish; the user rc is never written).
     fn rc(&self) -> String {
-        fs::read_to_string(self.home.join(".niubashrc")).unwrap_or_default()
+        fs::read_to_string(
+            self.home
+                .join(".niubash")
+                .join("generated")
+                .join("plugins.niu"),
+        )
+        .unwrap_or_default()
     }
 
     fn spec(&self) -> String {
@@ -183,7 +191,12 @@ fn wild_single_file_plugin_enumerates_honestly_and_loads() {
             "-c",
             &format!(
                 ". {}; spark loaded-ok",
-                sandbox.home.join(".niubashrc").to_string_lossy()
+                sandbox
+                    .home
+                    .join(".niubash")
+                    .join("generated")
+                    .join("plugins.niu")
+                    .to_string_lossy()
             ),
         ],
         &sandbox.envs,
@@ -230,12 +243,14 @@ fn bash_preexec_loads_identically_to_manual_sourcing() {
         .into_owned();
     let rc = sandbox
         .home
-        .join(".niubashrc")
+        .join(".niubash")
+        .join("generated")
+        .join("plugins.niu")
         .to_string_lossy()
         .into_owned();
 
     // Byte-faithful loading: sourcing the file directly and sourcing it
-    // through the managed rc block must yield the same hook state.
+    // through the generated loader must yield the same hook state.
     let probe = r#"printf '%s|%s|%s' "${PROMPT_COMMAND-}" "$(type -t __bp_run_precmd)" "${#precmd_functions[@]}""#;
     let manual = run_niu_with_env(&["-c", &format!(". {file}; {probe}")], &sandbox.envs);
     assert_success(&manual, "manual source");
@@ -322,7 +337,9 @@ fn bpkg_package_adoption_uses_manifest_scripts_and_per_package_ids() {
     );
     let rc = sandbox
         .home
-        .join(".niubashrc")
+        .join(".niubash")
+        .join("generated")
+        .join("plugins.niu")
         .to_string_lossy()
         .into_owned();
     let engine = run_niu_with_env(
@@ -526,8 +543,13 @@ fn unknown_shape_repos_list_tagged_candidates_or_fail_honestly() {
         list_out.contains("install.sh [installer/test-like"),
         "tagged candidate must be listed: {list_out}"
     );
-    // Nothing was sourced by default.
-    assert!(sandbox.rc().is_empty(), "{}", sandbox.rc());
+    // Nothing was sourced by default: no rc was ever written and the
+    // loader generation carries no sections.
+    assert!(
+        !sandbox.rc().contains("# --- niu plugin source:"),
+        "no section may exist: {}",
+        sandbox.rc()
+    );
 
     // Source-level enable refuses to guess.
     let guess = run_niu_with_env(&["plugin", "enable", "unknown-shape"], &sandbox.envs);

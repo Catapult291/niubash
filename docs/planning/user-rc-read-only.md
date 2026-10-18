@@ -4,6 +4,16 @@ Status: proposed contract and acceptance plan; this document does not implement
 the behavior below. Existing startup, setup, and plugin-management behavior must
 not be described as compliant until the corresponding tests pass.
 
+Implementation update (niubash#359 case A, 1.4.2): the plugin-management half
+is implemented — `generated/plugins.niu` exists (`plugins::loader`), the host
+sources it read-only before the user rc with a double-execution guard and the
+`NIU_PLUGIN_LOADER=off` rollback switch, plugin verbs write the sidecar
+manifest only, and `niu plugin migrate-rc` is the read-only migration
+diagnostic. Still unimplemented here: `niu setup` create-only (the wizard's
+whole-file rc write converges in 1.4.3), the `startup.rc-policy` enum, and the
+config-writer rework it depends on. Gate evidence: `tests/rc_readonly_loader.rs`
+(359.4-359.9, 359.12) plus the stage-1 suites.
+
 ## Ownership Boundary
 
 `~/.niubashrc` is user-owned shell code, not a generated database. "Read-only"

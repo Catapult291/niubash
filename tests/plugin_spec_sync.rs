@@ -114,6 +114,25 @@ impl Sandbox {
         fs::read_to_string(self.home.join(".niubashrc")).unwrap_or_default()
     }
 
+    /// The generated loader's text (niubash#359: the activation plane the
+    /// verbs publish; the user rc is never written).
+    fn loader(&self) -> String {
+        fs::read_to_string(
+            self.home
+                .join(".niubash")
+                .join("generated")
+                .join("plugins.niu"),
+        )
+        .unwrap_or_default()
+    }
+
+    fn loader_path(&self) -> PathBuf {
+        self.home
+            .join(".niubash")
+            .join("generated")
+            .join("plugins.niu")
+    }
+
     fn spec_path(&self) -> PathBuf {
         self.home.join(".niubash").join("plugins.toml")
     }
@@ -162,19 +181,29 @@ fn sync_is_idempotent_bootstrap_quiet_and_merges_honestly() {
         "trust",
     );
 
-    // Sync 2: materialize from the spec.
+    // Sync 2: materialize from the spec into the generated loader (the rc
+    // is never written -- niubash#359).
     let second = run_niu_with_env(&["plugin", "sync"], &sandbox.envs);
     assert_success(&second, "sync 2");
-    let rc_after = sandbox.rc();
-    assert!(rc_after.contains("OSH_THEME='agnoster'"), "{rc_after}");
-    assert!(rc_after.contains("plugins=('git')"), "{rc_after}");
-    assert!(rc_after.contains("aliases=('cargo')"), "{rc_after}");
+    let loader_after = sandbox.loader();
+    assert!(
+        loader_after.contains("OSH_THEME='agnoster'"),
+        "{loader_after}"
+    );
+    assert!(loader_after.contains("plugins=('git')"), "{loader_after}");
+    assert!(loader_after.contains("aliases=('cargo')"), "{loader_after}");
+    assert!(sandbox.rc().is_empty(), "the rc was never written");
 
-    // Sync 3 (the idempotency pin): byte-identical rc, all rows unchanged,
-    // report says in sync.
+    // Sync 3 (the idempotency pin): byte-identical loader, all rows
+    // unchanged, report says in sync.
     let third = run_niu_with_env(&["plugin", "sync"], &sandbox.envs);
     assert_success(&third, "sync 3");
-    assert_eq!(sandbox.rc(), rc_after, "rc must be byte-identical");
+    assert_eq!(
+        sandbox.loader(),
+        loader_after,
+        "loader must be byte-identical"
+    );
+    assert!(sandbox.rc().is_empty(), "still no rc");
     assert!(
         stdout_text(&third).contains("in sync"),
         "{}",
@@ -191,15 +220,16 @@ fn sync_is_idempotent_bootstrap_quiet_and_merges_honestly() {
         stderr_text(&boot)
     );
 
-    // Merge semantics: hand-add an entry to the rc array and drop 'cargo'
-    // from the spec. The next sync removes spec-dropped cargo and keeps
-    // the hand-added g2; a spec without a theme key keeps the hand-set one.
-    let hand = rc_after.replace("plugins=('git')", "plugins=('git' 'g2')");
+    // Merge semantics: hand-add an entry to the loader array and drop
+    // 'cargo' from the spec. The next sync removes spec-dropped cargo and
+    // keeps the hand-added g2; a spec without a theme key keeps the
+    // hand-set one.
+    let hand = loader_after.replace("plugins=('git')", "plugins=('git' 'g2')");
     assert!(
-        hand != rc_after,
-        "hand edit must land (block shape changed?)"
+        hand != loader_after,
+        "hand edit must land (section shape changed?)"
     );
-    fs::write(sandbox.home.join(".niubashrc"), hand).unwrap();
+    fs::write(sandbox.loader_path(), hand).unwrap();
     fs::write(
         sandbox.spec_path(),
         format!(
@@ -214,16 +244,20 @@ fn sync_is_idempotent_bootstrap_quiet_and_merges_honestly() {
     .unwrap();
     let merged = run_niu_with_env(&["plugin", "sync"], &sandbox.envs);
     assert_success(&merged, "merge sync");
-    let rc = sandbox.rc();
+    let loader = sandbox.loader();
     assert!(
-        rc.contains("plugins=('git' 'g2')"),
-        "spec-dropped cargo gone, hand-added g2 kept: {rc}"
+        loader.contains("plugins=('git' 'g2')"),
+        "spec-dropped cargo gone, hand-added g2 kept: {loader}"
     );
-    assert!(!rc.contains("aliases="), "spec-dropped alias removed: {rc}");
     assert!(
-        rc.contains("OSH_THEME='agnoster'"),
-        "hand-set theme survives a spec that declares none: {rc}"
+        !loader.contains("aliases="),
+        "spec-dropped alias removed: {loader}"
     );
+    assert!(
+        loader.contains("OSH_THEME='agnoster'"),
+        "hand-set theme survives a spec that declares none: {loader}"
+    );
+    assert!(sandbox.rc().is_empty(), "the rc is still untouched");
 
     // The survival pin: hand-added entries must stay hand-added — they
     // survive not just the sync that first sees them but every later sync
@@ -231,10 +265,10 @@ fn sync_is_idempotent_bootstrap_quiet_and_merges_honestly() {
     // own recorded selection and then dropped by a subsequent change).
     let settled = run_niu_with_env(&["plugin", "sync"], &sandbox.envs);
     assert_success(&settled, "settling sync");
-    let rc = sandbox.rc();
+    let loader = sandbox.loader();
     assert!(
-        rc.contains("plugins=('git' 'g2')"),
-        "hand-added g2 survives repeated syncs: {rc}"
+        loader.contains("plugins=('git' 'g2')"),
+        "hand-added g2 survives repeated syncs: {loader}"
     );
     assert!(
         stdout_text(&settled).contains("in sync"),
@@ -474,8 +508,12 @@ fn adopt_snapshots_the_live_state_and_round_trips() {
     assert_success(&enable, "enable plugin");
     let theme = run_niu_with_env(&["plugin", "enable", "agnoster"], &sandbox.envs);
     assert_success(&theme, "enable theme");
+    let live_loader = sandbox.loader();
+    assert!(
+        live_loader.contains("OSH_THEME='agnoster'"),
+        "{live_loader}"
+    );
     let live_rc = sandbox.rc();
-    assert!(live_rc.contains("OSH_THEME='agnoster'"), "{live_rc}");
     fs::remove_file(sandbox.spec_path()).unwrap();
 
     // --adopt declares it with the live snapshot.
@@ -490,8 +528,9 @@ fn adopt_snapshots_the_live_state_and_round_trips() {
     assert!(spec.contains("enable = ['git']"), "{spec}");
     assert_eq!(sandbox.rc(), live_rc, "adopt must not move the rc");
 
-    // Round-trip: plain sync is a no-op — rc and spec byte-stable.
+    // Round-trip: plain sync is a no-op — loader, rc and spec byte-stable.
     let spec_once = sandbox.spec();
+    let loader_once = sandbox.loader();
     let plain = run_niu_with_env(&["plugin", "sync"], &sandbox.envs);
     assert_success(&plain, "plain sync after adopt");
     assert!(
@@ -500,6 +539,7 @@ fn adopt_snapshots_the_live_state_and_round_trips() {
         stdout_text(&plain)
     );
     assert_eq!(sandbox.rc(), live_rc, "rc byte-identical");
+    assert_eq!(sandbox.loader(), loader_once, "loader byte-identical");
     assert_eq!(sandbox.spec(), spec_once, "spec byte-identical");
 
     // And the startup form is silent again — the nag is gone for good.

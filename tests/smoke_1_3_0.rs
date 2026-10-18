@@ -110,6 +110,18 @@ impl Sandbox {
         fs::read_to_string(self.home.join(".niubashrc")).unwrap_or_default()
     }
 
+    /// The generated loader's text (niubash#359: the activation plane the
+    /// verbs publish; the user rc is never written).
+    fn loader(&self) -> String {
+        fs::read_to_string(
+            self.home
+                .join(".niubash")
+                .join("generated")
+                .join("plugins.niu"),
+        )
+        .unwrap_or_default()
+    }
+
     fn spec(&self) -> String {
         fs::read_to_string(&self.spec_path).unwrap_or_default()
     }
@@ -271,8 +283,9 @@ fn boot_interactive(sandbox: &Sandbox, stdin_script: &str) -> Output {
 // ── A. install chain ─────────────────────────────────────────────────────────
 
 /// oh-my-bash: catalog add (offline fixture) → trust → enable source+theme →
-/// a fresh `niu -c '. ~/.niubashrc; echo $OSH_THEME'` sees the theme the
-/// block declared. This is the literal 1.3.0 checklist leg.
+/// a fresh `niu -c '. ~/.niubash/generated/plugins.niu; echo $OSH_THEME'`
+/// (the manual-source path a user opts into) sees the theme the generation
+/// declared. This is the literal 1.3.0 checklist leg, loader-era.
 #[test]
 fn a1_oh_my_bash_install_chain_theme_takes_effect() {
     let sandbox = Sandbox::new("a1-omb");
@@ -300,11 +313,15 @@ fn a1_oh_my_bash_install_chain_theme_takes_effect() {
     let theme = run_niu(&["plugin", "enable", "agnoster"], &sandbox.envs);
     assert_success(&theme, "plugin enable agnoster");
 
-    let rc = sandbox.rc();
-    assert!(rc.contains("OSH_THEME='agnoster'"), "{rc}");
+    let loader = sandbox.loader();
+    assert!(loader.contains("OSH_THEME='agnoster'"), "{loader}");
+    assert!(!sandbox.rc().contains("OSH_THEME"), "{}", sandbox.rc());
 
-    let probe = run_niu(&["-c", ". ~/.niubashrc; echo $OSH_THEME"], &sandbox.envs);
-    assert_success(&probe, "fresh shell sourcing the managed rc");
+    let probe = run_niu(
+        &["-c", ". ~/.niubash/generated/plugins.niu; echo $OSH_THEME"],
+        &sandbox.envs,
+    );
+    assert_success(&probe, "fresh shell sourcing the generated loader");
     assert_eq!(
         normalized(&probe),
         "agnoster",
@@ -341,10 +358,13 @@ fn a2_bash_it_install_chain_theme_takes_effect() {
     assert!(entry.is_file(), "bash-it enabled/ entry missing: {entry:?}");
 
     let probe = run_niu(
-        &["-c", ". ~/.niubashrc; printf '%s' \"$PS1\""],
+        &[
+            "-c",
+            ". ~/.niubash/generated/plugins.niu; printf '%s' \"$PS1\"",
+        ],
         &sandbox.envs,
     );
-    assert_success(&probe, "fresh shell sourcing the managed rc");
+    assert_success(&probe, "fresh shell sourcing the generated loader");
     assert_eq!(
         stdout_text(&probe).trim_end_matches(['\r', '\n']),
         "demox> ",
@@ -845,10 +865,22 @@ fn d2_wizard_one_run_theme_journey() {
     let code = s.wait_exit();
     assert_eq!(code, 0, "the wizard run must exit 0");
 
-    // The same run wrote the guarded activation block into the rc.
+    // The same run recorded the pick; the activation content went to the
+    // generated loader (niubash#359) — the rc carries none.
     let rc = fs::read_to_string(s.home().join(".niubashrc")).unwrap();
-    assert!(rc.contains("OSH_THEME='agnoster'"), "{rc}");
-    assert!(rc.contains(">>> niu source oh-my-bash"), "{rc}");
+    assert!(!rc.contains(">>> niu source oh-my-bash"), "{rc}");
+    assert!(!rc.contains("OSH_THEME="), "{rc}");
+    let loader = fs::read_to_string(
+        s.home()
+            .join(".niubash")
+            .join("generated")
+            .join("plugins.niu"),
+    )
+    .unwrap_or_default();
+    assert!(
+        loader.contains("OSH_THEME='agnoster'"),
+        "the pick published the loader generation: {loader}"
+    );
     let journal = fs::read_to_string(s.home().join(".niubash").join("setup-journal.toml")).unwrap();
     assert!(journal.contains("theme = 'agnoster'"), "{journal}");
     assert!(journal.contains("collection = 'recommended'"), "{journal}");
@@ -895,8 +927,11 @@ fn d2_wizard_one_run_theme_journey() {
         ("NIU_PLUGIN_SOURCES_ROOT", sources_str),
         ("NIU_PLUGIN_SPEC", spec_str),
     ];
-    let probe = run_niu(&["-c", ". ~/.niubashrc; echo $OSH_THEME"], &probe_env);
-    assert_success(&probe, "fresh shell sourcing the journey rc");
+    let probe = run_niu(
+        &["-c", ". ~/.niubash/generated/plugins.niu; echo $OSH_THEME"],
+        &probe_env,
+    );
+    assert_success(&probe, "fresh shell sourcing the journey loader");
     assert_eq!(
         normalized(&probe),
         "agnoster",
@@ -1036,15 +1071,22 @@ fn d3_setup_rerun_applies_in_the_live_session() {
     s.expect("Applied the new configuration");
     s.expect("agnoster-fixture-face ");
 
-    // The one-shot marker is consumed, the rc carries the pick, and the
-    // old sentinel prompt is gone for good.
+    // The one-shot marker is consumed, the pick is active (the loader
+    // generation carries it — niubash#359), and the old sentinel prompt is
+    // gone for good.
     assert!(
         !home.join(".niubash").join("setup-apply-pending").exists(),
         "the handoff marker must be consumed by the apply"
     );
     let rc = fs::read_to_string(home.join(".niubashrc")).unwrap();
-    assert!(rc.contains("OSH_THEME='agnoster'"), "{rc}");
+    assert!(!rc.contains("OSH_THEME="), "{rc}");
     assert!(!rc.contains("OLD> "), "{rc}");
+    let loader = fs::read_to_string(home.join(".niubash").join("generated").join("plugins.niu"))
+        .unwrap_or_default();
+    assert!(
+        loader.contains("OSH_THEME='agnoster'"),
+        "the pick is in the loader generation: {loader}"
+    );
     // Default answer to the provider question is Skip: no snippet in the rc.
     assert!(!rc.contains("carapace"), "{rc}");
 

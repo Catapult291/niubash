@@ -31,6 +31,7 @@ pub mod assets;
 pub mod catalog;
 pub mod descriptors;
 pub mod distros;
+pub mod loader;
 pub mod mirrors;
 pub mod recipes;
 pub mod sources;

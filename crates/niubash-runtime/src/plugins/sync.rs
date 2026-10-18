@@ -11,14 +11,16 @@
 //!    lands untrusted and sync prints the exact `niu plugin trust <id>`);
 //!    an install identity that is already registered is adopted, not
 //!    refused;
-//! 2. **declared, installed, trusted** → materialize the managed rc block
-//!    / enabled tree *from the spec*, idempotently (`plugins::assets::
-//!    materialize_spec_selection`, hand-added entries preserved);
+//! 2. **declared, installed, trusted** → materialize the generated loader
+//!    section *from the spec*, idempotently (`plugins::assets::
+//!    compute_spec_selection`, hand-added entries preserved) and publish
+//!    ONE `generated/plugins.niu` generation for the whole pass
+//!    (validate-then-atomic; niubash#359 — the user rc is never written);
 //!    immediately before this pass, theme claims are reconciled to a
-//!    single owner toward the rc's live state (niubash#168): a theme pick
-//!    written to the rc + spec is the user's latest expressed choice, so a
-//!    stale same-name claim is cleared — never re-routed over a working
-//!    theme block — and sync prints what it reconciled;
+//!    single owner toward the live state (niubash#168): a theme pick
+//!    recorded in the spec + loader is the user's latest expressed choice,
+//!    so a stale same-name claim is cleared — never re-routed over a
+//!    working theme — and sync prints what it reconciled;
 //! 3. **installed, not declared** → suggest cleanup, never auto-delete
 //!    (`--prune` removes them explicitly);
 //! 4. **spec absent** → legacy imperative mode: nothing to reconcile; sync
@@ -31,7 +33,7 @@
 //! setup wizard as a single bootstrap line. Startup installs that fail are
 //! memoized and deferred on later startups — only explicit verbs retry.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use super::assets;
@@ -124,8 +126,10 @@ fn resolve_spec_origin(target: &str) -> anyhow::Result<(Option<String>, String)>
 }
 
 /// The registry record a spec entry owns: explicit id, catalog id, or the
-/// recorded origin — in that order.
-fn record_for_entry<'a>(
+/// recorded origin — in that order. Shared with the loader generation's
+/// regenerate path (`assets::regenerate_loader_generation`), which must
+/// resolve entries exactly like sync does.
+pub fn record_for_entry<'a>(
     entry: &SpecSource,
     registry: &'a [SourceRecord],
 ) -> Option<&'a SourceRecord> {
@@ -371,6 +375,15 @@ fn sync_with_spec(
         })
         .collect();
 
+    // niubash#359: the pass COMPUTES every declared source's selection and
+    // publishes ONE generated-loader generation at the end
+    // (validate-then-atomic; the user rc is never written). Ids the pass
+    // skipped (awaiting-trust, degraded, drift, failures) keep their
+    // current section verbatim — a skip never deactivates anything.
+    let mut computed: Vec<(String, assets::ComputedSelection)> = Vec::new();
+    let mut keep_current: BTreeSet<String> = BTreeSet::new();
+    let mut drop_silent: BTreeSet<String> = BTreeSet::new();
+
     for (entry_index, entry) in spec.sources.iter_mut().enumerate() {
         let (catalog_hint, origin) = match resolve_spec_origin(&entry.target) {
             Ok(resolved) => resolved,
@@ -542,10 +555,13 @@ fn sync_with_spec(
                     ),
                 });
             }
+            // A skip never deactivates: the current loader section stays.
+            keep_current.insert(record.id.clone());
             continue;
         }
         if !record.path.is_dir() {
             let _ = sources::clear_drifted_source(&record.id);
+            keep_current.insert(record.id.clone());
             rows.push(SyncRow {
                 id: record.id.clone(),
                 action: "degraded".to_string(),
@@ -569,6 +585,7 @@ fn sync_with_spec(
             }
             Ok(report) => {
                 let _ = sources::record_drifted_source(&record.id);
+                keep_current.insert(record.id.clone());
                 let short = |pin: &str| pin.chars().take(12).collect::<String>();
                 rows.push(SyncRow {
                     id: record.id.clone(),
@@ -590,6 +607,7 @@ fn sync_with_spec(
                 continue;
             }
             Err(err) => {
+                keep_current.insert(record.id.clone());
                 rows.push(SyncRow {
                     id: record.id.clone(),
                     action: "failed".to_string(),
@@ -599,9 +617,12 @@ fn sync_with_spec(
             }
         }
 
-        // Materialize the spec selection (idempotent; hand-added entries
-        // preserved) and persist the materialized state into the lock.
-        match assets::materialize_spec_selection(
+        // Compute the spec selection (idempotent; hand-added entries
+        // preserved) and persist the materialized state into the lock. The
+        // section itself lands in the generated loader when the pass
+        // publishes its single generation at the end (niubash#359: the
+        // user rc is never written).
+        match assets::compute_spec_selection(
             &record,
             entry,
             theme_claimed_elsewhere
@@ -609,27 +630,25 @@ fn sync_with_spec(
                 .copied()
                 .unwrap_or(false),
         ) {
-            Ok(materialized) => {
+            Ok(selection) => {
                 let mut updated = record.clone();
-                updated.spec_enabled = Some(materialized.spec_enabled.unwrap_or_default());
-                updated.spec_theme = materialized.spec_theme;
+                updated.spec_enabled = selection.spec_enabled.clone();
+                updated.spec_theme = selection.spec_theme.clone();
                 if updated.spec_enabled != record.spec_enabled
                     || updated.spec_theme != record.spec_theme
                 {
                     write_record(&mut registry, updated);
                 }
-                let action = materialized.action;
+                computed.push((record.id.clone(), selection));
+            }
+            Err(err) => {
+                keep_current.insert(record.id.clone());
                 rows.push(SyncRow {
                     id: record.id.clone(),
-                    action,
-                    detail: materialized.detail,
+                    action: "failed".to_string(),
+                    detail: err.to_string(),
                 });
             }
-            Err(err) => rows.push(SyncRow {
-                id: record.id.clone(),
-                action: "failed".to_string(),
-                detail: err.to_string(),
-            }),
         }
     }
     if spec_changed || !merged.is_empty() {
@@ -648,10 +667,13 @@ fn sync_with_spec(
         undeclared.push(record.id.clone());
         if record.spec_enabled.is_some() {
             // The spec owned this source and no longer declares it: drop
-            // its managed block (spec is the truth) but keep the tree. A
-            // failed removal (a malformed block) is a failed row, never a
-            // "deactivated" print over a block that still loads (wt83 #175).
-            match remove_activation_block(&record) {
+            // its tree-side activation and its loader section (spec is the
+            // truth) but keep the tree — and NEVER touch the user rc
+            // (niubash#359; the rc's legacy managed block, if any, stays
+            // until the user removes it). A failed tree half is a failed
+            // row, never a "deactivated" print over a section that still
+            // loads (wt83 #175).
+            match assets::deactivate_tree(&record) {
                 Ok(()) => {
                     let mut registry_now = read_source_registry();
                     if let Some(stored) = registry_now
@@ -662,6 +684,7 @@ fn sync_with_spec(
                         stored.spec_theme = None;
                         sources::write_source_registry(&registry_now)?;
                     }
+                    drop_silent.insert(record.id.clone());
                     rows.push(SyncRow {
                         id: record.id.clone(),
                         action: "deactivated".to_string(),
@@ -672,13 +695,36 @@ fn sync_with_spec(
                         ),
                     });
                 }
-                Err(err) => rows.push(SyncRow {
-                    id: record.id.clone(),
-                    action: "failed".to_string(),
-                    detail: err.to_string(),
-                }),
+                Err(err) => {
+                    keep_current.insert(record.id.clone());
+                    rows.push(SyncRow {
+                        id: record.id.clone(),
+                        action: "failed".to_string(),
+                        detail: err.to_string(),
+                    });
+                }
             }
         }
+    }
+
+    // Publish the pass's single loader generation (niubash#359; gate case
+    // 359.7): validate-then-atomic, byte-stable when nothing changed. The
+    // per-id rows join the report in spec order.
+    match assets::publish_loader_generation(&computed, &keep_current, &drop_silent) {
+        Ok((generation_rows, _)) => {
+            for row in generation_rows {
+                rows.push(SyncRow {
+                    id: row.id,
+                    action: row.action,
+                    detail: row.detail,
+                });
+            }
+        }
+        Err(err) => rows.push(SyncRow {
+            id: "(loader generation)".to_string(),
+            action: "failed".to_string(),
+            detail: format!("the generated loader could not be published: {err}"),
+        }),
     }
     let mut pruned: Vec<SyncRow> = Vec::new();
     if options.prune {
@@ -878,13 +924,6 @@ fn write_record(registry: &mut Vec<SourceRecord>, updated: SourceRecord) {
     if let Err(err) = sources::write_source_registry(registry) {
         log::warn!("failed to persist spec state: {err}");
     }
-}
-
-/// Drop a source's managed rc activation (and bash-it enabled/ entries)
-/// without touching the rest of the tree. Errors surface (wt83 #175): a
-/// removal that did not happen must reach the report, not vanish.
-fn remove_activation_block(record: &SourceRecord) -> anyhow::Result<()> {
-    assets::deactivate_block(record)
 }
 
 /// `niu plugin update` (no id): the vim-plug `:PlugUpdate` move — refetch
@@ -1146,6 +1185,19 @@ mod tests {
         fs::read_to_string(assets::rc_file()).unwrap_or_default()
     }
 
+    /// The generated loader's full text in the sandbox.
+    fn loader_text() -> String {
+        crate::plugins::loader::read_loader_text().unwrap_or_default()
+    }
+
+    fn loader_section(id: &str) -> String {
+        crate::plugins::loader::parse_sections(&loader_text())
+            .into_iter()
+            .find(|section| section.id == id)
+            .map(|section| section.body)
+            .unwrap_or_default()
+    }
+
     fn spec_sources() -> Vec<SpecSource> {
         spec::load_spec().unwrap().unwrap_or_default().sources
     }
@@ -1187,38 +1239,42 @@ mod tests {
 
         sources::trust_source("oh-my-bash").unwrap();
 
-        // Sync 2: materializes the spec into the managed block.
+        // Sync 2: materializes the spec into the generated loader (the rc
+        // stays untouched -- niubash#359).
         let report = sync_spec(SyncOptions::default()).unwrap();
         assert_eq!(report.rows[0].action, "activated", "{:?}", report.rows);
-        let rc = rc_text();
-        assert!(rc.contains("OSH_THEME='agnoster'"), "{rc}");
-        assert!(rc.contains("plugins=('git' 'npm')"), "{rc}");
+        let loader = loader_section("oh-my-bash");
+        assert!(loader.contains("OSH_THEME='agnoster'"), "{loader}");
+        assert!(loader.contains("plugins=('git' 'npm')"), "{loader}");
         assert!(!report.clean, "{:?}", report);
 
         // Sync 3 (idempotency, pinned by integration too): byte-identical
-        // rc, unchanged rows, clean report.
-        let before = rc_text();
+        // loader, unchanged rows, clean report.
+        let before = loader_text();
         let report = sync_spec(SyncOptions::default()).unwrap();
         assert_eq!(report.rows[0].action, "unchanged", "{:?}", report.rows);
-        assert_eq!(rc_text(), before, "rc must be byte-identical");
+        assert_eq!(loader_text(), before, "loader must be byte-identical");
         assert!(report.clean, "{:?}", report);
+        assert!(rc_text().is_empty(), "still no rc");
 
-        // Removing an entry from the spec drops it from the rc block, and
-        // hand-added entries survive: simulate a hand edit by adding 'g2'
-        // directly to the rc array, then syncing after removing npm.
+        // Removing an entry from the spec drops it from the loader section,
+        // and hand-added entries survive: simulate a hand edit by adding
+        // 'g2' directly to the loader array, then syncing after removing
+        // npm.
         let hand = before.replace("plugins=('git' 'npm')", "plugins=('git' 'npm' 'g2')");
-        fs::write(assets::rc_file(), &hand).unwrap();
+        fs::write(crate::plugins::loader::loader_path(), &hand).unwrap();
         let mut next_spec = spec::load_spec().unwrap().unwrap();
         next_spec.sources[0].enable.retain(|name| name != "npm");
         spec::save_spec(&next_spec).unwrap();
         let report = sync_spec(SyncOptions::default()).unwrap();
         assert_eq!(report.rows[0].action, "activated", "{:?}", report.rows);
-        let rc = rc_text();
+        let loader = loader_section("oh-my-bash");
         assert!(
-            rc.contains("plugins=('git' 'g2')"),
-            "spec-removed npm is dropped, hand-added g2 survives: {rc}"
+            loader.contains("plugins=('git' 'g2')"),
+            "spec-removed npm is dropped, hand-added g2 survives: {loader}"
         );
-        assert!(rc.contains("OSH_THEME='agnoster'"), "{rc}");
+        assert!(loader.contains("OSH_THEME='agnoster'"), "{loader}");
+        assert!(rc_text().is_empty(), "the rc was never written");
 
         let _ = fs::remove_dir_all(&holder);
         let _ = fs::remove_dir_all(&box_.temp);
@@ -1308,9 +1364,14 @@ mod tests {
         sync_spec(SyncOptions::default()).unwrap();
         sources::trust_source("oh-my-bash").unwrap();
         sync_spec(SyncOptions::default()).unwrap();
-        assert!(rc_text().contains("plugins=('git')"), "{}", rc_text());
+        assert!(
+            loader_section("oh-my-bash").contains("plugins=('git')"),
+            "{}",
+            loader_text()
+        );
 
-        // Remove the declaration → sync drops the activation, keeps tree.
+        // Remove the declaration → sync drops the activation (from the
+        // loader), keeps tree, keeps rc untouched.
         spec::save_spec(&PluginSpec::default()).unwrap();
         let report = sync_spec(SyncOptions::default()).unwrap();
         assert!(
@@ -1321,7 +1382,8 @@ mod tests {
             "{:?}",
             report.rows
         );
-        assert!(!rc_text().contains("plugins="), "{}", rc_text());
+        assert!(!loader_text().contains("plugins="), "{}", loader_text());
+        assert!(rc_text().is_empty(), "the rc was never written");
         assert!(
             box_.temp.join("sources/oh-my-bash/oh-my-bash.sh").is_file(),
             "tree kept"
@@ -1429,17 +1491,30 @@ mod tests {
         assert_eq!(declared[0].id.as_deref(), Some("oh-my-bash"));
         assert_eq!(declared[0].theme.as_deref(), Some("agnoster"));
         assert_eq!(declared[0].enable, ["git"], "{declared:?}");
-        // The adopt run itself materializes without disturbing the block.
+        // The adopt run itself materializes the LOADER from the snapshot
+        // without disturbing the legacy block.
         assert_eq!(rc_text(), with_plugin, "the live block is byte-stable");
+        assert!(
+            loader_section("oh-my-bash").contains("plugins=('git')")
+                && loader_section("oh-my-bash").contains("OSH_THEME='agnoster'"),
+            "{}",
+            loader_text()
+        );
 
         // Round-trip: a plain sync is a no-op — clean report, byte-identical
-        // rc, spec, and registry (spec_enabled/spec_theme included).
+        // rc, loader, spec, and registry (spec_enabled/spec_theme included).
         let spec_text = fs::read_to_string(spec::spec_path()).unwrap();
         let registry_text =
             fs::read_to_string(sources::sources_root().join("registry.toml")).unwrap();
+        let loader_before = loader_text();
         let report = sync_spec(SyncOptions::default()).unwrap();
         assert!(report.clean, "{:?}", report);
         assert_eq!(rc_text(), with_plugin, "rc byte-identical after plain sync");
+        assert_eq!(
+            loader_text(),
+            loader_before,
+            "loader byte-identical after plain sync"
+        );
         assert_eq!(
             fs::read_to_string(spec::spec_path()).unwrap(),
             spec_text,
@@ -1818,15 +1893,22 @@ mod tests {
         })
         .unwrap();
         sync_spec(SyncOptions::default()).unwrap();
-        assert!(rc_text().contains("BASH_IT_THEME='demox'"), "{}", rc_text());
+        assert!(
+            loader_section("bash-it").contains("BASH_IT_THEME='demox'"),
+            "{}",
+            loader_text()
+        );
 
         // Era 2 (the wizard pick): the rc is wholesale-rewritten to the
         // oh-my-bash block only, and the spec gains the omb entry (the
         // adopt snapshot) while bash-it's stale claim survives — the exact
-        // state a 1.3.x wizard run leaves behind.
+        // state a 1.3.x (write-era) wizard run leaves behind. The loader
+        // from the era-1 sync is gone with it: a write-era machine never
+        // had one.
         let wizard_block = assets::build_theme_block("oh-my-bash", "demox").expect("theme block");
         let wizard_rc = format!("# wizard rc\n\n{wizard_block}\n");
         fs::write(assets::rc_file(), &wizard_rc).unwrap();
+        fs::remove_file(crate::plugins::loader::loader_path()).unwrap();
         spec::save_spec(&PluginSpec {
             schema: None,
             sources: vec![
@@ -1863,11 +1945,15 @@ mod tests {
             report.rows
         );
         assert_eq!(rc_text(), wizard_rc, "the working theme block never flips");
-        assert!(rc_text().contains("OSH_THEME='demox'"), "{}", rc_text());
         assert!(
-            !rc_text().contains("BASH_IT_THEME"),
+            loader_section("oh-my-bash").contains("OSH_THEME='demox'"),
+            "{}",
+            loader_text()
+        );
+        assert!(
+            !loader_text().contains("BASH_IT_THEME"),
             "the stale claim must not re-materialize: {}",
-            rc_text()
+            loader_text()
         );
         // The spec is updated (the stale claim is gone, the pick is pinned).
         let declared = spec_sources();
@@ -1889,6 +1975,9 @@ mod tests {
             report.rows
         );
         assert_eq!(rc_text(), wizard_rc, "rc byte-stable across sources");
+        let loader_before = loader_text();
+        sync_spec(SyncOptions::default()).unwrap();
+        assert_eq!(loader_text(), loader_before, "loader byte-stable too");
 
         let _ = fs::remove_dir_all(&holder);
         let _ = fs::remove_dir_all(&box_.temp);
@@ -1955,9 +2044,10 @@ mod tests {
             "{:?}",
             report.rows
         );
-        let rc = rc_text();
-        assert!(rc.contains("OSH_THEME='demox'"), "{rc}");
-        assert!(!rc.contains("BASH_IT_THEME"), "{rc}");
+        let loader = loader_text();
+        assert!(loader.contains("OSH_THEME='demox'"), "{loader}");
+        assert!(!loader.contains("BASH_IT_THEME"), "{loader}");
+        assert!(rc_text().is_empty(), "the rc was never written");
         let declared = spec_sources();
         assert_eq!(
             declared
@@ -1969,9 +2059,9 @@ mod tests {
         );
 
         // Stable across a second sync.
-        let before = rc_text();
+        let before = loader_text();
         sync_spec(SyncOptions::default()).unwrap();
-        assert_eq!(rc_text(), before);
+        assert_eq!(loader_text(), before);
 
         let _ = fs::remove_dir_all(&holder);
         let _ = fs::remove_dir_all(&box_.temp);
@@ -2038,19 +2128,25 @@ mod tests {
 
         let report = sync_spec(SyncOptions::default()).unwrap();
         assert!(
-            report.rows.iter().all(|row| row.action != "activated"),
+            report
+                .rows
+                .iter()
+                .all(|row| !(row.id == "bash-it" && row.action == "activated")),
             "the floor must not resurrect bash-it over the claimed theme: {:?}",
             report.rows
         );
-        let rc = rc_text();
-        assert!(rc.contains("OSH_THEME='demox'"), "{rc}");
+        let loader = loader_text();
+        assert!(loader.contains("OSH_THEME='demox'"), "{loader}");
         assert!(
-            !rc.contains("niu source bash-it"),
-            "no bash-it loader block over the claimed theme: {rc}"
+            !loader.contains("BASH_IT"),
+            "no bash-it loader section over the claimed theme: {loader}"
         );
+        assert_eq!(rc_text(), wizard_rc, "the rc was never rewritten");
 
         // Byte-stable across sources.
+        let loader_before = loader_text();
         sync_spec(SyncOptions::default()).unwrap();
+        assert_eq!(loader_text(), loader_before);
         assert_eq!(rc_text(), wizard_rc);
 
         let _ = fs::remove_dir_all(&holder);
