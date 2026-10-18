@@ -6,6 +6,30 @@ All notable changes to Niubash are documented in this file.
 
 ### Changed
 
+- **Shell-face startup is a measured contract** (`scripts/perf/shell-face-startup.py`):
+  execution-level `-c exit` timing for every installed face — the `niu.exe`
+  payload, the `winuxcmd\bin` / `winuxcmd\usr\bin` `bash.exe`/`sh.exe` links,
+  and the `C:\Program Files\Git\bin\bash.exe` convention slot — with a
+  verify-before-record rule (a face that cannot execute prints the failure
+  note, never a fast number), structural annotations (size, hardlink count,
+  same-file-as-payload), a `Measure-Command` cross-check mode, and a
+  timing-ratio-only `--check` gate (niubash#377). Measured on the 1.4.0
+  install (faces still the 243,200 B rubash forwarders): payload
+  `niu -c exit` 27.2 ms avg, faces 42.1–47.3 ms (+9.8 to +15.0 ms, one extra
+  process), the .NET slot 80.6 ms (+48 ms, two extra processes); after
+  `--relink-shells --force` on the same engine the faces measure equal to the
+  payload within noise (23.8–29.7 ms, same inode) with `$0`, `BASH_VERSION`,
+  POSIX mode and the `NIU_SHELL` contract verified through the links.
+- **The installer sweeps retired shim shapes out of the PATH entry directory**
+  (niubash#376 hygiene): `{app}\winuxcmd\bin` and `{app}\winuxcmd\usr\bin` are
+  cleared of `*.bak-*` / `*.old-*` / `*.niu-old-*` on install and uninstall —
+  the same dead-weight class as the existing `niu.exe.old-*` sweep, observed
+  live as `bash.exe.bak-1.4.0` / `sh.exe.old-shposix` (4 × 226,816 B on real
+  machines; `*.niu-old-*` covers a relinker crash between park and drop).
+  Live entry names are never matched. The PATH entry directory contract
+  (hardlinks only, `usr\bin` off `PATH`, declared entry set) is now documented
+  in `docs/src/installer.md`.
+
 - **The factory prompt's git segment runs the user's own git** instead of the
   in-process libgit2 dependency: one bounded
   `git status --porcelain=v2 --branch` inside a repository, and **no spawn at
