@@ -179,6 +179,14 @@ pub struct Shell {
     // --noediting: disable readline-style line editing in the REPL.
     pub no_editing: bool,
     startup_invocation: Option<rubash::invocation::ShellInvocation>,
+    // niubash#400: `Shell::new` found the rbash invocation face (argv[0]
+    // basename or the shim-forwarded NIU_INVOKED_AS). Only the mark lives
+    // here; `finish_startup` turns it into `set -o restricted` at the same
+    // point the `-r`/`--restricted` flag form activates — after the startup
+    // files (rubash invocation.rs ShellInvocation::finish_startup) — so a
+    // BASH_ENV / profile / ENV chain sources unrestricted exactly like the
+    // flag form and GNU.
+    invoked_as_rbash: bool,
     // niubash#402: set by `execute_script_inner` when a script the host
     // ran ended in a top-level `exit` (the engine's `ExitCode` unwind, GNU
     // jump_to_top_level EXITPROG). The startup-file sourcer consumes it so an
@@ -349,6 +357,7 @@ impl Shell {
             executor.set_builtin_disabled("sudo", true);
         }
         let shell_name = invoked_as.or_else(|| std::env::args().next());
+        let mut invoked_as_rbash = false;
         if let Some(shell_name) = shell_name {
             let invoked_name = shell_name
                 .rsplit(['/', '\\'])
@@ -368,6 +377,17 @@ impl Shell {
                 executor.set_env("__RUBASH_POSIX_MODE", "1");
                 executor.set_shell_option("posix", true);
             }
+            // niubash#400: a shell invoked under the name `rbash' starts
+            // restricted (GNU shell.c:1258-1299 shell_is_restricted /
+            // maybe_make_restricted key the face off the argv[0] basename,
+            // after the `-' login marker is stripped). Only the MARK is taken
+            // here: the option itself is written in `finish_startup`, the
+            // same point the `-r`/`--restricted` flag form activates (rubash
+            // invocation.rs `ShellInvocation::finish_startup`, "after the
+            // host finishes startup files") — the startup files must see the
+            // unrestricted shell so a BASH_ENV/profile/ENV chain sources
+            // exactly like the flag form and GNU.
+            invoked_as_rbash = unmarked_name == "rbash";
         }
         // Starship is initialized through its Bash integration even when
         // Niubash is invoked through the sh/bash command shims.
@@ -564,6 +584,7 @@ impl Shell {
             rc_file: None,
             no_editing: false,
             startup_invocation: None,
+            invoked_as_rbash,
             script_exit_jump: false,
             one_shot,
         };
@@ -948,6 +969,18 @@ impl Shell {
         if let Some(invocation) = self.startup_invocation.take() {
             invocation.finish_startup(&mut self.executor);
         }
+        // niubash#400: the rbash face activates HERE — the same point the
+        // `-r`/`--restricted` flag write lands (the engine's
+        // ShellInvocation::finish_startup, "after the host finishes startup
+        // files") and after every startup file has been sourced. Activating
+        // in `Shell::new` instead would arm the restricted `.`/slash gates
+        // before the chain runs: a BASH_ENV file or the whole login profile
+        // chain would be refused (`.: <path>: restricted`) where the flag
+        // form and GNU load them fine. `set_shell_option` is idempotent, so
+        // the extra `finish_startup` passes on the REPL paths are harmless.
+        if self.invoked_as_rbash {
+            self.executor.set_shell_option("restricted", true);
+        }
     }
 
     /// Source the user's REPL startup file once before the first prompt.
@@ -1050,8 +1083,9 @@ impl Shell {
     /// True when this session is a login shell: `--login`/`-l` (the engine's
     /// `apply_to_executor` records the flag) or an argv[0] whose basename
     /// starts with `-' (shell.c set_shell_name; Shell::new records the same
-    /// marker), so the login profile chain replaces the rc / BASH_ENV
-    /// branches of the startup path (niubash#399).
+    /// marker). The login profile chain then replaces the interactive-RC
+    /// branch of the startup path (niubash#399); the env-file gates are
+    /// independent of it (see `source_non_interactive_env`).
     pub fn login_shell_active(&self) -> bool {
         self.executor.get_env("__RUBASH_LOGIN_SHELL").as_deref() == Some("1")
     }
@@ -1079,40 +1113,11 @@ impl Shell {
         files
     }
 
-    /// The login branch of the startup path (niubash#399): source the
-    /// profile chain with the same maybe_execute_file discipline and
-    /// exit-jump plumbing as the rc (niubash#402), then run the same
-    /// REPL-only tail. `--noprofile` skips the files but keeps the branch:
-    /// a login shell never falls through to the rc / BASH_ENV alternatives
-    /// (GNU shell.c:1833). Returns `Some(status)` when a profile ended with
-    /// a top-level `exit`.
-    fn run_login_startup(&mut self, repl: bool) -> Option<i32> {
-        if repl {
-            self.executor.set_env("NIU_REPL_STARTUP", "1");
-        }
-        let exit = self.source_login_profile_files();
-        if let Some(status) = exit {
-            // niubash#402 discipline: the jump's status must survive the
-            // marker cleanup, and none of the remaining startup steps run.
-            if repl {
-                self.executor.unset_env("NIU_REPL_STARTUP");
-            }
-            return Some(status);
-        }
-        if repl {
-            let _ = self.execute_script("unset NIU_REPL_STARTUP");
-        }
-        self.update_completion_state();
-        if repl {
-            self.finish_startup();
-            self.run_greeting_hooks();
-        }
-        None
-    }
-
     /// Source the login profile chain (see [`Self::login_profile_paths`]),
     /// honouring `--noprofile`. Returns `Some(status)` when a profile ended
-    /// with a top-level `exit` (the niubash#402 unwind, niubash#399).
+    /// with a top-level `exit` (the niubash#402 unwind, niubash#399). The
+    /// chain replaces only the rc branch of the startup path; the env-file
+    /// gates run independently of login (see the callers).
     fn source_login_profile_files(&mut self) -> Option<i32> {
         if self.no_profile {
             return None;
@@ -1135,24 +1140,60 @@ impl Shell {
         normalize_executor_home_env(&mut self.executor, &self.home_dir);
         ensure_windows_profile_env(&mut self.executor, &self.home_dir);
         ensure_prompt_terminal_env(&mut self.executor);
-        // GNU shell.c:1833 run_startup_files: the login branch is checked
-        // first and replaces the interactive-rc alternative entirely — a
-        // login shell sources the profile chain whether or not it is
-        // interactive, and --rcfile (a bashrc_file concept) is never
-        // consulted on it. niubash#399: an `exit` in a profile ends the
-        // invocation with the profile's status before any prompt or command
-        // line, like every other startup file (niubash#402).
-        if self.login_shell_active() {
-            return self.run_login_startup(repl);
+        // GNU shell.c:1833 run_startup_files: the login profile chain is
+        // checked first and replaces the interactive-RC alternative — a
+        // login shell sources /etc/profile and the first user profile
+        // whether or not it is interactive, and --rcfile (a bashrc_file
+        // concept) is never consulted on it. niubash#399: an `exit` in a
+        // profile ends the invocation with the profile's status before any
+        // prompt or command line, like every other startup file
+        // (niubash#402).
+        let login = self.login_shell_active();
+        if login {
+            if repl {
+                self.executor.set_env("NIU_REPL_STARTUP", "1");
+            }
+            let exit = self.source_login_profile_files();
+            if let Some(status) = exit {
+                // niubash#402 discipline: the jump's status must survive the
+                // marker cleanup, and none of the remaining startup steps run.
+                if repl {
+                    self.executor.unset_env("NIU_REPL_STARTUP");
+                }
+                return Some(status);
+            }
+            if repl {
+                let _ = self.execute_script("unset NIU_REPL_STARTUP");
+            }
         }
         // GNU shell.c:1241-1246 (bash --posix) and shell.c:1238-1239 (invoked
         // as sh, which Shell::new turns into posix mode): the interactive
         // startup file is `$ENV`, not the bash rc file, and an unset `$ENV`
-        // sources nothing. --rcfile is a bashrc_file concept and is ignored
-        // in this branch. An `exit` in the file ends the invocation with its
-        // status (niubash#399).
+        // sources nothing. The $ENV gate is INDEPENDENT of login state —
+        // `sh -l -i -c` sources the profile chain and $ENV alike
+        // (niubash#412 review of the #399 PR). --rcfile is a bashrc_file
+        // concept and is ignored in this branch. An `exit` in the file ends
+        // the invocation with its status (niubash#399).
         if self.posix_mode_active() {
-            return self.execute_env_file("ENV");
+            let exit = self.execute_env_file("ENV");
+            if login {
+                self.update_completion_state();
+                if repl {
+                    self.finish_startup();
+                    self.run_greeting_hooks();
+                }
+            }
+            return exit;
+        }
+        if login {
+            // The profile chain replaces the rc branch only (shell.c:1833);
+            // the env files above are not part of that exchange.
+            self.update_completion_state();
+            if repl {
+                self.finish_startup();
+                self.run_greeting_hooks();
+            }
+            return None;
         }
         if self.no_rc {
             return None;
@@ -1311,13 +1352,15 @@ impl Shell {
     }
 
     /// Source the non-interactive startup files. GNU shell.c:722
-    /// run_startup_files: a login shell sources the login profile chain —
-    /// never BASH_ENV — whether or not a command string follows
-    /// (niubash#399); the BASH_ENV / NIU_ENV file is the non-login
-    /// alternative (shell.c:1214-1220). Returns `Some(status)` when a
-    /// startup file ended with a top-level `exit` (the niubash#402 unwind):
-    /// the caller must end the invocation with that status instead of
-    /// running its command line or script — GNU ends the shell for a
+    /// run_startup_files: a login shell sources the login profile chain
+    /// first (niubash#399), whether or not a command string follows. The
+    /// BASH_ENV / NIU_ENV gate below is INDEPENDENT of login —
+    /// shell.c:1214-1220 keys on interactivity and posix mode, never on
+    /// login state, so `bash -l -c` sources the profile chain AND the env
+    /// file (niubash#412 review of the #399 PR). Returns `Some(status)`
+    /// when a startup file ended with a top-level `exit` (the niubash#402
+    /// unwind): the caller must end the invocation with that status instead
+    /// of running its command line or script — GNU ends the shell for a
     /// profile `exit` and for a BASH_ENV `exit` alike.
     ///
     /// The env-file branch mirrors GNU bash's BASH_ENV behavior
@@ -1343,11 +1386,14 @@ impl Shell {
     /// file is sourced: no plugins, prompts, or completion machinery is loaded,
     /// so interactive-only content stays out of the one-shot execution path.
     pub fn source_non_interactive_env(&mut self) -> Option<i32> {
-        let exit = if self.login_shell_active() {
+        let mut exit = if self.login_shell_active() {
             self.source_login_profile_files()
         } else {
-            self.source_non_interactive_startup_file()
+            None
         };
+        if exit.is_none() {
+            exit = self.source_non_interactive_startup_file();
+        }
         self.finish_startup();
         exit
     }
@@ -6333,6 +6379,7 @@ complete -F _envtooldyn_hook envtooldyn
             rc_file: None,
             no_editing: false,
             startup_invocation: None,
+            invoked_as_rbash: false,
             script_exit_jump: false,
             one_shot: false,
         };

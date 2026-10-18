@@ -554,6 +554,45 @@ impl NiuSession {
         )
     }
 
+    /// Spawn the shell under an alternate invocation face (niubash#400): the
+    /// niu binary is copied next to the sandbox as `<face>.exe` — outside the
+    /// HOME so the face never leaks into the shell's own fixtures — and that
+    /// copy is the session's executable, so argv[0]'s basename carries the
+    /// face stem exactly like a deployed `rbash` hardlink/symlink. `rc` is
+    /// staged like [`spawn_custom`]. The root is removed on drop.
+    pub fn spawn_face_with_args(
+        prefix: &str,
+        face: &str,
+        rc: &str,
+        args: &[&str],
+        extra_env: &[(String, String)],
+        size: (u16, u16),
+        timeout: Duration,
+    ) -> NiuSession {
+        let root = unique_temp_dir(prefix);
+        let binary = root.join(format!("{face}.exe"));
+        std::fs::create_dir_all(&root).ok();
+        std::fs::copy(niu_binary(), &binary)
+            .unwrap_or_else(|e| panic!("could not stage the {face} face copy: {e}"));
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        try_spawn_in_root(
+            root,
+            &binary,
+            Some(rc),
+            &args,
+            extra_env,
+            &[],
+            size,
+            timeout,
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "niu session as {face:?} with {args:?} could not be spawned under a \
+                 pseudo terminal after a successful probe"
+            )
+        })
+    }
+
     /// Spawn the interactive shell over a home the test staged beforehand
     /// (niubash#180 journey: the `niu setup` child the session spawns must
     /// share that exact HOME, so the driver must not mint its own sandbox).
@@ -582,6 +621,42 @@ impl NiuSession {
             panic!(
                 "niu session over {root:?} could not be spawned under a pseudo \
                  terminal after a successful probe"
+            )
+        })
+    }
+
+    /// [`spawn_face_with_args`] over a root the caller stages first: the
+    /// niubash#400 startup-file equivalence cases must drop a BASH_ENV file
+    /// or a login profile into the same home the face session runs over,
+    /// before the process exists.
+    pub fn spawn_face_in_root(
+        root: &Path,
+        face: &str,
+        rc: &str,
+        args: &[&str],
+        extra_env: &[(String, String)],
+        size: (u16, u16),
+        timeout: Duration,
+    ) -> NiuSession {
+        let binary = root.join(format!("{face}.exe"));
+        std::fs::create_dir_all(&root).ok();
+        std::fs::copy(niu_binary(), &binary)
+            .unwrap_or_else(|e| panic!("could not stage the {face} face copy: {e}"));
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        try_spawn_in_root(
+            root.to_path_buf(),
+            &binary,
+            Some(rc),
+            &args,
+            extra_env,
+            &[],
+            size,
+            timeout,
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "niu session as {face:?} with {args:?} could not be spawned under a \
+                 pseudo terminal after a successful probe"
             )
         })
     }
