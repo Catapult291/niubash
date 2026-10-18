@@ -8,7 +8,12 @@ description = "Runtime crate for niubash: rubash-backed shell REPL on Windows"
 
 [dependencies]
 rubash = { version = "1.3.4", git = "https://github.com/unixwin/rubash.git", branch = "master" }
-reedline = { version = "0.50" }
+# niubash#373: 0.52 anchors the prompt without turning a missing
+# cursor-position reply into a read_line abort — a DSR-silent terminal
+# (dumb terminals, script(1) recordings, some serial/tmux links) gets its
+# prompt painted instead of paying a ~2.6 s stall, a line-editor error, and
+# a dead session on every startup (niubash#355 finding 3). 0.50 aborted.
+reedline = { version = "0.52" }
 fd-lock = "4.0"
 anyhow = "1.0"
 thiserror = "1.0"
@@ -35,7 +40,7 @@ globset = "0.4"
 glob = "0.3"
 png = "0.17"
 crossterm = { version = "0.27", default-features = false, features = ["event-stream", "windows"] }
-# reedline 0.50 speaks crossterm 0.29; the paste-chunk detector inspects the
+# reedline 0.52 speaks crossterm 0.29; the paste-chunk detector inspects the
 # raw key events reedline hands it (ReedlineRawEvent wraps a crossterm 0.29
 # Event), so it must name the SAME event types or the patterns would not
 # typecheck against the payload.
@@ -62,7 +67,7 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage
 # honest (niubash#207 step 1); EditCommand::PasteSystem stays wired up and
 # simply has no system clipboard behind it on android.
 [target.'cfg(not(target_os = "android"))'.dependencies]
-reedline = { version = "0.50", features = ["system_clipboard"] }
+reedline = { version = "0.52", features = ["system_clipboard"] }
 
 [dev-dependencies]
 tempfile = "3"

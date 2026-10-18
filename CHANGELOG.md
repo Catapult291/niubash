@@ -74,6 +74,32 @@ All notable changes to Niubash are documented in this file.
 
 ### Fixed
 
+- **A DSR-silent terminal no longer kills the shell, and TAB completion
+  commits** (unixwin/niubash#373, the #355 follow-up). Interactive startup
+  used to anchor the prompt with a `ESC[6n` cursor-position query and ABORT
+  the line editor when it timed out: on a terminal that never answers
+  (dumb terminals, `script(1)` recordings, some serial/tmux links) every
+  startup paid a ~2.6 s stall, printed
+  "niubash: line editor error: The cursor position could not be read within
+  a normal duration", and exited before painting any prompt. The editor
+  (reedline 0.50 -> 0.52) now treats the query as advisory — the prompt
+  paints without a reply and later cycles stay interactive; Windows/ConPTY
+  is unaffected either way (conhost withholds the client at session attach
+  until the terminal answers, a terminal-side contract below niu, pinned by
+  the new `tests/issue373.rs` harness). File completion now commits
+  like command completion: `cat uniqfi<TAB>` splices the completed word
+  into the line (the unique match commits outright, the ambiguous set
+  commits its common prefix and still shows the grid) instead of leaving
+  the suffix as a menu preview that Enter executed unexpanded — and Enter
+  submits the line as typed (GNU accept-line), dismissing the grid, where
+  reedline 0.52's menu would have consumed the first Enter as an
+  acceptance. The dismissal rides only the completion TAB window: a
+  Ctrl+R history search's accepting Enter stays the bare event reedline's
+  search handler implements (a whole `Multiple` batch is dropped there —
+  unconditionally wrapping it turned the search's Enter into a dead key). Measured TTP on the ConPTY harness is unchanged (niu 3.14 s
+  vs GNU bash 3.26 s median, transport-floor dominated; internal startup
+  ~70-140 ms — `scripts/perf/ttp-bench.py`).
+
 - **dirname/basename**: slash-shaped operands stay verbatim — `dirname /a/b`
   reports `/a` instead of a drive spelling such as `A:`; the slash-drive
   argument mask now covers the filesystem-blind string tools

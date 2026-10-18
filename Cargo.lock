@@ -364,12 +364,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "either"
-version = "1.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
-
-[[package]]
 name = "env_logger"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -647,15 +641,6 @@ dependencies = [
  "hermit-abi",
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "itertools"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
-dependencies = [
- "either",
 ]
 
 [[package]]
@@ -1104,21 +1089,18 @@ dependencies = [
 
 [[package]]
 name = "reedline"
-version = "0.50.0"
+version = "0.52.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "753088c970c4e63f91114d0dbef96c84fbaf3fde8943877f4254d33e97ce2193"
+checksum = "cc0282eb061a7d039435f10075f22988e0dd7468901ee247a803021786afc662"
 dependencies = [
  "arboard",
  "chrono",
  "crossterm 0.29.0",
  "fd-lock",
- "itertools",
  "nu-ansi-term",
  "serde",
  "strip-ansi-escapes",
  "strum",
- "thiserror 2.0.20",
- "unicase",
  "unicode-segmentation",
  "unicode-width",
 ]
@@ -1532,12 +1514,6 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
-
-[[package]]
-name = "unicase"
-version = "2.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
 name = "unicode-ident"

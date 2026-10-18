@@ -737,8 +737,13 @@ fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
 // ---------------------------------------------------------------------------
 
 /// TAB completes a command prefix from the builtin/PATH set.
+///
+/// niubash#373: un-ignored. The pre-fix wiring spliced nothing into the
+/// line (the engine's partial completions were off) and the menu consumed
+/// follow-up input; with the partial completion the typed word's candidates
+/// commit their common prefix into the line and the Enter after the
+/// completion submits it.
 #[test]
-#[ignore = "rubash#287 residual (post driver-send fix 2026-09-28): TAB opens a blank completion menu and follow-up input is consumed by it; command-set completion under minimal PATH broken in niu, not a wedge"]
 fn tab_completes_command_name() {
     if !require_pty_or_skip("tab_completes_command_name") {
         return;
@@ -755,8 +760,13 @@ fn tab_completes_command_name() {
 }
 
 /// TAB completes a unique file path prefix in the working directory.
+///
+/// niubash#373 sub-item 2 (niubash#355 finding 4): un-ignored, and the
+/// assertion is the execution-level one — a single Enter after the TAB must
+/// run the COMPLETED path (unique match commits outright, like bash
+/// readline); if the suffix stayed a menu preview, `cat uniqfix` would fail
+/// and the body could never print.
 #[test]
-#[ignore = "rubash#287 residual (post driver-send fix 2026-09-28): TAB path completion wedges the editor into a blank menu; niu completion wiring gap, not a wedge"]
 fn tab_completes_unique_file_path() {
     if !require_pty_or_skip("tab_completes_unique_file_path") {
         return;
@@ -768,6 +778,26 @@ fn tab_completes_unique_file_path() {
     s.send(TAB);
     s.send("\r");
     s.expect("uniq-file-body");
+    s.expect_prompt();
+    s.expect_absent("No such file", ABSENT_WINDOW);
+}
+
+/// niubash#373 F5 (the pre-fix rubash#287 shape): a TAB whose candidate set
+/// is EMPTY must not wedge the editor — whatever the completion machinery
+/// did (or didn't) splice, the Enter after it still submits the line.
+#[test]
+fn tab_completion_empty_set_enter_still_submits() {
+    if !require_pty_or_skip("tab_completion_empty_set_enter_still_submits") {
+        return;
+    }
+    let mut s = NiuSession::spawn("tab-empty");
+    s.wait_ready();
+    // The fresh sandbox start dir has no matching file and the word is not
+    // in command position: the candidate set is empty.
+    s.send("echo tab373-nomatch");
+    s.send(TAB);
+    s.send("\r");
+    s.expect("tab373-nomatch");
     s.expect_prompt();
 }
 

@@ -16,9 +16,10 @@ use crate::shell::Shell;
 use crate::syntax_highlighting::NiubashSyntaxHighlighter;
 use reedline::{
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
-    ColumnarMenu, EditCommand, EditMode, Emacs, KeyCode, KeyModifiers, Keybindings, ListMenu,
-    MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch, PromptViMode, Reedline,
-    ReedlineEvent, ReedlineMenu, ReedlineRawEvent, Signal, ValidationResult, Validator, Vi,
+    default_vi_visual_keybindings, ColumnarMenu, EditCommand, EditMode, Emacs, KeyCode,
+    KeyModifiers, Keybindings, ListMenu, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
+    PromptViMode, Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent, Signal,
+    ValidationResult, Validator, Vi,
 };
 
 const COMPLETION_MENU: &str = "completion_menu";
@@ -241,6 +242,23 @@ pub fn build_line_editor(shell: &Rc<RefCell<Shell>>) -> anyhow::Result<Reedline>
         ))
         .with_menu(completion_menu)
         .with_menu(history_menu)
+        // niubash#373 sub-item 2 (niubash#355 finding 4): a completion
+        // candidate must land in the line, not hover as a menu preview.
+        // With the engine default (`partial_completions = false`) the menu
+        // activation splices NOTHING into the buffer, so `cat uniqfi<TAB>`
+        // left the line at `cat uniqfi` with the completed text drawn only
+        // as the menu's highlighted entry — a subsequent Enter executed the
+        // uncompleted path. `partial_completions` gives every TAB the GNU
+        // readline commit shape: the longest common prefix of the candidate
+        // set is spliced into the line (a lone candidate commits outright —
+        // bash's unique-match behavior), the grid still shows for an
+        // ambiguous set, and Enter submits whatever is committed. The
+        // history menu opts out upstream (its `can_partially_complete` is
+        // `false`), so history search is untouched; `quick_completions`
+        // stays OFF deliberately — its lone-candidate path simulates Enter
+        // (accept AND execute), which is nushell's completion cell, not a
+        // bash-like shell's TAB.
+        .with_partial_completions(true)
         // niubash#202: bracketed paste (mode ?2004). Without it a terminal
         // paste of multiline text behaves as if the user typed each line
         // followed by Enter: every line runs its own prompt cycle (each
@@ -523,7 +541,14 @@ fn build_edit_mode(
                 NativeKeymapTarget::ViNormal,
                 engine_bindings,
             ));
-            Box::new(Vi::new(insert_keybindings, normal_keybindings))
+            Box::new(Vi::new(
+                insert_keybindings,
+                normal_keybindings,
+                // reedline 0.52 added visual mode with its own keybinding
+                // set; niubash has never bound visual keys of its own, so
+                // the upstream defaults are the faithful choice.
+                default_vi_visual_keybindings(),
+            ))
         }
     }
 }
@@ -628,6 +653,15 @@ struct PasteChunkEditMode {
     /// Windows console path crossterm has no reader thread, so the probe
     /// cannot race a producer inside the process.
     lookahead: Lookahead,
+    /// niubash#373: whether a completion menu may still be alive — a TAB
+    /// opened the completion flow and no submit/chord has ended that
+    /// window. Gates the Enter dismissal prefix (see [`Self::delegate`]):
+    /// the prefix must never ride an Enter inside an active history search,
+    /// where reedline routes whole `Multiple` batches to the search handler
+    /// that drops them (`Multiple(_)` → `Inapplicable`) — that was the
+    /// Ctrl+R dead key. A CONTROL chord always ends the window: the verb it
+    /// invokes (search, cancel, EOF) owns the next Enter.
+    menu_possible: bool,
 }
 
 /// The lookahead source of [`PasteChunkEditMode`]: yield the next queued
@@ -673,6 +707,7 @@ impl PasteChunkEditMode {
             last_event: None,
             pushback: VecDeque::new(),
             lookahead,
+            menu_possible: false,
         }
     }
 
@@ -841,6 +876,20 @@ fn is_bare_enter(key: &crossterm29::event::KeyEvent) -> bool {
     )
 }
 
+/// A bare Enter key press with no chord — the Ctrl+J (LF) shape is paste
+/// data on the chunk paths and must never dismiss a menu.
+fn is_bare_enter_press(raw: &crossterm29::event::Event) -> bool {
+    matches!(
+        raw,
+        crossterm29::event::Event::Key(crossterm29::event::KeyEvent {
+            code: crossterm29::event::KeyCode::Enter,
+            modifiers: crossterm29::event::KeyModifiers::NONE,
+            kind: crossterm29::event::KeyEventKind::Press,
+            ..
+        })
+    )
+}
+
 impl EditMode for PasteChunkEditMode {
     fn parse_event(&mut self, event: ReedlineRawEvent) -> ReedlineEvent {
         let raw = crossterm29::event::Event::from(event);
@@ -862,7 +911,14 @@ impl EditMode for PasteChunkEditMode {
                 translated,
                 ReedlineEvent::None | ReedlineEvent::Edit(_) | ReedlineEvent::Resize(..)
             );
-            events.push(translated);
+            // A wrapped submit arrives as its own `Multiple` (the flush
+            // event, then the dismissal+submit pair — niubash#373); splice
+            // the parts in, so a flush+submit batch stays one flat
+            // `Multiple` instead of nesting.
+            match translated {
+                ReedlineEvent::Multiple(inner) => events.extend(inner),
+                other => events.push(other),
+            }
             if terminal {
                 break;
             }
@@ -1018,7 +1074,13 @@ impl PasteChunkEditMode {
             }
             self.delegate(raw)
         };
-        events.push(translated);
+        // A wrapped submit arrives as its own `Multiple` (dismissal Esc,
+        // then the submit Enter — niubash#373); splice the parts in, so a
+        // flush+submit batch stays one flat `Multiple` instead of nesting.
+        match translated {
+            ReedlineEvent::Multiple(inner) => events.extend(inner),
+            other => events.push(other),
+        }
         if events.len() == 1 {
             events.pop().expect("len checked")
         } else {
@@ -1028,13 +1090,76 @@ impl PasteChunkEditMode {
 
     /// Hand the raw event to the wrapped edit mode unchanged.
     fn delegate(&mut self, raw: crossterm29::event::Event) -> ReedlineEvent {
+        // Track the menu window (niubash#373) for every key that actually
+        // dispatches — a TAB may leave the completion menu alive, a CONTROL
+        // chord hands the next Enter to a verb (history search, cancel,
+        // EOF) whose handling must never see the dismissal prefix below.
+        // Plain text keys cannot open or close a menu and stay out of it.
+        match &raw {
+            crossterm29::event::Event::Key(key)
+                if key.kind == crossterm29::event::KeyEventKind::Press =>
+            {
+                match (key.code, key.modifiers) {
+                    (crossterm29::event::KeyCode::Tab, crossterm29::event::KeyModifiers::NONE) => {
+                        self.menu_possible = true;
+                    }
+                    (_, modifiers)
+                        if modifiers.contains(crossterm29::event::KeyModifiers::CONTROL) =>
+                    {
+                        self.menu_possible = false;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
         // Release events are rejected upstream too; the conversion can
         // only fail on one, so the fallback keeps the event inert either
         // way.
-        match ReedlineRawEvent::try_from(raw) {
+        let enter_press = is_bare_enter_press(&raw);
+        let translated = match ReedlineRawEvent::try_from(raw) {
             Ok(event) => self.inner.parse_event(event),
             Err(_) => ReedlineEvent::None,
+        };
+        // niubash#373: reedline 0.52 offers an open menu first refusal at
+        // every submit event (`menu_took_the_key`) — nushell's completion
+        // cell, where Enter accepts the menu's selection and only a SECOND
+        // Enter submits. GNU bash has no menu state at accept-line: Enter
+        // runs the line as typed, listing or not. When a menu CAN still be
+        // alive (the TAB window above), the Esc prefix dismisses it so the
+        // very same Enter submits — one Enter, bash's shape, with the
+        // committed text from the partial completion.
+        //
+        // The gate is load-bearing beyond the menu: reedline 0.52 routes a
+        // WHOLE `Multiple` batch to the history-search handler while a
+        // Ctrl+R search is active, and that handler drops `Multiple(_)` as
+        // `Inapplicable` — an unconditionally wrapped Enter made Ctrl+R's
+        // accepting Enter a dead key (the match never loaded). Outside the
+        // TAB window the Enter stays bare, so search mode receives the
+        // plain event its handler implements.
+        //
+        // Chord carve-outs: Ctrl+J (Enter + CONTROL) never wraps — it is
+        // paste data on the chunk paths; the console reports Ctrl+M as the
+        // bare Enter key itself, so it wraps exactly like Enter (harmless:
+        // no menu outside the window means the Esc is a no-op).
+        let submit_carries_enter = match &translated {
+            ReedlineEvent::Enter => true,
+            ReedlineEvent::Multiple(events) => {
+                matches!(events.last(), Some(ReedlineEvent::Enter))
+            }
+            _ => false,
+        };
+        if submit_carries_enter && enter_press && self.menu_possible {
+            self.menu_possible = false;
+            let mut events = vec![ReedlineEvent::Esc];
+            match translated {
+                ReedlineEvent::Enter => events.push(ReedlineEvent::Enter),
+                ReedlineEvent::Multiple(rest) => events.extend(rest),
+                _ => unreachable!("checked above"),
+            }
+            return ReedlineEvent::Multiple(events);
         }
+        translated
     }
 }
 
@@ -3185,6 +3310,24 @@ mod tests {
         )
     }
 
+    /// A TAB key press — the completion menu's opener and the start of the
+    /// dismissal-prefix window (niubash#373).
+    fn tab() -> ReedlineRawEvent {
+        paste_key(
+            crossterm29::event::KeyCode::Tab,
+            crossterm29::event::KeyModifiers::NONE,
+        )
+    }
+
+    /// A Ctrl+R chord — the history-search verb. The ENTER that follows it
+    /// belongs to the search: the dismissal prefix must never ride it.
+    fn ctrl_r() -> ReedlineRawEvent {
+        paste_key(
+            crossterm29::event::KeyCode::Char('r'),
+            crossterm29::event::KeyModifiers::CONTROL,
+        )
+    }
+
     fn lf() -> ReedlineRawEvent {
         paste_key(
             crossterm29::event::KeyCode::Enter,
@@ -3529,7 +3672,9 @@ mod tests {
 
         // After the burst settles, the chunk is flushed as ONE insert and
         // the user's own Enter (empty queue behind it) still submits the
-        // buffer.
+        // buffer — a BARE Enter: no TAB preceded it, so the dismissal
+        // window is closed (niubash#373) and history search or any other
+        // flow keeps the plain event its handler implements.
         expire_burst(&mut detector);
         let event = detector.parse_event(cr());
         match event {
@@ -3652,6 +3797,9 @@ mod tests {
                 }
                 // The user's submit Enter is not paste data.
                 ReedlineEvent::Enter => {}
+                // The menu-dismissal prefix of a wrapped submit
+                // (niubash#373) — not paste data either.
+                ReedlineEvent::Esc => {}
                 ReedlineEvent::None => {}
                 other => panic!("unexpected event in paste reassembly: {other:?}"),
             }
@@ -3681,12 +3829,16 @@ mod tests {
             };
             append_event_text(&event, &mut reassembled);
         }
-        // The burst settles; the user's Enter flushes the chunk and submits.
+        // The burst settles; the user's Enter flushes the chunk and submits
+        // — a BARE Enter: the paste flow never opened the TAB window
+        // (niubash#373), so the submit stays the plain shape every
+        // downstream handler (history search included) implements.
         expire_burst(&mut detector);
         let event = detector.parse_event(cr());
         match &event {
             ReedlineEvent::Multiple(events) => {
                 assert_eq!(events.len(), 2, "flush insert then submit: {event:?}");
+                assert!(matches!(&events[0], ReedlineEvent::Edit(_)));
                 assert!(matches!(events[1], ReedlineEvent::Enter));
             }
             other => panic!("expected flush + submit, got {other:?}"),
@@ -3824,7 +3976,7 @@ mod tests {
         let event = detector.parse_event(cr());
         assert!(
             matches!(event, ReedlineEvent::Enter),
-            "the first Enter of a typed line must submit, not be absorbed"
+            "the first Enter of a typed line must submit, not be absorbed: {event:?}"
         );
         assert!(detector.pending.is_none());
         assert!(detector.pushback.is_empty());
@@ -3859,7 +4011,10 @@ mod tests {
         // behind the Enter is a submit.
         expire_burst(&mut detector);
         let event = detector.parse_event(cr());
-        assert!(matches!(event, ReedlineEvent::Enter));
+        assert!(
+            matches!(event, ReedlineEvent::Enter),
+            "silence behind the Enter is a submit: {event:?}"
+        );
         assert!(detector.pending.is_none());
     }
 
@@ -3884,7 +4039,7 @@ mod tests {
         let event = detector.parse_event(cr());
         assert!(
             matches!(event, ReedlineEvent::Enter),
-            "a CR whose queued follower is not an LF is a typed submit"
+            "a CR whose queued follower is not an LF is a typed submit: {event:?}"
         );
         assert_eq!(detector.pushback.len(), 1, "the typeahead key is kept");
 
@@ -4014,7 +4169,11 @@ mod tests {
     fn paste_chunk_detector_pushback_never_holds_a_bare_cr_341() {
         // Text behind the CR: typed submit, the text key is parked.
         let mut detector = paste_detector_with_queue(vec![char_key_event('z')]);
-        assert!(matches!(detector.parse_event(cr()), ReedlineEvent::Enter));
+        let event = detector.parse_event(cr());
+        assert!(
+            matches!(event, ReedlineEvent::Enter),
+            "a CR with typeahead behind it is a typed submit: {event:?}"
+        );
         assert_eq!(detector.pushback.len(), 1);
         assert!(!matches!(
             detector.pushback.front(),
@@ -4065,5 +4224,56 @@ mod tests {
             crossterm29::event::KeyCode::Char('m'),
             crossterm29::event::KeyModifiers::NONE
         )));
+    }
+
+    /// niubash#373 CR round: the menu-dismissal Esc rides an Enter ONLY
+    /// inside the TAB window. Outside it the Enter stays a bare
+    /// `ReedlineEvent::Enter` — reedline 0.52 routes whole `Multiple`
+    /// batches to the history-search handler while Ctrl+R is active, and
+    /// that handler drops `Multiple(_)` as `Inapplicable`, so an
+    /// unconditionally wrapped Enter turned Ctrl+R's accepting Enter into a
+    /// dead key (the search match never loaded). A CONTROL chord (the
+    /// Ctrl+R itself) ends the window.
+    #[test]
+    fn paste_chunk_wrapper_dismissal_esc_rides_only_the_tab_window() {
+        // No TAB since the last submit: the Enter stays bare — the shape
+        // history search (and every non-completion flow) requires.
+        let mut detector = paste_detector();
+        let event = detector.parse_event(cr());
+        assert!(
+            matches!(event, ReedlineEvent::Enter),
+            "an Enter outside the TAB window must stay bare: {event:?}"
+        );
+
+        // TAB opens the window: the follow-up Enter carries the dismissal.
+        let mut detector = paste_detector();
+        detector.parse_event(tab());
+        let event = detector.parse_event(cr());
+        match &event {
+            ReedlineEvent::Multiple(events) => {
+                assert_eq!(events.len(), 2, "{event:?}");
+                assert!(matches!(&events[0], ReedlineEvent::Esc));
+                assert!(matches!(&events[1], ReedlineEvent::Enter));
+            }
+            other => panic!("expected dismissal + submit, got {other:?}"),
+        }
+
+        // The window closed with that submit: the next Enter is bare again.
+        let event = detector.parse_event(cr());
+        assert!(
+            matches!(event, ReedlineEvent::Enter),
+            "the window ended with the wrapped submit: {event:?}"
+        );
+
+        // A CONTROL chord ends the window without a submit: TAB, Ctrl+R,
+        // Enter — the Enter belongs to the search and stays bare.
+        let mut detector = paste_detector();
+        detector.parse_event(tab());
+        detector.parse_event(ctrl_r());
+        let event = detector.parse_event(cr());
+        assert!(
+            matches!(event, ReedlineEvent::Enter),
+            "a chord-cleared window must leave the search's Enter bare: {event:?}"
+        );
     }
 }
