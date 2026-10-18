@@ -17,7 +17,7 @@
 //!   `show-all-if-unmodified` are the readline variables this state machine
 //!   can grow later; deliberately not built yet.)
 //!
-//! Implementation rides reedline 0.50's `Menu` abstraction — the
+//! Implementation rides reedline 0.52's `Menu` abstraction — the
 //! "print + redraw" exit shape the owner asked the menu/painter layers to be
 //! weighed against. The engine hands every menu [`Menu::update_working_details`]
 //! (editor + completer + painter) right before each repaint, which is where
@@ -33,7 +33,7 @@
 //! gain, so the interactive semantics win and the anchor stays intact.
 
 use reedline::menu_functions::{completer_input, CompletionDisplay};
-use reedline::{Completer, Editor, InputMode, Menu, MenuEvent, Painter, Suggestion};
+use reedline::{Completer, Editor, InputMode, Menu, MenuEvent, MenuSettings, Painter, Suggestion};
 
 /// Two-space gutter between completion columns — GNU readline separates
 /// fields visually the same way (bash lists read `alpha  beta`).
@@ -55,17 +55,13 @@ enum GnuPhase {
 
 /// The GNU-style completion menu. See the [module docs](self).
 ///
-/// reedline 0.50 does not re-export `MenuSettings`, so this menu carries its
-/// `name` and `marker` directly and overrides [`Menu::name`] /
-/// [`Menu::indicator`] — the panicking `settings()` default is then never
-/// reachable, and [`MenuBuilder`](reedline::MenuBuilder) is replaced by the
-/// plain builder below.
+/// reedline 0.52 routes `Menu::name` / `Menu::indicator` through the
+/// mandatory [`Menu::settings`], so this menu carries a [`MenuSettings`] and
+/// its builders write the `name` / `marker` straight into it — the engine
+/// routes `ReedlineEvent::Menu(name)` by `settings().name`, and the painter
+/// swaps the prompt indicator for `settings().marker` while the list is up.
 pub struct GnuMenu {
-    name: String,
-    /// Painted in place of the prompt indicator while the list is up;
-    /// callers hand in the shell's own indicator so the redrawn prompt is
-    /// pixel-identical to a fresh one.
-    marker: String,
+    settings: MenuSettings,
     active: bool,
     /// Engine event queued by [`GnuMenu::menu_event`], processed at paint
     /// time in [`GnuMenu::update_working_details`] (where the editor and
@@ -85,8 +81,7 @@ pub struct GnuMenu {
 impl Default for GnuMenu {
     fn default() -> Self {
         Self {
-            name: "menu".to_string(),
-            marker: String::new(),
+            settings: MenuSettings::default(),
             active: false,
             event: None,
             completions: CompletionDisplay::default(),
@@ -101,14 +96,14 @@ impl GnuMenu {
     /// Name the menu (the engine routes `ReedlineEvent::Menu(name)` by it).
     #[must_use]
     pub fn with_name(mut self, name: &str) -> Self {
-        self.name = name.to_string();
+        self.settings = self.settings.with_name(name);
         self
     }
 
     /// Set the marker painted as the prompt indicator while the list is up.
     #[must_use]
     pub fn with_marker(mut self, marker: &str) -> Self {
-        self.marker = marker.to_string();
+        self.settings = self.settings.with_marker(marker);
         self
     }
 
@@ -261,12 +256,8 @@ impl GnuMenu {
 }
 
 impl Menu for GnuMenu {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn indicator(&self) -> &str {
-        &self.marker
+    fn settings(&self) -> &MenuSettings {
+        &self.settings
     }
 
     fn is_active(&self) -> bool {
