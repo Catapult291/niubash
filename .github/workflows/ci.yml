@@ -249,7 +249,7 @@ jobs:
   # regression is caught by the nightly, not at the next release tag.
   perfbudget-trend:
     name: per-asset timing trend (nightly)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule'
     runs-on: windows-2025
     timeout-minutes: 75
     env:
