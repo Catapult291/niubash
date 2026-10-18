@@ -2887,3 +2887,204 @@ fn issue400_plain_name_and_exe_spelling_control() {
     s2.expect("CD-BLOCKED");
     assert_eq!(s2.wait_exit(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// niubash#413 review round: the rbash face must activate at the same point
+// as the `-r` flag (after the startup files), and the #399 login face must
+// leave the env-file gates independent of login, exactly like GNU.
+// ---------------------------------------------------------------------------
+
+/// Stage `content` at `root/home/<name>`, creating the home first.
+fn stage_face_file(root: &std::path::Path, name: &str, content: &str) -> String {
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let path = home.join(name);
+    std::fs::write(&path, content).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// The startup-file line is face-equivalent (niubash#413 review): the rbash
+/// argv0 face and the `-r` flag both source a BASH_ENV file and the login
+/// profile chain UNRESTRICTED (GNU `rbash -c` loads BASH_ENV; `rbash -l -c`
+/// loads the chain), and the command line after the files runs restricted.
+#[test]
+fn issue400_startup_files_load_unrestricted_like_the_flag_form() {
+    if !require_pty_or_skip("issue400_startup_files_load_unrestricted_like_the_flag_form") {
+        return;
+    }
+    let probe = "echo BODY-$((3*3)); cd / 2>/dev/null && echo CD-OK || echo CD-BLOCKED";
+
+    // argv0 face + BASH_ENV: the file loads, the command runs restricted.
+    let root = login_sandbox("face-bashenv");
+    let env_file = stage_face_file(&root, "env.src", "echo ENV-M-$((2*4))\n");
+    let bash_env = ("BASH_ENV".to_string(), env_file);
+    let mut s = NiuSession::spawn_face_in_root(
+        &root,
+        "rbash",
+        &driver::default_rc(),
+        &["-c", probe],
+        &[bash_env],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("ENV-M-8");
+    s.expect("BODY-9");
+    s.expect("CD-BLOCKED");
+    s.expect_absent("CD-OK", ABSENT_WINDOW);
+    assert_eq!(s.wait_exit(), 0);
+
+    // flag form over the identical staging: byte-for-byte the same markers.
+    let root2 = login_sandbox("flag-bashenv");
+    let env_file2 = stage_face_file(&root2, "env.src", "echo ENV-M-$((2*4))\n");
+    let bash_env2 = ("BASH_ENV".to_string(), env_file2);
+    let mut s2 = NiuSession::spawn_shared_home_with_args(
+        &root2,
+        &driver::default_rc(),
+        &["-r", "-c", probe],
+        &[bash_env2],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s2.expect("ENV-M-8");
+    s2.expect("BODY-9");
+    s2.expect("CD-BLOCKED");
+    assert_eq!(s2.wait_exit(), 0);
+
+    // argv0 face + login profile chain: the chain loads unrestricted.
+    let root3 = login_sandbox("face-profile");
+    stage_face_file(&root3, ".bash_profile", "echo BP-M-$((5*2))\n");
+    let mut s3 = NiuSession::spawn_face_in_root(
+        &root3,
+        "rbash",
+        &driver::default_rc(),
+        &["-l", "-c", "echo BODY-$((7+7))"],
+        &[],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s3.expect("BP-M-10");
+    s3.expect("BODY-14");
+    assert_eq!(s3.wait_exit(), 0);
+
+    // flag form + login profile chain: identical.
+    let root4 = login_sandbox("flag-profile");
+    stage_face_file(&root4, ".bash_profile", "echo BP-M-$((5*2))\n");
+    let mut s4 = NiuSession::spawn_shared_home_with_args(
+        &root4,
+        &driver::default_rc(),
+        &["-r", "-l", "-c", "echo BODY-$((7+7))"],
+        &[],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s4.expect("BP-M-10");
+    s4.expect("BODY-14");
+    assert_eq!(s4.wait_exit(), 0);
+}
+
+/// The BASH_ENV gate is independent of login (GNU shell.c:1214-1220 keys on
+/// interactivity, not login): `bash -l -c` sources the profile chain AND the
+/// env file, profile first.
+#[test]
+fn issue399_login_noninteractive_sources_bash_env_after_the_chain() {
+    if !require_pty_or_skip("issue399_login_noninteractive_sources_bash_env_after_the_chain") {
+        return;
+    }
+    let root = login_sandbox("login-bashenv");
+    stage_login_file(&root, ".bash_profile", "echo BP-M-$((5+5))\n");
+    let env_file = stage_login_file(&root, "env.src", "echo ENVF-M-$((4+4))\n");
+    let bash_env = (
+        "BASH_ENV".to_string(),
+        env_file.to_string_lossy().into_owned(),
+    );
+    let mut s = NiuSession::spawn_shared_home_with_args(
+        &root,
+        &driver::default_rc(),
+        &["-l", "-c", "echo BODY"],
+        &[bash_env],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("BP-M-10");
+    s.expect("ENVF-M-8");
+    s.expect("BODY");
+    assert_eq!(s.wait_exit(), 0);
+}
+
+/// The posix `$ENV` gate is independent of login too (GNU shell.c:1238-1246
+/// keys on posix+interactive): `sh -l -i -c` sources the profile chain AND
+/// $ENV, chain first. An `exit` in the chain still ends the invocation
+/// before the env file or the command runs.
+#[test]
+fn issue399_posix_login_interactive_sources_env_after_the_chain() {
+    if !require_pty_or_skip("issue399_posix_login_interactive_sources_env_after_the_chain") {
+        return;
+    }
+    let root = login_sandbox("posix-login-env");
+    stage_login_file(&root, ".bash_profile", "echo BP-M-$((5+5))\n");
+    let env_file = stage_login_file(&root, "env2.src", "echo ENV2-M-$((4+4))\n");
+    let env = ("ENV".to_string(), env_file.to_string_lossy().into_owned());
+    let sh_face = ("NIU_INVOKED_AS".to_string(), "sh".to_string());
+    let mut s = NiuSession::spawn_shared_home_with_args(
+        &root,
+        &driver::default_rc(),
+        &["-l", "-i", "-c", "echo BODY"],
+        &[env, sh_face],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("BP-M-10");
+    s.expect("ENV2-M-8");
+    s.expect("BODY");
+    assert_eq!(s.wait_exit(), 0);
+
+    let root2 = login_sandbox("posix-login-exit");
+    stage_login_file(&root2, ".bash_profile", "echo BP-X\nexit 9\n");
+    let env_file2 = stage_login_file(&root2, "env2.src", "echo ENV2-M\n");
+    let env2 = ("ENV".to_string(), env_file2.to_string_lossy().into_owned());
+    let sh_face2 = ("NIU_INVOKED_AS".to_string(), "sh".to_string());
+    let mut s2 = NiuSession::spawn_shared_home_with_args(
+        &root2,
+        &driver::default_rc(),
+        &["-l", "-i", "-c", "echo AFTER"],
+        &[env2, sh_face2],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s2.expect("BP-X");
+    let code = s2.wait_exit();
+    assert_eq!(
+        code, 9,
+        "the profile's exit status is the invocation status"
+    );
+    s2.expect_absent("ENV2-M", ABSENT_WINDOW);
+    s2.expect_absent("AFTER", ABSENT_WINDOW);
+}
+
+/// Regression for the `RefCell already borrowed` panic the #399 PR fixed in
+/// `run_repl`: the rc-exit Option must be bound outside the `if let`
+/// scrutinee, so a plain REPL with `exit 5` in the rc ends with status 5
+/// instead of panicking (the old shape exited 1 via the panic path).
+#[test]
+fn repl_rc_exit_carries_status_without_panic() {
+    if !require_pty_or_skip("repl_rc_exit_carries_status_without_panic") {
+        return;
+    }
+    let rc = format!("{}\nexit 5\n", driver::default_rc());
+    let mut s = NiuSession::spawn_custom("repl-rc-exit-status", &rc, &[], (120, 30), HEAVY_TIMEOUT);
+    s.expect("Niubash");
+    let code = s.wait_exit();
+    let transcript = s.transcript();
+    assert_eq!(
+        code, 5,
+        "the rc's exit status is the session status: {transcript}"
+    );
+    assert!(
+        !transcript.contains("panicked"),
+        "no RefCell panic: {transcript}"
+    );
+    assert!(
+        !transcript.contains(driver::PROMPT1),
+        "no prompt may render after the rc exit: {transcript}"
+    );
+}
