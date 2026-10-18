@@ -305,7 +305,12 @@ fn run(args: &[String]) -> anyhow::Result<()> {
         shell.set_script_name(first);
         shell.executor.inherit_process_stdin();
         shell.enable_process_stdin_pipeline_bridge();
-        shell.source_non_interactive_env();
+        // niubash#399: a login-marked argv[0] (`-niu script`) sources the
+        // login profile chain here, and an `exit` in any sourced startup
+        // file ends the invocation with its status before the script runs.
+        if let Some(status) = shell.source_non_interactive_env() {
+            finish_startup_exit(&mut shell, status);
+        }
         shell.executor.set_positional_params(args[2..].to_vec());
         let code = shell.execute_script(&content)?;
         let code = shell.finish_with_exit_trap(code)?;
@@ -620,13 +625,16 @@ fn run_shell_invocation(args: &[String]) -> anyhow::Result<()> {
         // (shell.c:1222: rc file) and never reads BASH_ENV; plain `-c` runs
         // the shell.c:1214-1220 non-interactive BASH_ENV branch (the
         // shell.c:1156 sshd bashrc case is compiled out of the reference
-        // build — see source_non_interactive_env).
+        // build — see source_non_interactive_env). A login shell (`-l`,
+        // niubash#399) sources the profile chain instead of either, and an
+        // `exit` in any of these startup files ends the invocation with its
+        // status before the command string runs.
         if invocation.interactive {
             if let Some(status) = shell.run_interactive_startup_rc() {
                 finish_startup_exit(&mut shell, status);
             }
-        } else {
-            shell.source_non_interactive_env();
+        } else if let Some(status) = shell.source_non_interactive_env() {
+            finish_startup_exit(&mut shell, status);
         }
         niubash_runtime::startup_trace::tick("invocation: setup done");
         // GNU shell.c: $0 for -c is the word after the command string, or
@@ -674,13 +682,16 @@ fn run_shell_invocation(args: &[String]) -> anyhow::Result<()> {
     if let Some(script_name) = invocation.script {
         // GNU: `bash -i script` is an interactive shell (forced_interactive)
         // and sources the rc file, not BASH_ENV (shell.c:1214 checks
-        // interactive_shell == 0).
+        // interactive_shell == 0). `bash -l script` sources the login
+        // profile chain instead of either (niubash#399), and an `exit` in
+        // the sourced file ends the invocation with its status before the
+        // script body runs.
         if invocation.interactive {
             if let Some(status) = shell.run_interactive_startup_rc() {
                 finish_startup_exit(&mut shell, status);
             }
-        } else {
-            shell.source_non_interactive_env();
+        } else if let Some(status) = shell.source_non_interactive_env() {
+            finish_startup_exit(&mut shell, status);
         }
         shell.set_script_name(&script_name);
         // niubash#406: a missing/unreadable script operand is the SHELL's
@@ -742,7 +753,12 @@ fn run_shell_invocation(args: &[String]) -> anyhow::Result<()> {
         shell.enter_interactive();
         return niubash_runtime::repl::run_repl(shell);
     }
-    shell.source_non_interactive_env();
+    // niubash#399: the piped non-interactive stdin route sources the login
+    // profile chain (`-l` over a pipe) or the BASH_ENV file, and an `exit`
+    // in either ends the invocation with its status before stdin is read.
+    if let Some(status) = shell.source_non_interactive_env() {
+        finish_startup_exit(&mut shell, status);
+    }
     // rubash#586: the engine's stdin-script driver reads the stream on
     // demand (GNU input.c:381-397 gives a non-seekable stdin a 1-byte
     // parser buffer). A read_to_string slurp here feeds every later
@@ -1304,7 +1320,12 @@ fn run_repl_command(flag: &str, leading_options: &[String], rest: &[String]) -> 
 fn run_stdin_script() -> anyhow::Result<()> {
     let mut shell = niubash_runtime::Shell::new_for_stdin_script()?;
     shell.executor.inherit_process_stdin();
-    shell.source_non_interactive_env();
+    // niubash#399: a login-marked argv[0] (`-niu < script`) sources the
+    // login profile chain; an `exit` in any sourced startup file ends the
+    // invocation with its status before the first script line is read.
+    if let Some(status) = shell.source_non_interactive_env() {
+        finish_startup_exit(&mut shell, status);
+    }
     let mut line = String::new();
     let mut pending = Vec::new();
 
@@ -4116,8 +4137,10 @@ fn print_completion_probe(rest: &[String]) -> anyhow::Result<()> {
     // the same precedence `-c` applies through `source_non_interactive_env`).
     // `complete` compspecs and NIU_COMPDEFS declarations from an agent init
     // file must be visible to the probe; sourced before the interactive rc so
-    // the rc stays the more specific override.
-    shell.source_non_interactive_env();
+    // the rc stays the more specific override. The probe is a synthetic
+    // surface niu spawns itself under its own name (never a login shell), so
+    // a startup-file exit-jump has no invocation to terminate here.
+    let _ = shell.source_non_interactive_env();
     let _ = shell.run_startup_rc();
     // The REPL loads the rc-declared completion functions (NIU_COMPDEFS)
     // after sourcing and installs the completion bridge before the line
