@@ -2740,3 +2740,150 @@ fn issue399_login_repl_profile_exit_ends_session_before_prompt() {
         "the login face replaces the rc: {transcript}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// niubash#400: a shell invoked under the name `rbash` starts restricted.
+// Oracle: WSL GNU Bash 5.3.0 via an `rbash` symlink over stdin — `$-` reads
+// `hrBc`, `cd` is refused ("cd: restricted"), PATH/SHELL turn read-only,
+// command names with `/` are refused, `set +r` cannot lift the mode, and a
+// plain `bash`/`niu` name stays unrestricted. The engine's own binary keys
+// the same face off argv[0] (rubash shell.c:1258-1299 derivation, #598);
+// the host face must assemble the identical executor state.
+// ---------------------------------------------------------------------------
+
+/// The restricted-face probe script: every marker is produced by executing a
+/// command, never by screen shape. GNU expectations: flags read `hrBc`, the
+/// cd is refused with the working directory untouched, PATH/SHELL
+/// assignments fail readonly (rc 1), and `set +r` is itself refused.
+/// A failed readonly assignment is fatal to the running command list (GNU
+/// aborts a `-c` script on `PATH=/x` with rc 1), so the assignment probes
+/// run inside subshells: the subshell carries the failure status, the
+/// script keeps going.
+const RBASH_PROBE: &str = concat!(
+    "echo FLAGS=$-; ",
+    "cd / && echo CD-OK || echo CD-BLOCKED; ",
+    "echo CWD=$PWD; ",
+    "( PATH=/x ) 2>/dev/null; echo PATHRC=$?; ",
+    "( SHELL=/x ) 2>/dev/null; echo SHELLRC=$?; ",
+    "set +r 2>/dev/null; cd / && echo ESCAPED || echo STILL-RESTRICTED; ",
+    "echo DONE-$((6*7))",
+);
+
+/// The argv[0] face: a niu copy invoked as `rbash.exe` starts restricted.
+#[test]
+fn issue400_rbash_argv0_face_is_restricted() {
+    if !require_pty_or_skip("issue400_rbash_argv0_face_is_restricted") {
+        return;
+    }
+    let mut s = NiuSession::spawn_face_with_args(
+        "issue400-rbash-argv0",
+        "rbash",
+        &driver::default_rc(),
+        &["-c", RBASH_PROBE],
+        &[],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("FLAGS=hrBc");
+    s.expect("CD-BLOCKED");
+    s.expect_absent("CD-OK", ABSENT_WINDOW);
+    s.expect("PATHRC=1");
+    s.expect("SHELLRC=1");
+    s.expect("STILL-RESTRICTED");
+    s.expect_absent("ESCAPED", ABSENT_WINDOW);
+    s.expect("DONE-42");
+    assert_eq!(s.wait_exit(), 0);
+}
+
+/// The flag form and the argv0 face assemble the same state: plain `niu -r`
+/// refuses the same probes the `rbash` name does (the flag surface was the
+/// earlier half of this contract; the name must not diverge from it).
+#[test]
+fn issue400_flag_form_matches_the_argv0_face() {
+    if !require_pty_or_skip("issue400_flag_form_matches_the_argv0_face") {
+        return;
+    }
+    let mut s = NiuSession::spawn_custom_with_args(
+        "issue400-rbash-flag",
+        &driver::default_rc(),
+        &["-r", "-c", RBASH_PROBE],
+        &[],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("FLAGS=hrBc");
+    s.expect("CD-BLOCKED");
+    s.expect("PATHRC=1");
+    s.expect("SHELLRC=1");
+    s.expect("STILL-RESTRICTED");
+    s.expect("DONE-42");
+    assert_eq!(s.wait_exit(), 0);
+}
+
+/// The shim-forwarded face (`NIU_INVOKED_AS=rbash`, how the rubash bash
+/// shim hands its argv[0] stem to the host) is restricted too, and `$0`
+/// keeps reading the invocation name like GNU set_shell_name.
+#[test]
+fn issue400_shim_forwarded_face_is_restricted() {
+    if !require_pty_or_skip("issue400_shim_forwarded_face_is_restricted") {
+        return;
+    }
+    let invoked = ("NIU_INVOKED_AS".to_string(), "rbash".to_string());
+    let mut s = NiuSession::spawn_custom_with_args(
+        "issue400-rbash-shim",
+        &driver::default_rc(),
+        &[
+            "-c",
+            "echo FLAGS=$-; echo P0=$0; cd / 2>/dev/null && echo CD-OK || echo CD-BLOCKED",
+        ],
+        &[invoked],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("FLAGS=hrBc");
+    s.expect("P0=rbash");
+    s.expect("CD-BLOCKED");
+    s.expect_absent("CD-OK", ABSENT_WINDOW);
+    assert_eq!(s.wait_exit(), 0);
+}
+
+/// Control: the same binary under its own name is unrestricted — `cd`
+/// succeeds, no `r` in `$-`, PATH assignable, and the `.EXE` spelling is
+/// normalized the way the shims spell it.
+#[test]
+fn issue400_plain_name_and_exe_spelling_control() {
+    if !require_pty_or_skip("issue400_plain_name_and_exe_spelling_control") {
+        return;
+    }
+    let mut s = NiuSession::spawn_custom_with_args(
+        "issue400-plain-control",
+        &driver::default_rc(),
+        &[
+            "-c",
+            "echo FLAGS=$-; cd / && echo CD-OK; PATH=/x; echo PATHRC=$?",
+        ],
+        &[],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("FLAGS=hBc");
+    s.expect("CD-OK");
+    s.expect("PATHRC=0");
+    assert_eq!(s.wait_exit(), 0);
+
+    let mut s2 = NiuSession::spawn_face_with_args(
+        "issue400-rbash-upper",
+        "RBASH",
+        &driver::default_rc(),
+        &[
+            "-c",
+            "echo FLAGS=$-; cd / 2>/dev/null && echo CD-OK || echo CD-BLOCKED",
+        ],
+        &[],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s2.expect("FLAGS=hrBc");
+    s2.expect("CD-BLOCKED");
+    assert_eq!(s2.wait_exit(), 0);
+}

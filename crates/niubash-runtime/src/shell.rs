@@ -349,6 +349,7 @@ impl Shell {
             executor.set_builtin_disabled("sudo", true);
         }
         let shell_name = invoked_as.or_else(|| std::env::args().next());
+        let mut invoked_as_restricted = false;
         if let Some(shell_name) = shell_name {
             let invoked_name = shell_name
                 .rsplit(['/', '\\'])
@@ -368,6 +369,20 @@ impl Shell {
                 executor.set_env("__RUBASH_POSIX_MODE", "1");
                 executor.set_shell_option("posix", true);
             }
+            // niubash#400: a shell invoked under the name `rbash' starts
+            // restricted (GNU shell.c:1258-1299 shell_is_restricted /
+            // maybe_make_restricted key the face off the argv[0] basename,
+            // with the `-' login marker stripped first and the ".exe"
+            // spelling normalized case-insensitively the way the shims
+            // forward it). The engine's own binary derives the same option
+            // from argv[0] (rubash main.rs), so the host face hands the
+            // executor the same state: `$-` grows the `r`, `cd` is refused,
+            // PATH/SHELL/ENV/BASH_ENV/HISTFILE turn read-only, and the
+            // remaining restricted command and redirection gates come from
+            // the engine's shared enforcement — identical to the `-r` /
+            // `--restricted` flag form.
+            let face_stem = invoked_name.strip_suffix(".exe").unwrap_or(&invoked_name);
+            invoked_as_restricted = face_stem.strip_prefix('-').unwrap_or(face_stem) == "rbash";
         }
         // Starship is initialized through its Bash integration even when
         // Niubash is invoked through the sh/bash command shims.
@@ -407,6 +422,13 @@ impl Shell {
         }
         executor.set_env("NIU_PROMPT_SYMBOL", &config.shell.prompt_symbol);
         sync_executor_path_from_process_path(&mut executor);
+        // Applied after the startup PATH/SHELL assembly so the maybe_make_
+        // restricted read-only walk (shell_options set_shell_option) pins the
+        // final values, exactly like the `-r` flag whose executor write lands
+        // after Shell::new returns (niubash#400).
+        if invoked_as_restricted {
+            executor.set_shell_option("restricted", true);
+        }
 
         crate::startup_trace::tick("executor env ready");
 
