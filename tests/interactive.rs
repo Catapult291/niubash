@@ -1115,6 +1115,231 @@ fn paste_with_same_burst_enter_submits_on_first_enter() {
     s.expect_prompt();
 }
 
+/// The owner's niubash#341 pasted script (2026-10-14), sent with the
+/// Windows Terminal KEY_EVENT line-break shape: a bare CR per line break,
+/// `\r\r` for empty lines, no LF anywhere — exactly the records ConPTY
+/// synthesizes for a real WT paste (probe-verified against
+/// ReadConsoleInputW; the CRLF feeds earlier paste regressions use carry an
+/// additional VK_CONTROL sandwich plus the Ctrl+J partner, the shape #252
+/// modeled, which is why four rounds of CRLF-shaped fixes never saw this).
+///
+/// Markers are the script's printed OUTPUTS; the two `if is_even` branch
+/// outputs are the exact corruption witnesses — pre-fix, the line after an
+/// empty line lost its first bytes at a reedline batch boundary (`if
+/// is_even 10; then` executing as `_even 10; then`) and the branch output
+/// never appeared. Expected outputs pinned from GNU bash running the same
+/// script: identical except the `$RANDOM` section (nondeterministic) and
+/// the `原串` line (a pre-existing non-interactive engine quirk on this
+/// path's sibling, unrelated to paste).
+#[test]
+fn wt_paste_bare_cr_key_event_shape_runs_owner_script_341() {
+    if !cfg!(windows) {
+        return;
+    }
+    if !require_pty_or_skip("wt_paste_bare_cr_key_event_shape_runs_owner_script_341") {
+        return;
+    }
+    let mut s = NiuSession::spawn_custom(
+        "paste-wt-keyevent-341",
+        &driver::default_rc(),
+        &[],
+        (120, 40),
+        HEAVY_TIMEOUT,
+    );
+    s.wait_ready();
+    let paste = OWNER_SCRIPT_341.replace('\n', "\r");
+    s.send(&paste);
+    // Execution-level markers in paste order: printed output lines of a
+    // correct run, never echoed-input substrings.
+    s.expect("===== Bash 非交互测试脚本 =====");
+    s.expect("a=17 b=5");
+    s.expect("a/b=3 a%b=2");
+    s.expect("水果数量: 5");
+    s.expect("中国 -> 北京");
+    s.expect("7! = 5040");
+    s.expect("fib(7)=13");
+    s.expect("4 是偶数");
+    s.expect("替换: Hello Shell Script World");
+    s.expect("mapfile 读取到 4 行:");
+    s.expect("<第二行>");
+    // The corruption witnesses.
+    s.expect("10 是偶数，函数返回成功");
+    s.expect("7 不是偶数，函数返回失败");
+    s.expect("===== 测试结束 =====");
+    s.expect_prompt();
+}
+
+/// The WT KEY_EVENT shape at #284's canonical typing shape: a bare-CR line
+/// with NOTHING queued behind it is still a typed submit — the CR-fold must
+/// not delay a driver's `send_line` or a fast typist.
+#[test]
+fn wt_paste_bare_cr_single_line_still_submits_341() {
+    if !cfg!(windows) {
+        return;
+    }
+    if !require_pty_or_skip("wt_paste_bare_cr_single_line_still_submits_341") {
+        return;
+    }
+    let rc = format!("{}\nWT341=KEYEVENT-OK\n", driver::default_rc());
+    let mut s =
+        NiuSession::spawn_custom("paste-wt-single-341", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
+    s.wait_ready();
+    s.send("echo $WT341\r");
+    s.expect("KEYEVENT-OK");
+    s.expect_prompt();
+}
+
+/// The niubash#341 owner script (issue #341, Windows Terminal,
+/// 2026-10-14): 76 non-empty lines of bash with 16 empty-line boundaries,
+/// including the two `if is_even` blocks whose line starts were shredded.
+/// One deviation, documented: section 3's multiline
+/// `declare -A capital=(...)` literal is rewritten to the output-identical
+/// declare-then-assign form, because ANY `declare -A name=(...)` through
+/// the line-editor path panics a debug-build child at rubash
+/// `locale.rs`'s COMPOUND_ASSIGNMENT_MARKER debug assertion — a
+/// pre-existing engine bug independent of this fix (a 3-line TYPED repro,
+/// no paste involved, panics an unpatched master build the same way; the
+/// owner's release build never trips `debug_assert!`).
+const OWNER_SCRIPT_341: &str = r###"#!/usr/bin/env bash
+set -euo pipefail
+
+echo "===== Bash 非交互测试脚本 ====="
+
+# 1. 变量和算术
+a=17
+b=5
+echo "a=$a b=$b"
+echo "a+b=$((a + b))"
+echo "a-b=$((a - b))"
+echo "a*b=$((a * b))"
+echo "a/b=$((a / b)) a%b=$((a % b))"
+
+# 2. 普通数组
+fruits=(苹果 香蕉 橙子 葡萄 西瓜)
+echo "水果数量: ${#fruits[@]}"
+for i in "${!fruits[@]}"; do
+  printf "  %d: %s\n" "$((i + 1))" "${fruits[$i]}"
+done
+
+# 3. 关联数组
+declare -A capital
+capital[中国]="北京"
+capital[日本]="东京"
+capital[法国]="巴黎"
+capital[德国]="柏林"
+for country in "${!capital[@]}"; do
+  echo "  $country -> ${capital[$country]}"
+done
+
+# 4. 函数：阶乘
+fact() {
+  local n=$1
+  local r=1
+  local i
+  for ((i = 2; i <= n; i++)); do
+    r=$((r * i))
+  done
+  echo "$r"
+}
+for n in 3 5 7; do
+  echo "$n! = $(fact "$n")"
+done
+
+# 5. 函数：斐波那契
+fib() {
+  local n=$1
+  if ((n <= 1)); then
+    echo "$n"
+    return
+  fi
+  echo $(( $(fib $((n - 1))) + $(fib $((n - 2))) ))
+}
+for n in {0..7}; do
+  printf "fib(%d)=%s " "$n" "$(fib "$n")"
+done
+echo
+
+# 6. 条件和 case
+check_number() {
+  local n=$1
+  if ((n % 2 == 0)); then
+    echo "$n 是偶数"
+  else
+    echo "$n 是奇数"
+  fi
+
+  case $n in
+    0) echo "  -> 零" ;;
+    1|2|3) echo "  -> 小数字" ;;
+    *) echo "  -> 其他数字" ;;
+  esac
+}
+for n in 0 1 4 7; do
+  check_number "$n"
+done
+
+# 7. 字符串处理
+text="Hello Bash Script World"
+echo "原串: $text"
+echo "长度: ${#text}"
+echo "大写: ${text^^}"
+echo "小写: ${text,,}"
+echo "替换: ${text/Bash/Shell}"
+echo "切片: ${text:6:4}"
+
+# 8. here-string 和 mapfile
+mapfile -t lines <<< $'alpha\nbeta\ngamma\ndelta'
+echo "mapfile 读取到 ${#lines[@]} 行:"
+for line in "${lines[@]}"; do
+  echo "  [$line]"
+done
+
+# 9. while 读取 here-doc
+echo "while 读取 here-doc:"
+while IFS= read -r line; do
+  echo "  <$line>"
+done <<'SCRIPT_EOF'
+第一行
+第二行
+第三行
+SCRIPT_EOF
+
+# 10. 随机数统计
+sum=0
+count=5
+echo "随机数:"
+for ((i = 1; i <= count; i++)); do
+  r=$((RANDOM % 100 + 1))
+  sum=$((sum + r))
+  printf "  #%d = %d\n" "$i" "$r"
+done
+echo "总和=$sum 平均=$((sum / count))"
+
+# 11. 乘法表
+echo "5x5 乘法表:"
+for ((i = 1; i <= 5; i++)); do
+  for ((j = 1; j <= 5; j++)); do
+    printf "%4d" "$((i * j))"
+  done
+  echo
+done
+
+# 12. 函数退出码
+is_even() {
+  (( $1 % 2 == 0 ))
+}
+
+if is_even 10; then
+  echo "10 是偶数，函数返回成功"
+fi
+
+if ! is_even 7; then
+  echo "7 不是偶数，函数返回失败"
+fi
+
+echo "===== 测试结束 ====="
+"###;
+
 /// niubash#277/#280 adjacency: ESC-sequenced arrow keys (ConPTY synthesizes
 /// them into arrow KEY_EVENTs from the pty's ESC[A..D stream) ride the
 /// input path untouched by paste-chunk detection — no chunk opens, no
