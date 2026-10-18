@@ -993,13 +993,15 @@ impl Shell {
             return;
         }
         ensure_prompt_terminal_env(&mut self.executor);
-        self.executor.set_env("NIU_REPL_STARTUP", "1");
         // niubash#359: a finished `niu setup` may have published a new
         // generated-loader generation; re-source it with the same decision
         // logic before the rc re-apply (the wizard's rc carries no managed
         // markers, so a clean machine resolves to Load — the same re-source
-        // semantics the rc itself has always had here).
+        // semantics the rc itself has always had here). Same ordering as
+        // run_startup_files: loader first, then the NIU_REPL_STARTUP
+        // marker, then the rc.
         let _ = self.load_generated_plugin_loader(Some(&path));
+        self.executor.set_env("NIU_REPL_STARTUP", "1");
         let outcome = self.source_file_into_current_shell(&path);
         let _ = self.execute_script("unset NIU_REPL_STARTUP");
         match outcome {

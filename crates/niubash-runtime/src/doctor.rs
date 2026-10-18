@@ -178,30 +178,44 @@ pub fn run_doctor(skill_files: &[crate::skill::SkillFile]) -> anyhow::Result<()>
     // write-era state) is reported with its exact migration verb — the
     // removal stays the user's own edit, forever.
     let loader_text = crate::plugins::loader::read_loader_text();
-    let rc_legacy_blocks: Option<Vec<_>> = std::fs::read_to_string(&rc)
-        .ok()
-        .and_then(|text| crate::plugins::loader::scan_legacy_blocks(&text).ok())
+    let rc_text_read = std::fs::read_to_string(&rc).ok();
+    let rc_legacy_blocks: Option<Vec<_>> = rc_text_read
+        .as_deref()
+        .and_then(|text| crate::plugins::loader::scan_legacy_blocks(text).ok())
         .filter(|blocks| !blocks.is_empty());
-    match (&loader_text, &rc_legacy_blocks) {
-        (None, None) => {
+    // CR F2: the doctor reports the guard's OWN evidence — a held-off
+    // loader is never diagnosed as clean.
+    let guard_trips: Vec<(usize, String)> = rc_text_read
+        .as_deref()
+        .map(crate::plugins::loader::guard_trip_lines)
+        .unwrap_or_default();
+    let legacy_held = rc_legacy_blocks.is_some() || !guard_trips.is_empty();
+    match (&loader_text, legacy_held) {
+        (None, false) => {
             writeln!(
                 out,
                 "  {info} plugin loader      none — plugin sources activate through it once \
                  a verb manages them"
             )?;
         }
-        (Some(_), None) => {
+        (Some(_), false) => {
             writeln!(
                 out,
                 "  {ok} plugin loader      {} (sourced before the rc; user overrides win)",
                 display(&crate::plugins::loader::loader_path())
             )?;
         }
-        (loader, Some(blocks)) => {
-            let lines: Vec<String> = blocks
+        (loader, true) => {
+            let mut lines: Vec<String> = rc_legacy_blocks
+                .unwrap_or_default()
                 .iter()
                 .map(|b| format!("{} (lines {}-{})", b.id, b.start_line, b.end_line))
                 .collect();
+            // CR F2: guard trips the block scan does not attribute are
+            // named by line, so the held-off state is always explainable.
+            for (line, text) in &guard_trips {
+                lines.push(format!("guard trip at line {line}: {text}"));
+            }
             writeln!(
                 out,
                 "  {warn} legacy rc blocks   {} — the generated loader stays OFF while they \

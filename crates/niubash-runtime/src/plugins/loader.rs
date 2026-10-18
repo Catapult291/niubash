@@ -326,35 +326,89 @@ pub fn startup_decision(rc_text: Option<&str>, loader_text: Option<&str>) -> Sta
     StartupDecision::Load
 }
 
-/// The double-execution scan: true when the rc text carries ANY
-/// managed-block marker this product ever wrote — the exact/near begin
-/// and end shapes (`# >>> niu source <id> …` / `# <<< niu source <id>`)
-/// in any id or wording, plus the exact markers the current loader
-/// generation recorded as superseded. Read-only by definition: this only
-/// looks at bytes the caller already read.
-pub fn rc_carries_superseded_markers(rc_text: &str) -> bool {
-    for line in rc_text.lines() {
+/// The double-execution guard's verdict and evidence, in ONE predicate that
+/// every surface shares (gate case 359.8 + CR F2: the guard, migrate-rc and
+/// the doctor must never disagree about whether the loader is held off).
+///
+/// The rc "trips" the guard — the loader stays OFF — exactly when a
+/// managed-marker PAIR wraps at least one line that actually executes:
+/// a begin-shaped comment line (`# >>> niu source …`, exact or near, any
+/// id — plus any exact line the current loader generation recorded as
+/// superseded) followed by a later end-shaped line, with a non-blank,
+/// non-comment line between the two. Marker lines are comments; without
+/// executable content between them nothing runs, so a stray marker-shaped
+/// remark (`# >>> niu source blocks were removed by hand … <<<` on one
+/// line, a lone marker, a comment-only pair) is INERT and never trips.
+/// Returns the 1-based line number and text of each tripping BEGIN line
+/// (empty = the loader may load).
+///
+/// Read-only by definition: this only looks at bytes the caller already
+/// read. The direction is deliberately fail-safe (rather off than
+/// double-execute, gate 359.8); the shared predicate is what keeps the
+/// remedy visible — migrate-rc and the doctor report the very lines the
+/// guard tripped on, never a "clean" verdict over a held-off loader.
+pub fn guard_trip_lines(rc_text: &str) -> Vec<(usize, String)> {
+    // A line participates in pairing when it is marker-shaped in ONE
+    // direction: begin-shaped starts with `>>>` (after the comment strip),
+    // end-shaped with `<<<`. A line carrying both decorations is
+    // self-contained commentary (it cannot wrap content) and is ignored,
+    // as is anything without the product's `niu source` vocabulary. Exact
+    // lines the loader generation recorded as superseded participate too
+    // (future-proofing: a wording a later generation superseded need not
+    // match today's shape).
+    let recorded: BTreeSet<String> = read_loader_text()
+        .map(|text| recorded_superseded_markers(&text).into_iter().collect())
+        .unwrap_or_default();
+    let classify = |line: &str| -> Option<bool> {
         let trimmed = line.trim();
-        if !trimmed.starts_with('#') {
-            continue;
+        if recorded.contains(trimmed) {
+            let body = trimmed.trim_start_matches('#').trim_start();
+            return Some(!body.starts_with("<<<"));
         }
-        // The near-marker shapes the write era recognized
-        // (`assets::is_near_begin_marker` / `is_near_end_marker`): two or
-        // three angle brackets either way — anything bash would still read
-        // as this product's block vocabulary.
+        if !trimmed.starts_with('#') || !trimmed.contains("niu source") {
+            return None;
+        }
+        // Begin shapes: `>>>` exact or the `>>` near form (the write era's
+        // is_near_begin_marker); end shapes are always `<<<`.
         let body = trimmed.trim_start_matches('#').trim_start();
-        if (body.starts_with(">>>") || body.starts_with(">>") || body.starts_with("<<<"))
-            && trimmed.contains("niu source")
-        {
-            return true;
+        if body.starts_with(">>") && !body.contains("<<<") {
+            return Some(true);
         }
-    }
-    let Some(loader) = read_loader_text() else {
-        return false;
+        if body.starts_with("<<<") && !body.contains(">>>") {
+            return Some(false);
+        }
+        None
     };
-    let recorded = recorded_superseded_markers(&loader);
-    let recorded: BTreeSet<String> = recorded.into_iter().collect();
-    rc_text.lines().any(|line| recorded.contains(line.trim()))
+    let lines: Vec<&str> = rc_text.lines().collect();
+    let mut trips: Vec<(usize, String)> = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if classify(lines[index]) == Some(true) {
+            if let Some(stop) =
+                (index + 1..lines.len()).find(|&i| classify(lines[i]) == Some(false))
+            {
+                let body_executes = lines[index + 1..stop].iter().any(|line| {
+                    let trimmed = line.trim();
+                    !trimmed.is_empty() && !trimmed.starts_with('#')
+                });
+                if body_executes {
+                    trips.push((index + 1, lines[index].trim().to_string()));
+                }
+                index = stop + 1;
+                continue;
+            }
+            // An unpaired begin is an inert comment; the id-anchored scan
+            // (migrate-rc/doctor) still reports it for hand cleanup.
+        }
+        index += 1;
+    }
+    trips
+}
+
+/// True when the double-execution guard holds the loader off for this rc
+/// text (the shared [`guard_trip_lines`] predicate).
+pub fn rc_carries_superseded_markers(rc_text: &str) -> bool {
+    !guard_trip_lines(rc_text).is_empty()
 }
 
 /// Whether the one-time legacy-block migration hint should show right now
@@ -414,12 +468,26 @@ pub struct LegacyBlock {
     pub end_missing: bool,
 }
 
+/// One line the startup double-execution guard trips on (CR F2: reported
+/// with the SAME predicate the guard runs, so the diagnostics can never
+/// call a held-off loader "clean").
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GuardTrip {
+    /// 1-based rc line number of the tripping BEGIN marker.
+    pub line: usize,
+    pub text: String,
+}
+
 /// The result of `niu plugin migrate-rc` (design §4.1): what the rc
 /// carries, what the loader now carries, and where the suggested
 /// post-migration rc was written. The user rc itself is NEVER modified.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct MigrateReport {
     pub blocks: Vec<LegacyBlock>,
+    /// Lines the startup guard trips on (marker pairs with executable
+    /// content). Non-empty ⇒ the loader is held OFF regardless of `blocks`
+    /// — the report must name these lines, never print "clean".
+    pub guard_trips: Vec<GuardTrip>,
     /// Total rc line count scanned.
     pub rc_lines: usize,
     /// Whether a loader generation was published by this run (false when
@@ -429,6 +497,13 @@ pub struct MigrateReport {
     pub loader_ids: Vec<String>,
     /// Path of the suggested post-migration rc (`--diff`), when written.
     pub candidate_rc_path: Option<PathBuf>,
+}
+
+impl MigrateReport {
+    /// True when the generated loader is (still) held off by the rc.
+    pub fn loader_held_off(&self) -> bool {
+        !self.guard_trips.is_empty()
+    }
 }
 
 /// Scan for legacy managed blocks in the rc text: exact marker pairs per
@@ -516,6 +591,20 @@ pub fn migrate_rc(
         Some(text) => scan_legacy_blocks(text)?,
         None => Vec::new(),
     };
+    // CR F2: the "clean" verdict and the startup guard share ONE predicate.
+    // A trip the id-anchored scan does not attribute (a near-shape pair for
+    // an unknown id, say) is still reported — the guard's evidence IS the
+    // report's evidence.
+    let guard_trips: Vec<GuardTrip> = match &rc_text {
+        Some(text) => guard_trip_lines(text)
+            .into_iter()
+            .map(|(line, trip_text)| GuardTrip {
+                line,
+                text: trip_text,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
     let rc_lines = rc_text.as_ref().map(|t| t.lines().count()).unwrap_or(0);
 
     // Candidate loader generation from the current manifest (the same
@@ -588,11 +677,12 @@ pub fn migrate_rc(
         .into_iter()
         .map(|s| s.id)
         .collect();
-    if !blocks.is_empty() {
+    if !blocks.is_empty() || !guard_trips.is_empty() {
         mark_legacy_hint_shown();
     }
     Ok(MigrateReport {
         blocks,
+        guard_trips,
         rc_lines,
         loader_published,
         loader_ids,
@@ -801,31 +891,94 @@ mod tests {
     fn marker_scan_covers_exact_near_and_recorded_shapes() {
         let (temp, _guards) = sandbox("scan");
         let _ = &temp;
-        let cases = [
-            "# >>> niu source oh-my-bash >>>",
-            "# <<< niu source oh-my-bash <<<",
-            "# >>> niu source bash-it >>>",
-            "  # >>> niu source some-wild-tree >>>",
-            "# >> niu source hand-edited (older wording)",
-            "#<<< niu source squeezed <<<",
+        // The guard trips on a marker PAIR with executable content between
+        // the markers — exact, near, any id, any wording.
+        let pairs: [(&str, &str, &str); 5] = [
+            (
+                "# >>> niu source oh-my-bash >>>",
+                "OSH_THEME='robbyrussell'",
+                "# <<< niu source oh-my-bash <<<",
+            ),
+            (
+                "# >>> niu source bash-it >>>",
+                "BASH_IT_THEME='demox'",
+                "# <<< niu source bash-it <<<",
+            ),
+            (
+                "  # >>> niu source some-wild-tree >>>",
+                ". \"$HOME/x.sh\"",
+                "#<<< niu source squeezed <<<",
+            ),
+            (
+                "# >> niu source hand-edited (older wording)",
+                "plugins=('git')",
+                "# <<< niu source hand-edited",
+            ),
+            (
+                "# >>> niu source a >>>",
+                "  \"\n# just a comment above\n",
+                "# <<< niu source a <<<",
+            ),
         ];
-        for line in cases {
-            let rc = format!("before\n{line}\nafter\n");
-            assert!(rc_carries_superseded_markers(&rc), "must flag: {line}");
+        for (begin, body, end) in pairs {
+            let rc = format!("before\n{begin}\n{body}\n{end}\nafter\n");
+            assert!(
+                rc_carries_superseded_markers(&rc),
+                "must flag the executing pair: {begin}"
+            );
         }
-        // Ordinary user lines and non-marker comments never trip it.
+        // A comment-only pair is inert: the markers are comments, nothing
+        // between them executes, the loader must keep loading.
+        let inert_pairs: [(&str, &str, &str); 2] = [
+            (
+                "# >>> niu source oh-my-bash >>>",
+                "# the block was removed; these notes stay",
+                "# <<< niu source oh-my-bash <<<",
+            ),
+            ("# >>> niu source x >>>", "", "# <<< niu source x <<<"),
+        ];
+        for (begin, body, end) in inert_pairs {
+            let rc = format!("before\n{begin}\n{body}\n{end}\nafter\n");
+            assert!(
+                !rc_carries_superseded_markers(&rc),
+                "a comment-only pair must NOT hold the loader off: {begin}"
+            );
+        }
+        // CR F2 regression: a marker-shaped remark on ONE line is pure
+        // commentary (it cannot wrap content) — never a trip, while the
+        // id-anchored scan verdict agrees (both surfaces share the
+        // predicate via migrate-rc/doctor).
+        let cr_example =
+            "# >>> niu source blocks were removed by hand; review the moved-out notes <<<";
+        assert!(
+            !rc_carries_superseded_markers(&format!("x\n{cr_example}\n")),
+            "the single-line remark must not hold the loader off"
+        );
+        assert!(guard_trip_lines(&format!("x\n{cr_example}\n")).is_empty());
+        // Lone markers and ordinary user lines never trip it.
         assert!(!rc_carries_superseded_markers(
-            "# a comment\ngrep '>>>' file\nalias ll='ls -la'\n"
+            "# a comment\ngrep '>>>' file\nalias ll='ls -la'\n# <<< niu source stray <<<\n"
         ));
         // A recorded superseded marker with an arbitrary spelling is
-        // honored.
+        // honored — same pair-with-content rule.
         let marker = "# >>> niu source future-wording >>>";
         let mut superseded = BTreeSet::new();
         superseded.insert(marker.to_string());
         let doc = render_document(&sample_sections(), &superseded);
         let _ = fs::create_dir_all(loader_path().parent().unwrap());
         fs::write(loader_path(), &doc).unwrap();
-        assert!(rc_carries_superseded_markers(&format!("x\n{marker}\n")));
+        assert!(
+            rc_carries_superseded_markers(&format!(
+                "x\n{marker}\nexport OLD=1\n# <<< niu source future-wording <<<\n"
+            )),
+            "a recorded executing pair must trip"
+        );
+        assert!(
+            !rc_carries_superseded_markers(&format!(
+                "x\n{marker}\n# a note\n# <<< niu source future-wording <<<\n"
+            )),
+            "a recorded comment-only pair must not trip"
+        );
         assert!(!rc_carries_superseded_markers("clean\n"));
     }
 

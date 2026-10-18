@@ -1173,8 +1173,12 @@ fn remove_managed_block(begin: &str, end: &str) -> anyhow::Result<usize> {
     Ok(spans.len())
 }
 
-/// Build the managed activation block for a source with a theme selected
-/// (used by the setup wizard and by `niu plugin enable <theme>`).
+/// Render a source's managed-theme BLOCK as a string — a pure renderer with
+/// no write path. niubash#359: the setup wizard no longer embeds this in
+/// the rc and verbs publish loader sections instead; the live consumers are
+/// the theme previewer (it sources the rendering in a child process) and
+/// the tests that seed write-era rc fixtures. Kept pub: the preview must
+/// render byte-identically to what a write-era rc carried.
 pub fn build_theme_block(source_id: &str, theme: &str) -> Option<String> {
     let record = read_source_registry()
         .into_iter()
@@ -1288,8 +1292,11 @@ pub fn deactivate_tree(record: &SourceRecord) -> anyhow::Result<()> {
 /// niubash#359: RETIRED from every verb path — the rc half violated the
 /// zero-write contract. Kept unwired in the rollback zone (design §4.3);
 /// the live path is [`deactivate_tree`] + loader generation omission.
+/// Private on purpose: a pub re-export was a compile-passing path from any
+/// module straight into `remove_managed_block` (CR F1 mutation). Restoring
+/// `pub` is part of the rollback itself.
 #[allow(dead_code)]
-pub fn deactivate_block(record: &SourceRecord) -> anyhow::Result<()> {
+fn deactivate_block(record: &SourceRecord) -> anyhow::Result<()> {
     remove_managed_block(&begin_marker(&record.id), &end_marker(&record.id))?;
     deactivate_tree(record)
 }
@@ -2204,8 +2211,13 @@ pub fn publish_loader_generation(
 /// Regenerate the loader generation from the manifest alone — no installs,
 /// no registry or spec writes (the migrate-rc half of the generator;
 /// design §4.1 step 2). Sources the spec declares but that cannot safely
-/// materialize (no registry record, untrusted, degraded, drifted) keep
-/// their current section exactly as a sync skip would.
+/// materialize keep their current section exactly as a sync skip would:
+/// untrusted, degraded, drifted, compute failures — AND entries that still
+/// resolve to an id but have no registry record yet (their activation,
+/// if any was ever published, carries over instead of being silently
+/// dropped: a regeneration on the migrate-rc verb must never de-activate).
+/// Only entries that resolve to NO id at all (never installed, never
+/// published — no section can exist) are omitted, which is a no-op.
 pub fn regenerate_loader_generation() -> anyhow::Result<bool> {
     let Some(spec) = spec::load_spec()? else {
         // No spec: nothing is declared, the generation is empty (the rc's
@@ -2232,6 +2244,12 @@ pub fn regenerate_loader_generation() -> anyhow::Result<bool> {
     let mut keep_current: BTreeSet<String> = BTreeSet::new();
     for (index, entry) in spec.sources.iter().enumerate() {
         let Some(record) = super::sync::record_for_entry(entry, &registry) else {
+            // No install record — but if the entry resolves to an id, a
+            // stale section from an earlier machine state must carry over
+            // (a skip never de-activates; CR F3).
+            if let Some(id) = spec::resolve_entry_id(entry) {
+                keep_current.insert(id);
+            }
             continue;
         };
         let claimed = theme_claimed_elsewhere.get(index).copied().unwrap_or(false);

@@ -3621,7 +3621,18 @@ fn run_plugin_migrate_rc_command(args: &[String]) -> anyhow::Result<()> {
     );
     println!();
     let report = niubash_runtime::plugins::loader::migrate_rc(&rc_path, want_candidate)?;
-    if report.blocks.is_empty() {
+    if report.loader_held_off() && report.blocks.is_empty() {
+        // CR F2: the guard trips on lines the id-anchored scan does not
+        // attribute — name them, never print "clean" over a held-off
+        // loader.
+        println!(
+            "  {} the startup guard holds the loader OFF for these marker lines:",
+            niubash_runtime::text_style::yellow("guard:")
+        );
+        for trip in &report.guard_trips {
+            println!("    line {:>4}  {}", trip.line, trip.text);
+        }
+    } else if report.blocks.is_empty() {
         println!(
             "  {} no legacy managed blocks in {} ({} lines)",
             niubash_runtime::text_style::green("clean:"),
@@ -3681,11 +3692,11 @@ fn run_plugin_migrate_rc_command(args: &[String]) -> anyhow::Result<()> {
         );
         println!("    {}", candidate.display());
     }
-    if !report.blocks.is_empty() {
+    if !report.blocks.is_empty() || report.loader_held_off() {
         println!();
         println!("  next steps — niu never edits your rc, the removal is yours:");
         println!(
-            "    1. delete the managed block line ranges above from {} by hand",
+            "    1. delete the marked line ranges above from {} by hand",
             rc_path.display()
         );
         println!("       (or review {} and copy it over yourself)", {

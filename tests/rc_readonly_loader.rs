@@ -531,12 +531,6 @@ fn case_359_9_order_override_and_rollback_switch() {
         inventory_before,
         "the rollback switch must not write anything"
     );
-    assert_eq!(
-        fs::read(sandbox.loader_path()).unwrap(),
-        fs::read(sandbox.loader_path()).unwrap(),
-        "self-check"
-    );
-
     // Unset (roll forward): the loader loads again — the switch is
     // load-only, it never deleted or regenerated anything.
     let out2 = sandbox.run_interactive(probe);
@@ -608,7 +602,11 @@ fn migrate_rc_reports_never_writes_and_candidates_the_diff() {
     let again = sandbox.run(&["plugin", "migrate-rc"]);
     assert_success(&again, "migrate-rc again");
     sandbox.assert_rc_identity_unchanged(&identity);
-    assert!(stdout_text(&again).contains("oh-my-bash"), "{report}");
+    let again_report = stdout_text(&again);
+    assert!(
+        again_report.contains("oh-my-bash"),
+        "the second report still names the block: {again_report}"
+    );
 }
 
 /// migrate-rc on a clean machine: an honest "clean" report, the rc (absent)
@@ -624,6 +622,52 @@ fn migrate_rc_on_a_clean_machine_is_a_honest_noop() {
     assert!(
         !sandbox.home.join(".niubash/candidates").exists(),
         "no candidate for a clean rc"
+    );
+}
+
+/// CR F2, end to end: when the guard trips on lines the id-anchored scan
+/// cannot attribute (an id-less marker pair), migrate-rc must name the trip
+/// lines — NEVER print "clean" over a held-off loader. The rc stays
+/// untouched, as everywhere else in this file.
+#[test]
+fn migrate_rc_names_guard_trips_the_scan_cannot_attribute() {
+    let sandbox = Sandbox::new("guard-trip-report");
+    install_trusted_omb(&sandbox);
+    assert_success(&sandbox.run(&["plugin", "enable", "git"]), "enable");
+    // An id-less marker pair wrapping real content: the guard trips, the
+    // id-anchored scan finds no id to attribute it to.
+    fs::write(
+        sandbox.rc_path(),
+        "# my rc\n# >>> niu source >>>\nexport LEFTOVER=1\n# <<< niu source <<<\n",
+    )
+    .unwrap();
+    let identity = sandbox.rc_identity();
+
+    let out = sandbox.run(&["plugin", "migrate-rc"]);
+    assert_success(&out, "migrate-rc with an id-less pair");
+    sandbox.assert_rc_identity_unchanged(&identity);
+    let report = stdout_text(&out);
+    assert!(
+        report.contains("guard:"),
+        "the report must name the guard trip: {report}"
+    );
+    assert!(
+        report.contains("LEFTOVER") || report.contains("line"),
+        "the trip lines must be visible: {report}"
+    );
+    assert!(
+        !report.contains("clean:"),
+        "a held-off loader must never read as clean: {report}"
+    );
+
+    // Removing the stray pair by hand releases the loader: clean verdict.
+    fs::write(sandbox.rc_path(), "# my rc\nexport MY_OWN=1\n").unwrap();
+    let out2 = sandbox.run(&["plugin", "migrate-rc"]);
+    assert_success(&out2, "migrate-rc on a clean rc");
+    assert!(
+        stdout_text(&out2).contains("clean:"),
+        "a clean rc reads as clean: {}",
+        stdout_text(&out2)
     );
 }
 
@@ -694,101 +738,107 @@ fn strip_test_modules(text: &str) -> String {
 
 #[test]
 fn case_359_12_retired_writers_have_no_verb_call_sites() {
-    let runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/niubash-runtime/src");
-    let assets_text = fs::read_to_string(runtime.join("plugins/assets.rs")).unwrap();
-    let assets = strip_test_modules(&assets_text);
-
-    // The rollback zone keeps the writers (small-diff rollback contract).
-    for symbol in [
-        "fn write_managed_block(",
-        "fn remove_managed_block(",
-        "fn apply_block(",
-        "fn write_block_report(",
-        "fn deactivate_block(",
-    ] {
-        assert!(
-            assets.contains(symbol),
-            "rollback zone violated: {symbol} was deleted (design §4.3 keeps it)"
-        );
+    // CR F1: the audit walks the ENTIRE production source tree (both
+    // crates' src/ and the binary's src/), not a hand-maintained file
+    // list — a new module, or a call smuggled into setup_wizard.rs /
+    // repl.rs / trust.rs, is scanned the same as everything else. The
+    // mutation this closes: `assets::deactivate_block` used to be `pub`,
+    // so any module could compile-passing reach `remove_managed_block`
+    // through it; it is now private, and the tree-wide absence scan makes
+    // even a private re-wiring visible.
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut sources: Vec<PathBuf> = Vec::new();
+    fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
     }
+    collect(&manifest.join("crates/niubash-runtime/src"), &mut sources);
+    collect(&manifest.join("src"), &mut sources);
+    assert!(
+        sources.len() >= 40,
+        "the source walk found only {} files — the tree layout moved; fix the roots",
+        sources.len()
+    );
 
-    // Call-syntax occurrences in production code, pinned to the exact
-    // rollback-zone shape: each symbol's definition plus (only) the
-    // zone-internal wiring between the retired helpers themselves
-    // (write_block_report -> write_managed_block, apply_block ->
-    // remove_managed_block/write_block_report). The whole zone is unwired
-    // from the verbs — a NEW occurrence anywhere is a call site
-    // re-attaching a retired rc writer, and this fails.
-    for (symbol, allowed) in [
-        ("write_managed_block(", 2usize),
-        ("remove_managed_block(", 3),
-        ("apply_block(", 1),
-        ("write_block_report(", 2),
-        ("deactivate_block(", 1),
-    ] {
-        let count = assets.matches(symbol).count();
-        assert_eq!(
-            count, allowed,
-            "{symbol} appears {count} times in assets.rs (allowed: {allowed}) — a call \
-             site re-attached the retired rc writer (niubash#359 ratchet)"
-        );
-    }
+    const RETIRED: [&str; 5] = [
+        "write_managed_block(",
+        "remove_managed_block(",
+        "apply_block(",
+        "write_block_report(",
+        "deactivate_block(",
+    ];
+    // The rollback-zone internal wiring allowed in assets.rs (each
+    // symbol's definition plus only the zone-internal calls between the
+    // retired helpers themselves).
+    const ZONE_ALLOWED: [usize; 5] = [2, 3, 1, 2, 1];
 
-    // No other production file reaches them either (test modules included:
-    // the integration suite must not exercise the retired path either).
-    for file in [
-        "plugins/sync.rs",
-        "plugins/recipes.rs",
-        "plugins/loader.rs",
-        "plugins/spec.rs",
-        "plugins/sources.rs",
-        "plugins/ui.rs",
-        "shell.rs",
-        "doctor.rs",
-        "config.rs",
-    ] {
-        let raw = fs::read_to_string(runtime.join(file)).unwrap();
-        let text = strip_test_modules(&raw);
-        for symbol in [
-            "write_managed_block(",
-            "remove_managed_block(",
-            "apply_block(",
-            "write_block_report(",
-            "deactivate_block(",
-        ] {
-            assert!(
-                !text.contains(symbol),
-                "{file} references {symbol} — the retired rc writer leaked out of the \
-                 rollback zone (niubash#359 ratchet)"
-            );
+    let assets_path = manifest.join("crates/niubash-runtime/src/plugins/assets.rs");
+    for path in &sources {
+        let raw = fs::read_to_string(path).unwrap();
+        let display = path.strip_prefix(&manifest).unwrap_or(path).display();
+        if path == &assets_path {
+            // The zone itself: the writers EXIST (small-diff rollback
+            // contract) and are referenced ONLY by the zone-internal
+            // shape above, with in-crate tests stripped.
+            let production = strip_test_modules(&raw);
+            for (symbol, allowed) in RETIRED.iter().zip(ZONE_ALLOWED.iter()) {
+                assert!(
+                    production.contains(&format!("fn {symbol}")),
+                    "rollback zone violated: fn {symbol} was deleted (design §4.3 keeps it)"
+                );
+                let count = production.matches(symbol).count();
+                assert_eq!(
+                    count, *allowed,
+                    "{symbol} appears {count} times in assets.rs (allowed: {allowed}) — a \
+                     call site re-attached the retired rc writer (niubash#359 ratchet)"
+                );
+            }
+        } else {
+            // EVERY other production file — including its #[cfg(test)]
+            // modules: the integration surface must not exercise the
+            // retired path either. Zero tolerance, no closed list.
+            for symbol in RETIRED {
+                assert!(
+                    !raw.contains(symbol),
+                    "{} references {symbol} — the retired rc writer leaked out of the \
+                     rollback zone (niubash#359 ratchet)",
+                    display
+                );
+            }
         }
     }
 
     // The setup wizard's whole-file writer stays (1.4.3 converges it to
-    // create-only), but it must stay confined to setup_wizard.rs.
-    let wizard = fs::read_to_string(runtime.join("setup_wizard.rs")).unwrap();
-    assert!(
-        wizard.contains("fn write_rc_and_mark_done("),
-        "the wizard rc writer vanished (W6 is 1.4.3 scope)"
-    );
-    for file in ["plugins/assets.rs", "plugins/sync.rs"] {
-        let text = fs::read_to_string(runtime.join(file)).unwrap();
-        assert!(
-            !text.contains("write_rc_and_mark_done("),
-            "{file} reaches the wizard's rc writer (confine W6 to setup_wizard.rs)"
-        );
-    }
-    let main = fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
-    for symbol in [
-        "write_managed_block(",
-        "remove_managed_block(",
-        "write_rc_and_mark_done(",
-        "write_primary_rc(",
-    ] {
-        assert!(
-            !main.contains(symbol),
-            "main.rs reaches the retired rc writer {symbol} (niubash#359 ratchet)"
-        );
+    // create-only), but it must stay confined to setup_wizard.rs — same
+    // tree-wide form as the managed-block ratchet.
+    const WIZARD_WRITERS: [&str; 2] = ["write_rc_and_mark_done(", "write_primary_rc("];
+    for path in &sources {
+        let raw = fs::read_to_string(path).unwrap();
+        let is_wizard = path.ends_with("setup_wizard.rs");
+        for symbol in WIZARD_WRITERS {
+            if is_wizard {
+                assert!(
+                    raw.contains(&format!("fn {symbol}")),
+                    "the wizard rc writer {symbol} vanished (W6 is 1.4.3 scope)"
+                );
+            } else {
+                assert!(
+                    !raw.contains(symbol),
+                    "{} reaches the wizard's rc writer {symbol} (confine W6 to \
+                     setup_wizard.rs, niubash#359 ratchet)",
+                    path.display()
+                );
+            }
+        }
     }
 }
 
