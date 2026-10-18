@@ -139,7 +139,12 @@ pub fn save_spec(spec: &PluginSpec) -> anyhow::Result<()> {
              # schema = \"{PLUGIN_SPEC_SCHEMA}\"\n"
         ));
     }
-    fs::write(&path, out)?;
+    // niubash#359 (design §4.4): the spec is control-plane state, so it
+    // gets the same #304 atomic swap (a concurrent reader — a sync or the
+    // doctor in another terminal — never observes a truncate window). The
+    // bare fs::write here was the exact hazard the rc writers had already
+    // retired.
+    crate::path_utils::write_file_atomic(&path, out.as_bytes())?;
     Ok(())
 }
 

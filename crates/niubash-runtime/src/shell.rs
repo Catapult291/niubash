@@ -994,6 +994,12 @@ impl Shell {
         }
         ensure_prompt_terminal_env(&mut self.executor);
         self.executor.set_env("NIU_REPL_STARTUP", "1");
+        // niubash#359: a finished `niu setup` may have published a new
+        // generated-loader generation; re-source it with the same decision
+        // logic before the rc re-apply (the wizard's rc carries no managed
+        // markers, so a clean machine resolves to Load — the same re-source
+        // semantics the rc itself has always had here).
+        let _ = self.load_generated_plugin_loader(Some(&path));
         let outcome = self.source_file_into_current_shell(&path);
         let _ = self.execute_script("unset NIU_REPL_STARTUP");
         match outcome {
@@ -1149,12 +1155,22 @@ impl Shell {
         if self.no_rc {
             return None;
         }
-        let Some(path) = self.startup_rc_path() else {
+        let rc_path = self.startup_rc_path().filter(|path| path.is_file());
+        // niubash#359: the generated plugin loader is the host-owned,
+        // read-only activation channel. It sources BEFORE the user rc so
+        // user overrides (PS1/alias/function) win, and only when the rc
+        // text carries no superseded managed-block marker (the
+        // double-execution guard — an old block in the rc is the live path,
+        // and loading both would execute the plugin set twice) and the
+        // rollback switch (NIU_PLUGIN_LOADER=off) allows loading. The step
+        // is zero-write by construction: it reads bytes and sources a file
+        // niu generated under an explicit verb.
+        if let Some(status) = self.load_generated_plugin_loader(rc_path.as_deref()) {
+            return Some(status);
+        }
+        let Some(path) = rc_path else {
             return None;
         };
-        if !path.is_file() {
-            return None;
-        }
 
         if repl {
             self.executor.set_env("NIU_REPL_STARTUP", "1");
@@ -1182,6 +1198,43 @@ impl Shell {
             self.run_greeting_hooks();
         }
         None
+    }
+
+    /// The generated plugin loader step of the rc startup branch
+    /// (niubash#359): decide read-only whether the host loads
+    /// `~/.niubash/generated/plugins.niu` this startup, source it before
+    /// the user rc when allowed, and serve the one-time migration hint
+    /// when the rc still carries a superseded managed block. Returns
+    /// `Some(status)` only when the loader ended with a top-level `exit`
+    /// (the same niubash#402 unwind as any startup file).
+    fn load_generated_plugin_loader(&mut self, rc_path: Option<&Path>) -> Option<i32> {
+        let rc_text = rc_path.and_then(|path| std::fs::read_to_string(path).ok());
+        let loader_text = crate::plugins::loader::read_loader_text();
+        match crate::plugins::loader::startup_decision(rc_text.as_deref(), loader_text.as_deref()) {
+            crate::plugins::loader::StartupDecision::Missing
+            | crate::plugins::loader::StartupDecision::OptedOut => None,
+            crate::plugins::loader::StartupDecision::SupersededBlockPresent => {
+                // The old managed block in the user rc is the live
+                // activation path; the loader stays off (double-execution
+                // guard). One-time read-only hint (design §4 mitigation):
+                // the marker write is config-dir internal and best-effort,
+                // never blocking, and only ever happens in this
+                // legacy-block situation — the clean-home startup matrix
+                // stays byte-for-byte untouched.
+                if crate::plugins::loader::should_show_legacy_hint() {
+                    eprintln!(
+                        "niubash: your rc still carries an old managed plugin block, so the \
+                         generated plugin loader stays off; review the migration with:  \
+                         niu plugin migrate-rc"
+                    );
+                }
+                None
+            }
+            crate::plugins::loader::StartupDecision::Load => {
+                let path = crate::plugins::loader::loader_path();
+                self.source_startup_file(&path)
+            }
+        }
     }
 
     /// Source one startup file with GNU maybe_execute_file semantics:

@@ -1594,6 +1594,9 @@ fn print_usage() {
     println!("  plugin update|sync|restore|rollback|clean");
     println!("                            Lockfile verbs (vim-plug/lazy.nvim-style)");
     println!("  plugin trust <id>         Review and activate a source's assets");
+    println!("  plugin migrate-rc [--diff]");
+    println!("                            Read-only migration report for legacy managed");
+    println!("                            blocks (never writes the rc)");
     println!("  plugin discover [--verbose]");
     println!("                            Read-only overview of external plugin sources");
     println!("  plugin source <command>   Full source protocol (add/trust/sign/verify/");
@@ -1660,6 +1663,10 @@ fn run_plugin_command(args: &[String]) -> anyhow::Result<()> {
         "list" => run_plugin_list_command(&args[3..]),
         "enable" => run_plugin_enable_command(&args[3..], true),
         "disable" => run_plugin_enable_command(&args[3..], false),
+        // niubash#359: the read-only migration diagnostic — reports the rc's
+        // legacy managed blocks, publishes the candidate loader generation,
+        // and NEVER writes the rc.
+        "migrate-rc" => run_plugin_migrate_rc_command(&args[3..]),
         "trust" => run_plugin_source_trust_command(&args[3..]),
         "update" => run_plugin_source_update_command(&args[3..]),
         "rollback" => run_plugin_source_rollback_command(&args[3..]),
@@ -3570,6 +3577,126 @@ fn run_plugin_enable_command(args: &[String], enable: bool) -> anyhow::Result<()
             "restart niu (or reload ~/.niubashrc) for the change to take effect"
         )
     );
+    // niubash#359 transition note: the rc's legacy managed block keeps the
+    // generated loader off until the user removes it (double-execution
+    // guard) — say so once, read-only.
+    if let Some(notice) = niubash_runtime::plugins::loader::migration_notice_if_needed() {
+        println!("  {}", niubash_runtime::text_style::yellow(&notice));
+    }
+    Ok(())
+}
+
+/// `niu plugin migrate-rc` (niubash#359, design §4.1): the read-only
+/// migration diagnostic. Scans the user rc for legacy managed blocks,
+/// publishes the candidate loader generation from the current manifest,
+/// and prints the removal guidance. `--diff` additionally writes the
+/// suggested post-migration rc under `~/.niubash/candidates/`. The user rc
+/// itself is NEVER modified — the removal is always the user's own edit.
+fn run_plugin_migrate_rc_command(args: &[String]) -> anyhow::Result<()> {
+    let mut want_candidate = false;
+    for arg in args {
+        match arg.as_str() {
+            "--diff" => want_candidate = true,
+            "-h" | "--help" => {
+                println!("usage: niu plugin migrate-rc [--diff]");
+                println!();
+                println!("  read-only: scans ~/.niubashrc for legacy managed plugin blocks,");
+                println!("  publishes the candidate loader generation from the current");
+                println!("  manifest, and prints what to remove BY HAND. --diff also writes");
+                println!("  the suggested post-migration rc to ~/.niubash/candidates/.");
+                println!("  This command never modifies your rc.");
+                return Ok(());
+            }
+            unknown => anyhow::bail!("unknown plugin migrate-rc option '{}'", unknown),
+        }
+    }
+    let rc_path = niubash_runtime::plugins::assets::rc_file();
+    println!(
+        "{}",
+        niubash_runtime::text_style::bold("niu plugin migrate-rc")
+    );
+    println!(
+        "  {}",
+        niubash_runtime::text_style::dim("read-only diagnostic — your rc is never written")
+    );
+    println!();
+    let report = niubash_runtime::plugins::loader::migrate_rc(&rc_path, want_candidate)?;
+    if report.blocks.is_empty() {
+        println!(
+            "  {} no legacy managed blocks in {} ({} lines)",
+            niubash_runtime::text_style::green("clean:"),
+            rc_path.display(),
+            report.rc_lines
+        );
+    } else {
+        println!(
+            "  {} legacy managed block(s) in {}:",
+            niubash_runtime::text_style::yellow("found:"),
+            rc_path.display()
+        );
+        for block in &report.blocks {
+            let shape = if block.end_missing {
+                "begin marker with NO end marker (malformed — still executes)"
+            } else if block.exact {
+                "exact managed markers"
+            } else {
+                "hand-edited (near) markers"
+            };
+            let ownership = if block.spec_declared {
+                "declared — the loader generation carries its activation"
+            } else {
+                "NOT declared — declare it first (`niu plugin sync --adopt` or \
+                 `niu plugin add`), or removing the block deactivates it"
+            };
+            println!(
+                "    lines {:>4}-{:>4}  source '{}' ({}; {})",
+                block.start_line, block.end_line, block.id, shape, ownership
+            );
+        }
+    }
+    println!();
+    if report.loader_published {
+        println!(
+            "  {} loader generation published: {}",
+            niubash_runtime::text_style::green("loader:"),
+            niubash_runtime::plugins::loader::loader_path().display()
+        );
+    } else {
+        println!(
+            "  {} loader generation already current: {}",
+            niubash_runtime::text_style::green("loader:"),
+            niubash_runtime::plugins::loader::loader_path().display()
+        );
+    }
+    if report.loader_ids.is_empty() {
+        println!("    (no sources declared — the loader is empty)");
+    } else {
+        println!("    sections: {}", report.loader_ids.join(", "));
+    }
+    if let Some(candidate) = &report.candidate_rc_path {
+        println!();
+        println!(
+            "  {} suggested post-migration rc (review, then apply BY HAND):",
+            niubash_runtime::text_style::cyan("diff:")
+        );
+        println!("    {}", candidate.display());
+    }
+    if !report.blocks.is_empty() {
+        println!();
+        println!("  next steps — niu never edits your rc, the removal is yours:");
+        println!(
+            "    1. delete the managed block line ranges above from {} by hand",
+            rc_path.display()
+        );
+        println!("       (or review {} and copy it over yourself)", {
+            report
+                .candidate_rc_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "the ranges".to_string())
+        });
+        println!("    2. restart niu — the generated loader takes over automatically");
+    }
     Ok(())
 }
 
@@ -3667,15 +3794,19 @@ fn run_plugin_sync_command(args: &[String]) -> anyhow::Result<()> {
             checksum_pin: None,
             timeout,
         })?;
-    // niubash#196: a hand-written theme variable outside the managed blocks
-    // is not the supported channel — `niu plugin sync` rewrites the managed
-    // blocks from the spec, so the rc line is ignored/dropped.
+    // niubash#196/#359: a hand-written theme variable outside the managed
+    // blocks is not the supported channel — the theme belongs in the spec.
+    // Since the read-only redesign sync writes NO rc at all, the
+    // hand-written line is no longer overwritten: it now simply runs AFTER
+    // the generated loader, so it wins at startup. Say which channel is
+    // supported and what the hand line does, and let the user choose.
     let stray = niubash_runtime::plugins::assets::stray_theme_assignment_lines();
     if !stray.is_empty() {
         eprintln!(
             "niu plugin sync: found hand-written theme assignment(s) outside the managed \
-             blocks: {}. The theme belongs in {} as `theme = \"...\"` on the source entry — \
-             hand-written OSH_THEME lines are overwritten by sync.",
+             blocks: {}. The supported channel is {} as `theme = \"...\"` on the source \
+             entry; your hand-written line runs after the generated plugin loader, so it \
+             wins at startup — keep it only if you intend that override.",
             stray.join("; "),
             niubash_runtime::plugins::spec::spec_path().display()
         );
@@ -3742,6 +3873,11 @@ fn run_plugin_sync_command(args: &[String]) -> anyhow::Result<()> {
             "{}",
             niubash_runtime::text_style::dim("spec and machine are in sync")
         );
+    }
+    // niubash#359 transition note: a legacy managed block in the user rc
+    // keeps the generated loader off until the user removes it.
+    if let Some(notice) = niubash_runtime::plugins::loader::migration_notice_if_needed() {
+        println!("  {}", niubash_runtime::text_style::yellow(&notice));
     }
     Ok(())
 }

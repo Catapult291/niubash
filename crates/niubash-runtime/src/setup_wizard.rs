@@ -2159,18 +2159,25 @@ fn print_config_summary(
     println!();
 }
 
-/// Record an external theme pick in the plugin spec (niubash#168): the rc
-/// block the wizard just wrote and the spec entry must carry the same
-/// ownership, or every later `niu plugin sync` re-materializes the stale
-/// claim and reverts the pick. Failures are printed, never fatal — the rc
-/// pick already landed and the reconciliation pre-pass can still heal a
-/// missed claim on the next sync.
+/// Record an external theme pick in the plugin spec (niubash#168) and
+/// publish the loader generation for it (niubash#359): the spec entry must
+/// carry the same ownership as the pick, or every later `niu plugin sync`
+/// re-materializes the stale claim and reverts the pick — and since the rc
+/// carries no activation content anymore, the pick only takes effect when
+/// the generated loader is republished. Failures are printed, never fatal —
+/// the reconciliation pre-pass can still heal a missed claim on the next
+/// sync, and a failed publish keeps the last good generation.
 fn record_theme_pick_in_spec(pick: &ThemePick) {
     let ThemePick::External { name, source_id } = pick else {
         return;
     };
     if let Err(err) = crate::plugins::assets::claim_theme(source_id, name) {
         println!("  \u{26a0}\u{fe0f}  could not record the theme pick in the plugin spec: {err:#}");
+        return;
+    }
+    if let Err(err) = crate::plugins::sync::sync_spec(crate::plugins::sync::SyncOptions::default())
+    {
+        println!("  \u{26a0}\u{fe0f}  could not publish the plugin loader generation: {err:#}");
     }
 }
 
@@ -2286,25 +2293,29 @@ fn setup_home_dir() -> PathBuf {
     shell_home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Guarded activation block for an external oh-my-bash theme (§3.3/§11.4):
-/// set `OSH_THEME` first, then the adapter's canonical loader snippet inside
-/// a managed block (`niu plugin enable/disable` edits the same markers).
-/// The existence guard keeps the fallback layer alive when the source tree
-/// is missing.
-fn external_theme_activation(cfg: &WizardConfig, theme: &str) -> Option<String> {
-    let source_id = cfg.theme_source_id.as_deref()?;
+/// The theme note for an external oh-my-bash/bash-it pick (§3.3/§11.4).
+///
+/// niubash#359: the rc carries NO activation content anymore — no managed
+/// block, no theme variable, no loader snippet. The pick lands in the spec
+/// (`record_theme_pick_in_spec`) and the generated loader
+/// (`~/.niubash/generated/plugins.niu`) carries the activation, sourced by
+/// the host BEFORE this rc so a hand edit here still wins. The rc keeps
+/// only the human-facing note naming the pick's source.
+fn external_theme_note(cfg: &WizardConfig, theme: &str) -> Option<String> {
+    cfg.theme_source_id.as_deref()?;
     if theme.is_empty() {
         return None;
     }
-    crate::plugins::assets::build_theme_block(source_id, theme)
+    Some(theme.to_string())
 }
 
 fn generate_rc(cfg: &WizardConfig) -> String {
     // Clean rc (niubash#145): no built-in plugin/theme stack lines, no
     // oh-my-niu bundle discovery, no NIU_PLUGINS/NIU_THEME assignments.
-    // An external-source theme (oh-my-bash) activates through its guarded
-    // loader and renders via the bash-compatible PS1 channel.
-    let external = external_theme_activation(cfg, &cfg.theme);
+    // An external-source theme (oh-my-bash) activates through the
+    // generated plugin loader (niubash#359) and renders via the
+    // bash-compatible PS1 channel.
+    let external = external_theme_note(cfg, &cfg.theme);
     let mut header = String::new();
     if !cfg.cwd_style.is_empty() {
         header.push_str(&format!(
@@ -2389,10 +2400,14 @@ unset __niubash_home_drive __niubash_home_rest
 #   niu plugin add <target>      declare + install a plugin source
 #   niu plugin sync              reconcile ~/.niubash/plugins.toml with reality
 #   niu plugin source trust      review and activate a source's assets
+#   niu plugin migrate-rc        review legacy managed blocks (read-only;
+#                                niu never edits this file)
 #   niu setup                    re-run this guide
 "#,
         header = header,
-        external_block = external.unwrap_or_default(),
+        // niubash#359: no activation content is embedded — the theme's
+        // managed block retired; the generated loader carries it.
+        external_block = "",
         alias_block = alias_block,
         theme_note = theme_note,
         provider_block = provider_block,
@@ -3143,11 +3158,11 @@ mod tests {
     ///    BASH_IT_THEME block while the wizard model said oh-my-bash, and
     ///    PS1 stayed the default. The collision must resolve exactly once,
     ///    deterministically, to the primary framework (oh-my-bash).
-    /// 2. Loader fidelity (§14.4): whichever source a picked theme came
-    ///    from, the rc activates it through THAT framework's own mechanism
-    ///    (no shims, no PS1-writing): OSH_THEME + the guarded oh-my-bash.sh
-    ///    loader for oh-my-bash picks, BASH_IT_THEME + the guarded
-    ///    bash_it.sh loader for bash-it picks, note naming the real source.
+    /// 2. Loader fidelity (§14.4), read-only edition (niubash#359): the rc
+    ///    carries NO activation content anymore -- the pick lands in the
+    ///    spec and the generated loader activates it through THAT
+    ///    framework's own mechanism; the rc keeps only the note naming the
+    ///    real source.
     #[test]
     fn theme_pick_routes_and_applies_through_the_owning_framework() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3184,16 +3199,16 @@ mod tests {
             "{gallery:?}"
         );
 
-        // (2) A pick from either source routes through that framework's own
-        // loader block.
+        // (2) A pick from either source names that framework in the note
+        // and embeds NO activation content (niubash#359: the generated
+        // loader carries it, host-sourced before this rc).
         let omb_pick = build_config(&ThemePick::External {
             name: "demox".to_string(),
             source_id: "oh-my-bash".to_string(),
         });
         let rc = generate_rc(&omb_pick);
-        assert!(rc.contains("OSH_THEME='demox'"), "{rc}");
-        assert!(rc.contains(". \"$OSH/oh-my-bash.sh\""), "{rc}");
-        assert!(!rc.contains("BASH_IT_THEME"), "{rc}");
+        assert!(!rc.contains("OSH_THEME='"), "{rc}");
+        assert!(!rc.contains("niu source"), "{rc}");
         assert!(
             rc.contains("# Prompt owned by the oh-my-bash theme 'demox'"),
             "the note must name the pick's actual source: {rc}"
@@ -3204,9 +3219,8 @@ mod tests {
             source_id: "bash-it".to_string(),
         });
         let rc = generate_rc(&bash_it_pick);
-        assert!(rc.contains("BASH_IT_THEME='demox'"), "{rc}");
-        assert!(rc.contains("bash_it.sh"), "{rc}");
-        assert!(!rc.contains("OSH_THEME"), "{rc}");
+        assert!(!rc.contains("BASH_IT_THEME='"), "{rc}");
+        assert!(!rc.contains("niu source"), "{rc}");
         assert!(
             rc.contains("# Prompt owned by the bash-it theme 'demox'"),
             "the note must name the pick's actual source: {rc}"
@@ -3217,13 +3231,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
     }
 
-    /// niubash#168 (P0): the theme pick writes BOTH halves — the rc block
-    /// through `generate_rc`, and the spec claim through
-    /// `record_theme_pick_in_spec` (the helper both the Q1 and the
-    /// post-install pick paths call) — so the rc and the spec cannot
-    /// disagree about theme ownership. The era-1 stale claim on the shared
-    /// name moves with the pick, and every later sync VERIFIES the pick
-    /// (byte-stable rc, theme active) instead of re-routing it.
+    /// niubash#168 (P0), read-only edition: the theme pick writes the spec
+    /// claim through `record_theme_pick_in_spec` (the helper both the Q1
+    /// and the post-install pick paths call); the rc carries no block
+    /// (niubash#359), so the rc and the spec cannot disagree about theme
+    /// ownership. The era-1 stale claim on the shared name moves with the
+    /// pick, and every later sync VERIFIES the pick (byte-stable loader,
+    /// theme active) instead of re-routing it.
     #[test]
     fn wizard_theme_pick_writes_the_spec_and_survives_sync() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3268,7 +3282,7 @@ mod tests {
         })
         .unwrap();
 
-        // The wizard pick: the rc block AND the spec claim, in one motion.
+        // The wizard pick: the spec claim (the rc gets only the note).
         let pick = ThemePick::External {
             name: "demox".to_string(),
             source_id: "oh-my-bash".to_string(),
@@ -3276,6 +3290,7 @@ mod tests {
         let cfg = build_config(&pick);
         let rc = generate_rc(&cfg);
         std::fs::write(home.join(PRIMARY_RC_FILE), &rc).unwrap();
+        let rc_bytes = std::fs::read(home.join(PRIMARY_RC_FILE)).unwrap();
         record_theme_pick_in_spec(&pick);
 
         // The spec names oh-my-bash (id pin — the ambiguous name is owned
@@ -3289,19 +3304,20 @@ mod tests {
             "the theme-only era-1 declaration moved with the pick: {spec_text}"
         );
 
-        // Every later sync verifies the pick: byte-identical rc, theme
-        // active, no competing framework block.
+        // Every later sync verifies the pick: byte-identical rc (never
+        // written), theme active in the loader, no competing framework.
         crate::plugins::sync::sync_spec(crate::plugins::sync::SyncOptions::default())
             .expect("sync 1");
-        let after = std::fs::read_to_string(home.join(PRIMARY_RC_FILE)).unwrap();
-        assert_eq!(after, rc, "the picked theme block never flips");
-        assert!(after.contains("OSH_THEME='demox'"), "{after}");
-        assert!(!after.contains("BASH_IT_THEME"), "{after}");
+        let after = std::fs::read(home.join(PRIMARY_RC_FILE)).unwrap();
+        assert_eq!(after, rc_bytes, "the rc is never rewritten");
+        let loader_text = crate::plugins::loader::read_loader_text().unwrap_or_default();
+        assert!(loader_text.contains("OSH_THEME='demox'"), "{loader_text}");
+        assert!(!loader_text.contains("BASH_IT_THEME"), "{loader_text}");
         crate::plugins::sync::sync_spec(crate::plugins::sync::SyncOptions::default())
             .expect("sync 2");
         assert_eq!(
-            std::fs::read_to_string(home.join(PRIMARY_RC_FILE)).unwrap(),
-            rc,
+            std::fs::read(home.join(PRIMARY_RC_FILE)).unwrap(),
+            rc_bytes,
             "byte-stable across sources"
         );
 
@@ -3445,7 +3461,7 @@ mod tests {
     }
 
     #[test]
-    fn wizard_external_theme_pick_writes_guarded_loader() {
+    fn wizard_external_theme_pick_embeds_no_activation_content() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = unique_temp_dir("wizard-omb-theme");
         let root = temp.join("sources");
@@ -3460,36 +3476,25 @@ mod tests {
             ..WizardConfig::default()
         };
         let rc = generate_rc(&cfg);
-        // §3.2/§3.3: OSH_THEME + NIU_THEME_SOURCE=omb + the guarded loader,
-        // and no native theme pair or template override.
-        assert!(rc.contains("OSH_THEME='robbyrussell'"), "{rc}");
-        assert!(rc.contains("NIU_THEME_SOURCE=omb"), "{rc}");
-        assert!(rc.contains("if [ -f "), "{rc}");
-        assert!(rc.contains(". \"$OSH/oh-my-bash.sh\""), "{rc}");
-        assert!(
-            rc.contains("${NIU_PLUGIN_SOURCES_ROOT:-$HOME/.niubash/sources}/oh-my-bash"),
-            "{rc}"
-        );
-        assert!(rc.contains("fallback stays active when absent"), "{rc}");
-        // §14.5 rc order contract: floor config (NIU_* display knobs) lands
-        // early; the framework enable block loads after it, so a framework
-        // that claims PS1 always runs on top of — never below — the floor.
-        let floor_pos = rc.find("NIU_PROMPT_CWD_STYLE=").expect("floor knob");
-        let block_pos = rc.find(">>> niu source oh-my-bash").expect("managed block");
-        assert!(
-            floor_pos < block_pos,
-            "floor config must precede the framework block:\n{rc}"
-        );
-        // The wizard-written block is the managed block: markers present so
-        // `niu plugin enable/disable` can edit it surgically.
-        assert!(
-            rc.contains(">>> niu source oh-my-bash (managed by `niu plugin enable/disable`) >>>"),
-            "{rc}"
-        );
+        // niubash#359: the rc carries NO activation content -- no theme
+        // variable, no guarded loader, no managed markers. The pick lands
+        // in the spec and the generated loader carries the activation,
+        // host-sourced BEFORE this rc so a hand edit here still wins.
+        assert!(!rc.contains("OSH_THEME="), "{rc}");
+        assert!(!rc.contains("NIU_THEME_SOURCE="), "{rc}");
+        assert!(!rc.contains("niu source"), "{rc}");
+        assert!(!rc.contains("oh-my-bash.sh"), "{rc}");
         assert!(!rc.contains("NIU_THEME="), "{rc}");
         assert!(!rc.contains("NIU_THEME_PLUGIN="), "{rc}");
         assert!(!rc.contains("niubash_prompt_use_template"), "{rc}");
+        // The note names the pick's source, and the floor config lands.
         assert!(rc.contains("bash-compatible channel"), "{rc}");
+        assert!(
+            rc.contains("# Prompt owned by the oh-my-bash theme 'robbyrussell'"),
+            "{rc}"
+        );
+        assert!(rc.contains("NIU_PROMPT_CWD_STYLE="), "{rc}");
+        assert!(rc.contains("niu plugin migrate-rc"), "{rc}");
 
         crate::plugins::sources::remove_source("oh-my-bash").unwrap();
         let _ = std::fs::remove_dir_all(&temp);
@@ -3521,10 +3526,10 @@ mod tests {
     }
 
     /// (a) recommended + trust-yes + theme picked: the same run trusts the
-    /// fresh source and rewrites the rc through the guarded activation
-    /// block — journal/undo cover the pick exactly like a Q1 pick.
+    /// fresh source and records the pick — journal/undo cover it exactly
+    /// like a Q1 pick; the rc keeps zero activation content (niubash#359).
     #[test]
-    fn post_install_pick_trusts_then_writes_the_guarded_theme_block() {
+    fn post_install_pick_trusts_then_records_the_theme_pick() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = unique_temp_dir("wizard-post-install");
         let root = temp.join("sources");
@@ -3563,12 +3568,38 @@ mod tests {
             "the pick must have trusted it"
         );
 
-        // The rc on disk carries the same guarded block a Q1 pick writes.
+        // The rc on disk carries NO activation content (niubash#359): the
+        // pick went to the spec + config; the loader will carry the block
+        // once a sync runs (adopt_installed_sources_into_spec does, at the
+        // end of the run).
         let rc = std::fs::read_to_string(home.join(PRIMARY_RC_FILE)).unwrap();
-        assert!(rc.contains("OSH_THEME='agnoster'"), "{rc}");
-        assert!(rc.contains("NIU_THEME_SOURCE=omb"), "{rc}");
-        assert!(rc.contains(">>> niu source oh-my-bash"), "{rc}");
-        assert!(rc.contains("fallback stays active when absent"), "{rc}");
+        assert!(!rc.contains("OSH_THEME="), "{rc}");
+        assert!(!rc.contains(">>> niu source oh-my-bash"), "{rc}");
+        assert!(
+            rc.contains("# Prompt owned by the oh-my-bash theme 'agnoster'"),
+            "{rc}"
+        );
+        {
+            let _spec_guard = EnvGuard::set(
+                "NIU_PLUGIN_SPEC",
+                &home.join(".niubash/plugins.toml").to_string_lossy(),
+            );
+            record_theme_pick_in_spec(&ThemePick::External {
+                name: "agnoster".to_string(),
+                source_id: "oh-my-bash".to_string(),
+            });
+            crate::plugins::sync::sync_spec(crate::plugins::sync::SyncOptions::default())
+                .expect("sync publishes the loader");
+            let loader_text = crate::plugins::loader::read_loader_text().unwrap_or_default();
+            assert!(
+                loader_text.contains("OSH_THEME='agnoster'"),
+                "{loader_text}"
+            );
+            assert!(
+                loader_text.contains("fallback stays active when absent"),
+                "{loader_text}"
+            );
+        }
 
         // One journal + undo lines for both the collection and the pick.
         let journal = SetupJournal {
@@ -3683,8 +3714,9 @@ mod tests {
         );
 
         // The journey's end state: collection installed the fixture
-        // (untrusted), the trust question trusted it, the theme pick wrote
-        // the guarded block through generate_rc.
+        // (untrusted), the trust question trusted it, the theme pick was
+        // recorded (niubash#359: the pick lands in the spec, the rc gets
+        // only the note).
         install_untrusted_omb_fixture();
         crate::plugins::sources::trust_source("oh-my-bash").expect("fixture trust");
         let cfg = WizardConfig {
@@ -3693,6 +3725,10 @@ mod tests {
             ..WizardConfig::default()
         };
         std::fs::write(home.join(PRIMARY_RC_FILE), generate_rc(&cfg)).unwrap();
+        record_theme_pick_in_spec(&ThemePick::External {
+            name: "agnoster".to_string(),
+            source_id: "oh-my-bash".to_string(),
+        });
 
         adopt_installed_sources_into_spec(Lang::En);
 
@@ -3700,15 +3736,28 @@ mod tests {
             .expect("the wizard wrote the spec");
         assert!(spec_text.contains("id = 'oh-my-bash'"), "{spec_text}");
         assert!(spec_text.contains("theme = 'agnoster'"), "{spec_text}");
-        // The settled state round-trips: a plain sync is a no-op for the rc.
-        let rc_before = std::fs::read_to_string(home.join(PRIMARY_RC_FILE)).unwrap();
+        // The pick already published the loader generation
+        // (record_theme_pick_in_spec runs the sync — niubash#359), and the
+        // settled state round-trips: a plain sync is a no-op for the rc AND
+        // the generation.
+        let rc_before = std::fs::read(home.join(PRIMARY_RC_FILE)).unwrap();
+        let loader_before = crate::plugins::loader::read_loader_text().unwrap_or_default();
+        assert!(
+            loader_before.contains("OSH_THEME='agnoster'"),
+            "the pick published the loader generation: {loader_before}"
+        );
         let report =
             crate::plugins::sync::sync_spec(crate::plugins::sync::SyncOptions::default()).unwrap();
         assert!(report.clean, "{:?}", report);
         assert_eq!(
-            std::fs::read_to_string(home.join(PRIMARY_RC_FILE)).unwrap(),
+            std::fs::read(home.join(PRIMARY_RC_FILE)).unwrap(),
             rc_before,
             "sync after the wizard must not move the rc"
+        );
+        assert_eq!(
+            crate::plugins::loader::read_loader_text().unwrap_or_default(),
+            loader_before,
+            "byte-stable generation"
         );
 
         crate::plugins::sources::remove_source("oh-my-bash").unwrap();

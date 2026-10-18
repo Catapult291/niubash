@@ -730,7 +730,11 @@ pub(crate) fn write_source_registry(sources: &[SourceRecord]) -> anyhow::Result<
         schema: Some(SOURCE_REGISTRY_SCHEMA.to_string()),
         sources: sources.to_vec(),
     })?;
-    fs::write(path, text)?;
+    // niubash#359 (design SS4.4): the registry is control-plane state, so
+    // it gets the same #304 atomic swap the rc writers had - a concurrent
+    // reader (the doctor, a sync in another terminal) sees the old or the
+    // new full file, never a truncate window.
+    crate::path_utils::write_file_atomic(&path, text.as_bytes())?;
     Ok(())
 }
 

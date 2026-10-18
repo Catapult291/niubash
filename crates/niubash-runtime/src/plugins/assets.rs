@@ -30,7 +30,7 @@
 //! Every block keeps the adapter's existence guard, so a missing tree is a
 //! silent no-op at startup (iron law 2: the fallback chain never breaks).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -48,6 +48,11 @@ use crate::path_utils::shell_home_dir;
 /// Source blocks and tool PATH blocks each carry their own marker kind —
 /// `niu source` vs `niu tool` — so a tool id can never collide with a
 /// source id's block and every managed block is surgically removable.
+///
+/// niubash#359: no verb WRITES these markers anymore (the generated
+/// loader replaced the managed block), but the recognition stays: the
+/// startup double-execution guard scans the user rc for them read-only,
+/// `niu plugin migrate-rc` reports them, and the doctor names them.
 fn begin_marker(id: &str) -> String {
     format!("# >>> niu source {id} (managed by `niu plugin enable/disable`) >>>")
 }
@@ -56,15 +61,68 @@ fn end_marker(id: &str) -> String {
     format!("# <<< niu source {id} <<<")
 }
 
-/// True when `id` has a managed source block in the rc (the enable state
-/// as the loader sees it — one source of truth for listings and the
-/// plugin UI). The former tool PATH-block channel retired with the
-/// download driver (owner ruling 2026-10-04).
+/// Read-only recognition primitives for the migrate-rc/doctor surfaces
+/// (`plugins::loader` scans the user rc with these). They expose what the
+/// private spellings above render, with no write path anywhere.
+pub fn begin_marker_for(id: &str) -> String {
+    begin_marker(id)
+}
+
+pub fn end_marker_for(id: &str) -> String {
+    end_marker(id)
+}
+
+/// True when the line is marker-shaped for `id`: an exact managed marker
+/// or the near (hand-edited) decoration — anything bash would recognize
+/// as this product's block vocabulary. Read-only classification.
+pub fn is_legacy_marker_line(line: &str, id: &str) -> bool {
+    let begin = begin_marker(id);
+    let end = end_marker(id);
+    line.trim() == begin || line.trim() == end
+}
+
+/// The distinct source ids whose marker-shaped lines the rc carries, in
+/// first-appearance order.
+pub fn legacy_marker_ids(lines: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in lines {
+        if let Some(id) = marker_id(line) {
+            if !out.iter().any(|existing| existing == id) {
+                out.push(id.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Inclusive (start, stop) spans of exact marker pairs — the read-only
+/// recognition primitive [`managed_block_spans`] exposes for the
+/// migrate-rc/doctor surfaces.
+pub fn managed_block_spans_public(
+    lines: &[String],
+    begin: &str,
+    end: &str,
+) -> anyhow::Result<Vec<(usize, usize)>> {
+    managed_block_spans(lines, begin, end)
+}
+
+/// The same for near-marker (hand-edited) pairs.
+pub fn near_marker_spans_public(
+    lines: &[String],
+    id: &str,
+    begin: &str,
+    end: &str,
+) -> anyhow::Result<Vec<(usize, usize)>> {
+    near_marker_spans(lines, id, begin, end)
+}
+
+/// True when `id` has an activation anywhere the loader can see it: a
+/// section in the generated loader, or (pre-migration rcs) a managed
+/// block. One state read for listings and the plugin UI. The former tool
+/// PATH-block channel retired with the download driver (owner ruling
+/// 2026-10-04).
 pub fn managed_block_present(id: &str) -> bool {
-    let Ok(text) = fs::read_to_string(rc_file()) else {
-        return false;
-    };
-    text.lines().any(|line| line.trim() == begin_marker(id))
+    live_block_present(id)
 }
 
 /// The primary interactive rc file asset activation edits.
@@ -269,7 +327,29 @@ fn split_quoted_words(text: &str) -> Vec<String> {
 /// Render a managed block: theme line, selection arrays (or per-file
 /// guarded source lines for DirectFiles), then the adapter's guarded
 /// loader snippet, wrapped in markers.
+///
+/// niubash#359: this writer shape is RETIRED from every verb path (the
+/// generated loader replaces the managed block; see
+/// [`render_block_body`] + `plugins::loader`). The function stays as the
+/// code-level rollback shape (design §4.3) and for the read-side helpers
+/// that recognize what old rcs still carry. The 359.12 structure ratchet
+/// pins that no verb can reach it.
 fn render_block(record: &SourceRecord, model: &SelectionModel, state: &BlockState) -> String {
+    format!(
+        "{}\n{}{}\n",
+        begin_marker(&record.id),
+        render_block_body(record, model, state),
+        end_marker(&record.id)
+    )
+}
+
+/// The body of one source's activation block — theme line, selection
+/// arrays (or per-file guarded source lines for DirectFiles), the static
+/// drift guard, then the adapter's guarded loader snippet. This exact
+/// byte stream used to sit between a managed block's markers in the user
+/// rc; since niubash#359 it is the body of a section in the generated
+/// loader (`plugins::loader`), unchanged in content, changed in position.
+fn render_block_body(record: &SourceRecord, model: &SelectionModel, state: &BlockState) -> String {
     let adapter = adapter_for(&record.adapter).expect("adapter for a rendered block");
     let mut body = String::new();
     let theme_var = match model {
@@ -317,12 +397,7 @@ fn render_block(record: &SourceRecord, model: &SelectionModel, state: &BlockStat
     if !loader.is_empty() {
         body.push_str(&loader);
     }
-    format!(
-        "{}\n{}{}\n",
-        begin_marker(&record.id),
-        body,
-        end_marker(&record.id)
-    )
+    body
 }
 
 /// The static drift-guard snippet for one source's managed block: warn at
@@ -389,6 +464,9 @@ fn managed_block_text(id: &str) -> Option<String> {
 /// the text bash actually executes when duplicate blocks exist (wt83 #175).
 /// Read errors and a begin-without-end marker degrade to what was found,
 /// the same tolerance the reads always had; writers never degrade.
+///
+/// niubash#359: no writer remains; the migrate-rc verb reports what this
+/// finds instead of rewriting it.
 fn read_managed_block_bodies(id: &str) -> Vec<String> {
     let Ok(lines) = rc_block_lines() else {
         return Vec::new();
@@ -403,6 +481,31 @@ fn read_managed_block_bodies(id: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The live activation state of an id, wherever the loader can see it
+/// (niubash#359): the generated loader's section first — it is what the
+/// host will actually source once the migration completes — then the
+/// legacy rc managed blocks (pre-migration rcs keep working read-only;
+/// verbs read their selection to merge it into the loader generation).
+fn live_block_bodies(id: &str) -> Vec<String> {
+    if let Some(text) = super::loader::read_loader_text() {
+        if let Some(section) = super::loader::parse_sections(&text)
+            .into_iter()
+            .find(|section| section.id == id)
+        {
+            // An empty body still counts as the live materialization (a
+            // declared whole-source framework floors on its own loader).
+            return vec![section.body];
+        }
+    }
+    read_managed_block_bodies(id)
+}
+
+/// True when `id` has live activation state (loader section or legacy rc
+/// block) — the floor-yield check and the listing surfaces.
+fn live_block_present(id: &str) -> bool {
+    !live_block_bodies(id).is_empty()
 }
 
 /// Number of managed marker pairs for an id; errors on a begin marker with
@@ -451,7 +554,7 @@ fn merged_block_state(bodies: &[String], model: &SelectionModel, record_id: &str
 
 /// The parsed state of the rc's managed blocks for an id (all of them).
 fn managed_state(id: &str, model: &SelectionModel, record_id: &str) -> BlockState {
-    let bodies = read_managed_block_bodies(id);
+    let bodies = live_block_bodies(id);
     merged_block_state(&bodies, model, record_id)
 }
 
@@ -459,6 +562,7 @@ fn managed_state(id: &str, model: &SelectionModel, record_id: &str) -> BlockStat
 /// rewrite used to flatten every line to LF, corrupting a mixed/rc-editors'
 /// file). `str::lines()` strips the `\r`, so rejoining with the detected
 /// terminator restores the file's own convention.
+#[allow(dead_code)]
 fn detect_eol(text: &str) -> &'static str {
     if text.contains("\r\n") {
         "\r\n"
@@ -479,6 +583,7 @@ const RC_BACKUP_KEEP: usize = 10;
 /// that writes the rc backs up, not only the setup wizard) and prune the
 /// backup set to the most recent [`RC_BACKUP_KEEP`] files — the wizard's
 /// era never cleaned them, so `~/.niubash/backups` grew without bound.
+#[allow(dead_code)]
 fn backup_rc() {
     let Some(dir) = rc_backup_dir() else {
         return;
@@ -499,6 +604,7 @@ fn backup_rc() {
 
 /// Keep the newest `keep` `.niubashrc.*.bak` files (mtime, name as the
 /// tiebreak); older ones are deleted.
+#[allow(dead_code)]
 fn prune_rc_backups(keep: usize) {
     let Some(dir) = rc_backup_dir() else {
         return;
@@ -831,9 +937,10 @@ fn normalize_migrated_sections(lines: Vec<String>) -> (Vec<String>, usize) {
 }
 
 /// True when the rc on disk still carries moved-out drift-guard debris
-/// (niubash#324) — the signal that lets the materializer's byte-identical
-/// fast path fall through to a repair.
-fn rc_has_migrated_debris() -> bool {
+/// (niubash#324) — reported read-only by the doctor (the write-era repair
+/// paths are retired; the evidence is the product's job now, the fix is
+/// the user's).
+pub fn rc_has_migrated_debris() -> bool {
     let Ok(text) = fs::read_to_string(rc_file()) else {
         return false;
     };
@@ -857,6 +964,10 @@ fn rc_has_migrated_debris() -> bool {
 /// migrated sections are normalized first (stale guard debris removed, the
 /// owner-corrupt rc converges) and a newly migrated line that an existing
 /// section already carries is merged into it, never copied again.
+///
+/// niubash#359: RETIRED from every verb path (rollback zone — see the
+/// module-level note on [`apply_block`]).
+#[allow(dead_code)]
 fn write_managed_block(begin: &str, end: &str, block: &str) -> anyhow::Result<(PathBuf, usize)> {
     let path = rc_file();
     let raw = fs::read_to_string(&path).ok();
@@ -964,6 +1075,10 @@ fn write_managed_block(begin: &str, end: &str, block: &str) -> anyhow::Result<(P
 /// first block and strand the duplicates). User lines inside the removed
 /// block(s) are migrated out with a warning, never silently dropped
 /// (niubash#176); the rc is backed up before the rewrite.
+///
+/// niubash#359: RETIRED from every verb path (rollback zone — see the
+/// module-level note on [`apply_block`]).
+#[allow(dead_code)]
 fn remove_managed_block(begin: &str, end: &str) -> anyhow::Result<usize> {
     let path = rc_file();
     let Ok(text) = fs::read_to_string(&path) else {
@@ -1148,15 +1263,15 @@ fn tree_disable(record: &SourceRecord, asset: &SourceAsset) -> anyhow::Result<()
     Ok(())
 }
 
-/// Fully deactivate a source without touching the rest of its tree: the
-/// managed rc block goes (ALL matching blocks — wt83 #175), and for
-/// `enabled/` managers (bash-it) the tree entries go too. Used when the
-/// spec stops declaring a source it owned (§14.6.3: spec is the truth; the
-/// tree itself is only ever removed by `niu plugin source remove`).
-/// Errors surface (a malformed block, an unremovable entry): a disable
-/// that could not touch the rc must not print success (wt83 #175).
-pub fn deactivate_block(record: &SourceRecord) -> anyhow::Result<()> {
-    remove_managed_block(&begin_marker(&record.id), &end_marker(&record.id))?;
+/// Deactivate a source's TREE-side activation (bash-it `enabled/` entries)
+/// without touching the rest of the tree — and without touching the user
+/// rc (niubash#359: the loader generation drops the section instead; the
+/// sync caller omits the id from the computed set). Used when the spec
+/// stops declaring a source it owned (§14.6.3: spec is the truth; the tree
+/// itself is only ever removed by `niu plugin source remove`). Errors
+/// surface: a disable that could not do its tree half must not print
+/// success (wt83 #175).
+pub fn deactivate_tree(record: &SourceRecord) -> anyhow::Result<()> {
     if let Some(adapter) = adapter_for(&record.adapter) {
         if let SelectionModel::EnabledDir { .. } = adapter.selection_model() {
             for asset in adapter.list_assets(&record.path) {
@@ -1165,6 +1280,18 @@ pub fn deactivate_block(record: &SourceRecord) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Fully deactivate a source: the managed rc block goes (ALL matching
+/// blocks — wt83 #175) and the `enabled/` tree entries go too.
+///
+/// niubash#359: RETIRED from every verb path — the rc half violated the
+/// zero-write contract. Kept unwired in the rollback zone (design §4.3);
+/// the live path is [`deactivate_tree`] + loader generation omission.
+#[allow(dead_code)]
+pub fn deactivate_block(record: &SourceRecord) -> anyhow::Result<()> {
+    remove_managed_block(&begin_marker(&record.id), &end_marker(&record.id))?;
+    deactivate_tree(record)
 }
 
 // ── Overview ─────────────────────────────────────────────────────────────────
@@ -1192,7 +1319,7 @@ pub fn asset_overview() -> Vec<SourceReport> {
         }
         let record = &status.record;
         let model = adapter.selection_model();
-        let bodies = read_managed_block_bodies(&record.id);
+        let bodies = live_block_bodies(&record.id);
         let state = merged_block_state(&bodies, &model, &record.id);
         let assets = adapter
             .list_assets(&record.path)
@@ -1630,11 +1757,12 @@ pub fn enable(name: &str) -> anyhow::Result<ActivationOutcome> {
     };
     spec::save_spec(&spec)?;
     let report = super::sync::sync_spec(super::sync::SyncOptions::default())?;
-    // The rc materialization is the visible half of enable: a failed row
-    // for this source (a malformed or unrepairable managed block) must
-    // fail the verb — printing success while the rc was never written is
-    // the fake success wt83 #175 records. A merged row (duplicate blocks
-    // collapsed) is reported in the outcome so the repair is visible.
+    // The loader generation is the visible half of enable: a failed row
+    // for this source must fail the verb — printing success while the
+    // generation was never published is the fake success wt83 #175
+    // records. (The user rc is never written, niubash#359: when the rc
+    // still carries the legacy managed block, the CLI prints the
+    // migrate-rc note so the transition state is visible.)
     let summary = finish_activation_summary(&record.id, summary, &report)?;
     Ok(ActivationOutcome {
         summary,
@@ -1678,7 +1806,7 @@ pub fn disable(name: &str) -> anyhow::Result<ActivationOutcome> {
                 record.clone(),
                 index.is_some(),
                 format!(
-                    "source '{}' deactivated — spec entry removed, loader block dropped \
+                    "source '{}' deactivated — spec entry removed, loader section dropped \
                      (tree kept; delete fully with `niu plugin source remove {}`)",
                     record.id, record.id
                 ),
@@ -1720,9 +1848,9 @@ pub fn disable(name: &str) -> anyhow::Result<ActivationOutcome> {
     }
     spec::save_spec(&spec)?;
     let report = super::sync::sync_spec(super::sync::SyncOptions::default())?;
-    // Same honesty contract as enable (wt83 #175): a disable whose rc
-    // removal failed must fail loudly, not print "loader block dropped"
-    // over a block that still loads at every startup.
+    // Same honesty contract as enable (wt83 #175): a disable whose
+    // generation publish failed must fail loudly, not print "loader
+    // section dropped" over a section that still loads at every startup.
     let summary = finish_activation_summary(&record.id, summary, &report)?;
     Ok(ActivationOutcome {
         summary,
@@ -1730,56 +1858,77 @@ pub fn disable(name: &str) -> anyhow::Result<ActivationOutcome> {
     })
 }
 
-// ── Spec materialization (the sync engine's writer) ──────────────────────────
+// ── Spec materialization (compute + loader generation publish) ───────────────
 
-/// What one spec materialization pass did to a source.
+/// What one spec computation pass decided for a source — WITHOUT touching
+/// the user rc (niubash#359: the rc is never written; the decision lands
+/// in the generated loader through [`publish_loader_generation`]).
 #[derive(Debug, Clone)]
-pub struct SpecMaterialization {
-    /// `activated` | `unchanged` | `deactivated` | `unsupported`
-    pub action: String,
+pub struct ComputedSelection {
+    /// The source's rendered section body (theme/arrays/files + drift
+    /// guard + loader snippet) when it participates in the generation;
+    /// `None` = the generation drops the section (nothing enabled).
+    pub section: Option<String>,
     pub detail: String,
     /// New `spec_enabled` to persist (None = leave as-is).
     pub spec_enabled: Option<Vec<String>>,
     /// New `spec_theme` to persist.
     pub spec_theme: Option<String>,
+    /// The record's adapter is unknown — the row reports `unsupported`
+    /// (nothing can be computed, the section is dropped, never silently).
+    pub unsupported: bool,
 }
 
-/// Materialize one spec entry onto a trusted, non-degraded record
-/// (§14.6.3 merge semantics): the spec's selection plus any hand-added
-/// entries wins; entries the spec dropped (in `prev` but not `next`) are
-/// removed; a hand-set theme survives a spec that does not declare one.
+/// One row of a loader generation publish: the same action vocabulary the
+/// rc materialization used (activated | unchanged | deactivated), derived
+/// by diffing the desired sections against the current generation.
+#[derive(Debug, Clone)]
+pub struct GenerationRow {
+    pub id: String,
+    pub action: String,
+    pub detail: String,
+}
+
+/// Compute one spec entry's selection against a trusted, non-degraded
+/// record (§14.6.3 merge semantics): the spec's selection plus any
+/// hand-added entries wins; entries the spec dropped (in `prev` but not
+/// `next`) are removed; a hand-set theme survives a spec that does not
+/// declare one.
 ///
 /// `theme_claimed_elsewhere` is the niubash#168 floor-yield input: true
 /// when another spec entry claims a (non-empty) theme. A source with no
 /// selection of its own then does NOT (re)create its loader-only floor
-/// block — the framework would load on top of the claimed theme. A block
-/// that already exists is left byte-stable (never silently flipped);
-/// removal is an explicit verb or a reconciled claim move.
-pub fn materialize_spec_selection(
+/// section — the framework would load on top of the claimed theme. A
+/// section that already exists is left byte-stable (never silently
+/// flipped); removal is an explicit verb or a reconciled claim move.
+///
+/// Side effects are confined to the control plane and the source's own
+/// tree (bash-it `enabled/` entries): the user rc is never touched
+/// (niubash#359).
+pub fn compute_spec_selection(
     record: &SourceRecord,
     entry: &SpecSource,
     theme_claimed_elsewhere: bool,
-) -> anyhow::Result<SpecMaterialization> {
+) -> anyhow::Result<ComputedSelection> {
     let Some(adapter) = adapter_for(&record.adapter) else {
-        return Ok(SpecMaterialization {
-            action: "unsupported".to_string(),
+        return Ok(ComputedSelection {
+            section: None,
             detail: format!("unknown adapter '{}'", record.adapter),
             spec_enabled: None,
             spec_theme: None,
+            unsupported: true,
         });
     };
     let model = adapter.selection_model();
-    let materialized = match model {
+    let computed = match model {
         SelectionModel::WholeSource => {
-            // Declared = active; the guarded loader block is the unit.
-            let rendered = render_block(record, &model, &BlockState::default());
-            let (action, detail) =
-                write_block_report(record, &rendered, "whole-source guarded loader")?;
-            SpecMaterialization {
-                action,
-                detail,
+            // Declared = active; the guarded loader section is the unit.
+            ComputedSelection {
+                section: Some(render_block_body(record, &model, &BlockState::default())),
+                detail: "whole-source guarded loader".to_string(),
                 spec_enabled: Some(Vec::new()),
                 spec_theme: None,
+                unsupported: false,
             }
         }
         SelectionModel::DirectFiles => {
@@ -1801,10 +1950,10 @@ pub fn materialize_spec_selection(
                 array_items: Vec::new(),
                 files: final_names.clone(),
             };
-            let (action, detail) = apply_block(record, &model, &state, !final_names.is_empty())?;
-            SpecMaterialization {
-                action,
-                detail: detail_with_unknown(detail, &unknown),
+            let active = !final_names.is_empty();
+            ComputedSelection {
+                section: active.then(|| render_block_body(record, &model, &state)),
+                detail: detail_with_unknown("per-file guarded source lines".to_string(), &unknown),
                 // Persist the SPEC-OWNED selection only (`next`), not the
                 // union with hand-added entries: `prev` must stay "what the
                 // spec last materialized" so hand additions remain
@@ -1813,6 +1962,7 @@ pub fn materialize_spec_selection(
                 // after the user typed them.
                 spec_enabled: Some(next),
                 spec_theme: None,
+                unsupported: false,
             }
         }
         SelectionModel::LoaderArrays { .. } | SelectionModel::EnabledDir { .. } => {
@@ -1836,7 +1986,7 @@ pub fn materialize_spec_selection(
                 Some(theme) => Some(theme.to_string()),
                 None => current_theme(record, &model),
             };
-            let (action, detail) = match model {
+            let (tree_changed, state) = match model {
                 SelectionModel::EnabledDir { .. } => {
                     // Reconcile the tree-side enabled/ entries first.
                     let mut tree_changed = false;
@@ -1851,50 +2001,24 @@ pub fn materialize_spec_selection(
                             tree_changed = true;
                         }
                     }
-                    let state = BlockState {
-                        theme: theme.clone(),
-                        arrays: BTreeSet::new(),
-                        array_items: Vec::new(),
-                        files: Vec::new(),
-                    };
-                    // Loader fidelity (defaults-as-floor §14.5/§14.6): a
-                    // DECLARED loader-manager source is active — OMB with no
-                    // OSH_THEME renders its own default theme, bash-it with an
-                    // empty enabled/ set still sources its framework. Disable
-                    // removes the declaration (and with it the block).
-                    // EXCEPT (niubash#168): the floor yields to a claimed
-                    // theme — a selection-less source never wins over a
-                    // theme claimed by another declared source; a block
-                    // already present stays (never silently flipped).
-                    let has_selection = !final_names.is_empty() || theme.is_some();
-                    let active = has_selection
-                        || !theme_claimed_elsewhere
-                        || managed_block_text(&record.id).is_some();
-                    let (block_action, detail) = apply_block(record, &model, &state, active)?;
-                    let action = if tree_changed
-                        || block_action == "activated"
-                        || block_action == "deactivated"
-                    {
-                        if final_names.is_empty() && theme.is_none() {
-                            "deactivated".to_string()
-                        } else {
-                            "activated".to_string()
-                        }
-                    } else {
-                        block_action
-                    };
-                    (action, detail)
+                    (
+                        tree_changed,
+                        BlockState {
+                            theme: theme.clone(),
+                            arrays: BTreeSet::new(),
+                            array_items: Vec::new(),
+                            files: Vec::new(),
+                        },
+                    )
                 }
                 _ => {
-                    // Start from the live parsed block so hand-added
+                    // Start from the live parsed section so hand-added
                     // entries (even ones niu cannot enumerate — the
                     // manager may still know them) keep their exact
                     // placement; then apply the spec's delta: drop what the
-                    // spec dropped, add what it declares. ALL of the id's
-                    // managed blocks seed the state (wt83 #175): with
-                    // duplicates present, bash executes every block, so
-                    // the union — not the first block — is what the user
-                    // actually runs.
+                    // spec dropped, add what it declares. The live state is
+                    // the generated loader's section (falling back to the
+                    // legacy rc blocks on pre-migration machines).
                     let mut state = managed_state(&record.id, &model, &record.id);
                     let dropped: Vec<String> = prev
                         .iter()
@@ -1938,22 +2062,31 @@ pub fn materialize_spec_selection(
                         }
                     }
                     state.theme = theme.clone();
-                    // Same loader-fidelity invariant as the EnabledDir arm:
-                    // declaration activates; empty arrays + no theme let the
-                    // manager apply its own defaults (OMB default theme).
-                    // And the same niubash#168 floor-yield: a selection-less
-                    // source does not resurrect its framework over a theme
-                    // claimed elsewhere; a present block stays.
-                    let has_selection = theme.is_some()
-                        || state.array_items.iter().any(|(_, items)| !items.is_empty());
-                    let active = has_selection
-                        || !theme_claimed_elsewhere
-                        || managed_block_text(&record.id).is_some();
-                    apply_block(record, &model, &state, active)?
+                    (false, state)
                 }
             };
-            SpecMaterialization {
-                action,
+            // Same loader-fidelity invariant as before (defaults-as-floor
+            // §14.5/§14.6): a DECLARED loader-manager source is active —
+            // OMB with no OSH_THEME renders its own default theme, bash-it
+            // with an empty enabled/ set still sources its framework.
+            // Disable removes the declaration (and with it the section).
+            // EXCEPT (niubash#168): the floor yields to a claimed theme —
+            // a selection-less source never wins over a theme claimed by
+            // another declared source; a present section stays (never
+            // silently flipped).
+            let has_selection = theme.is_some()
+                || !final_names.is_empty()
+                || state.array_items.iter().any(|(_, items)| !items.is_empty());
+            let active =
+                has_selection || !theme_claimed_elsewhere || live_block_present(&record.id);
+            let detail = if tree_changed {
+                "enabled/ entries reconciled; loader section from the manager's own selection"
+                    .to_string()
+            } else {
+                "selection materialized into the generated loader".to_string()
+            };
+            ComputedSelection {
+                section: active.then(|| render_block_body(record, &model, &state)),
                 detail: detail_with_unknown(detail, &unknown),
                 // `prev` = the spec-owned selection only (see the
                 // DirectFiles branch): hand-added entries must stay
@@ -1961,10 +2094,165 @@ pub fn materialize_spec_selection(
                 // sync after they were written.
                 spec_enabled: Some(next),
                 spec_theme: entry.theme.clone().filter(|theme| !theme.is_empty()),
+                unsupported: false,
             }
         }
     };
-    Ok(materialized)
+    Ok(computed)
+}
+
+/// Render + publish the loader generation from the computed selections
+/// (niubash#359; gate case 359.7): sections are keyed and sorted by id so
+/// identical manifest state renders byte-identical output; the previous
+/// generation survives a failed validation/publish unchanged
+/// (validate-then-atomic), and a byte-identical regeneration is a no-op.
+///
+/// `keep_current` names ids this pass SKIPPED (awaiting-trust, degraded,
+/// drifted, install failure): their current sections carry over verbatim,
+/// exactly as the rc materialization era left their blocks untouched on a
+/// skip. `drop_silent` names ids another pass already reported
+/// (sync's undeclared-source deactivation): their sections go without a
+/// duplicate row. Returns the per-id diff rows and whether a new
+/// generation was published.
+pub fn publish_loader_generation(
+    computed: &[(String, ComputedSelection)],
+    keep_current: &BTreeSet<String>,
+    drop_silent: &BTreeSet<String>,
+) -> anyhow::Result<(Vec<GenerationRow>, bool)> {
+    let current_text = super::loader::read_loader_text().unwrap_or_default();
+    let current: BTreeMap<String, String> = super::loader::parse_sections(&current_text)
+        .into_iter()
+        .map(|section| (section.id, section.body))
+        .collect();
+    let mut desired: BTreeMap<String, String> = BTreeMap::new();
+    for (id, selection) in computed {
+        if let Some(body) = &selection.section {
+            // Normalize the trailing newline: the renderer's body ends with
+            // one (the wrapper supplies the line break), the parser's
+            // section body does not — identical content must compare equal
+            // so an unchanged manifest stays byte-stable.
+            desired.insert(id.clone(), body.trim_end_matches('\n').to_string());
+        }
+    }
+    for id in keep_current {
+        if !desired.contains_key(id) {
+            if let Some(body) = current.get(id) {
+                desired.insert(id.clone(), body.clone());
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    for (id, selection) in computed {
+        if selection.unsupported {
+            rows.push(GenerationRow {
+                id: id.clone(),
+                action: "unsupported".to_string(),
+                detail: selection.detail.clone(),
+            });
+            continue;
+        }
+        let action = match (desired.get(id), current.get(id)) {
+            (Some(body), Some(current_body)) if body == current_body => "unchanged",
+            (Some(_), _) => "activated",
+            (None, Some(_)) => "deactivated",
+            (None, None) => "unchanged",
+        };
+        rows.push(GenerationRow {
+            id: id.clone(),
+            action: action.to_string(),
+            detail: selection.detail.clone(),
+        });
+    }
+    // Sections the current generation carries but neither this pass
+    // computed nor kept are stale (the source left the manifest entirely):
+    // the generation drops them, with a visible row — unless another pass
+    // already reported the drop (`drop_silent`).
+    for (id, _) in &current {
+        if !desired.contains_key(id)
+            && !computed.iter().any(|(existing, _)| existing == id)
+            && !keep_current.contains(id)
+            && !drop_silent.contains(id)
+        {
+            rows.push(GenerationRow {
+                id: id.clone(),
+                action: "deactivated".to_string(),
+                detail: "source left the manifest — loader section dropped".to_string(),
+            });
+        }
+    }
+    let sections: Vec<super::loader::LoaderSection> = desired
+        .into_iter()
+        .map(|(id, body)| super::loader::LoaderSection { id, body })
+        .collect();
+    // The double-execution record (design §2.3.3): this generation
+    // supersedes the managed marker pairs of every id it manages, plus
+    // everything a previous generation recorded (migrate-rc additions —
+    // the record must survive regeneration).
+    let mut superseded: BTreeSet<String> = BTreeSet::new();
+    for section in &sections {
+        superseded.insert(begin_marker(&section.id));
+        superseded.insert(end_marker(&section.id));
+    }
+    for marker in super::loader::recorded_superseded_markers(&current_text) {
+        superseded.insert(marker);
+    }
+    let rendered = super::loader::render_document(&sections, &superseded);
+    let published = super::loader::publish(&rendered)?;
+    Ok((rows, published))
+}
+
+/// Regenerate the loader generation from the manifest alone — no installs,
+/// no registry or spec writes (the migrate-rc half of the generator;
+/// design §4.1 step 2). Sources the spec declares but that cannot safely
+/// materialize (no registry record, untrusted, degraded, drifted) keep
+/// their current section exactly as a sync skip would.
+pub fn regenerate_loader_generation() -> anyhow::Result<bool> {
+    let Some(spec) = spec::load_spec()? else {
+        // No spec: nothing is declared, the generation is empty (the rc's
+        // legacy blocks keep executing until the user migrates).
+        return publish_loader_generation(&[], &BTreeSet::new(), &BTreeSet::new())
+            .map(|(_, published)| published);
+    };
+    let registry = read_source_registry();
+    let theme_claimed_elsewhere: Vec<bool> = spec
+        .sources
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            spec.sources.iter().enumerate().any(|(other, other_entry)| {
+                other != index
+                    && other_entry
+                        .theme
+                        .as_deref()
+                        .is_some_and(|theme| !theme.is_empty())
+            })
+        })
+        .collect();
+    let mut computed: Vec<(String, ComputedSelection)> = Vec::new();
+    let mut keep_current: BTreeSet<String> = BTreeSet::new();
+    for (index, entry) in spec.sources.iter().enumerate() {
+        let Some(record) = super::sync::record_for_entry(entry, &registry) else {
+            continue;
+        };
+        let claimed = theme_claimed_elsewhere.get(index).copied().unwrap_or(false);
+        let eligible = record.trusted
+            && record.path.is_dir()
+            && super::sources::verify_record(record)
+                .map(|report| report.verified)
+                .unwrap_or(false);
+        if !eligible {
+            keep_current.insert(record.id.clone());
+            continue;
+        }
+        match compute_spec_selection(record, entry, claimed) {
+            Ok(selection) => computed.push((record.id.clone(), selection)),
+            Err(_) => {
+                keep_current.insert(record.id.clone());
+            }
+        }
+    }
+    publish_loader_generation(&computed, &keep_current, &BTreeSet::new())
+        .map(|(_, published)| published)
 }
 
 /// Filter a name list against the known asset names; returns (known, unknown).
@@ -2001,10 +2289,21 @@ fn detail_with_unknown(detail: String, unknown: &[String]) -> String {
     }
 }
 
+// ── Retired rc writers (code-level rollback zone, design §4.3) ───────────────
+//
+// niubash#359 case A retired every verb's right to rewrite the user rc.
+// The functions below are the retired managed-block write machinery:
+// UNWIRED (no verb path reaches them — gate case 359.12's structure
+// ratchet pins that) but kept so a code-level rollback is a small diff:
+// restore the call sites and the managed-block behavior returns. They
+// must never be called from a verb; new code touches the generated
+// loader (`plugins::loader`) instead.
+
 /// Write (or drop) the managed block for a state; reports what happened.
 /// `active` says whether anything is activated at all (selection non-empty
 /// or a theme set) — a loader-only block still counts as active for
 /// models whose selection lives outside the rc (bash-it enabled/ entries).
+#[allow(dead_code)]
 fn apply_block(
     record: &SourceRecord,
     model: &SelectionModel,
@@ -2039,6 +2338,7 @@ fn apply_block(
 /// byte-identical fast path also falls through when the rc still carries
 /// moved-out guard debris (niubash#324): the block is in sync but the file
 /// around it is not, and the rewrite normalizes it.
+#[allow(dead_code)]
 fn write_block_report(
     record: &SourceRecord,
     rendered: &str,
@@ -2238,6 +2538,54 @@ mod tests {
         fs::read_to_string(spec::spec_path()).unwrap_or_default()
     }
 
+    /// The generated loader's text in the sandbox (the activation plane the
+    /// verbs publish since niubash#359).
+    fn loader_text() -> String {
+        super::super::loader::read_loader_text().unwrap_or_default()
+    }
+
+    /// The loader section body for one id (wrapper lines excluded).
+    fn loader_section(id: &str) -> String {
+        super::super::loader::parse_sections(&loader_text())
+            .into_iter()
+            .find(|section| section.id == id)
+            .map(|section| section.body)
+            .unwrap_or_default()
+    }
+
+    fn rc_bytes_snapshot() -> Option<Vec<u8>> {
+        fs::read(rc_file()).ok()
+    }
+
+    fn assert_rc_bytes_unchanged(before: &Option<Vec<u8>>) {
+        assert_eq!(
+            before.as_deref(),
+            fs::read(rc_file()).ok().as_deref(),
+            "the user rc must be byte-identical (niubash#359: no verb writes the rc)"
+        );
+    }
+
+    /// Seed a legacy managed block (the write-era shape) into the sandbox
+    /// rc — the only way a test creates one now, exactly as an old niu
+    /// version would have left it.
+    fn seed_legacy_block(id: &str, body: &str) {
+        let mut text = rc_text();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&super::begin_marker_for(id));
+        text.push('\n');
+        text.push_str(body.trim_end_matches('\n'));
+        text.push('\n');
+        text.push_str(&super::end_marker_for(id));
+        text.push('\n');
+        fs::write(rc_file(), text).unwrap();
+    }
+
+    /// The write-era canonical body of an oh-my-bash managed block (what an
+    /// old niu rendered between the markers) for legacy-rc seeding.
+    const OMB_BLOCK: &str = "OSH_THEME='robbyrussell'\nplugins=('git')\n. \"$OSH/oh-my-bash.sh\"";
+
     #[test]
     fn stray_theme_scan_sees_only_lines_outside_managed_blocks() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2274,15 +2622,21 @@ mod tests {
         assert!(rc_text().is_empty(), "no rc written on refusal");
         trust("oh-my-bash");
 
-        // Asset-level sugar: each enable writes the spec entry, sync
-        // materializes the manager's own rc arrays.
+        // Asset-level sugar: each enable edits the spec entry, sync
+        // publishes the generated loader (niubash#359: the rc is never
+        // written).
         enable("git").expect("plugin enable");
         enable("cargo").expect("alias enable");
         enable("agnoster").expect("theme enable");
-        let rc = rc_text();
-        assert!(rc.contains("OSH_THEME='agnoster'"), "{rc}");
-        assert!(rc.contains("plugins=('git')"), "{rc}");
-        assert!(rc.contains("aliases=('cargo')"), "{rc}");
+        let loader = loader_text();
+        assert!(loader.contains("OSH_THEME='agnoster'"), "{loader}");
+        assert!(loader.contains("plugins=('git')"), "{loader}");
+        assert!(loader.contains("aliases=('cargo')"), "{loader}");
+        assert!(
+            !rc_text().contains("OSH_THEME"),
+            "no rc was ever written: {}",
+            rc_text()
+        );
         let spec = spec_text();
         assert!(spec.contains("target = '"), "{spec}");
         assert!(spec.contains("'git'"), "{spec}");
@@ -2309,10 +2663,10 @@ mod tests {
 
         // Disables reverse each piece through the spec.
         disable("git").expect("plugin disable");
-        let rc = rc_text();
-        assert!(!rc.contains("plugins=('git')"), "{rc}");
+        let loader = loader_text();
+        assert!(!loader.contains("plugins=('git')"), "{loader}");
         disable("agnoster").expect("theme disable");
-        assert!(!rc_text().contains("OSH_THEME="), "{}", rc_text());
+        assert!(!loader_text().contains("OSH_THEME="), "{}", loader_text());
 
         let err = enable("nope").expect_err("unknown target");
         assert!(
@@ -2320,11 +2674,15 @@ mod tests {
             "{err}"
         );
 
-        // Source disable removes the declaration and the block, keeps the tree.
+        // Source disable removes the declaration and the loader section,
+        // keeps the tree (and never touches the rc).
         enable("git").unwrap();
         disable("oh-my-bash").expect("source disable");
-        let rc = rc_text();
-        assert!(!rc.contains(">>> niu source oh-my-bash"), "{rc}");
+        let loader = loader_text();
+        assert!(
+            !loader.contains("niu plugin source: oh-my-bash"),
+            "{loader}"
+        );
         assert!(!spec_text().contains("target ="), "{}", spec_text());
         assert!(
             box_.temp.join("sources/oh-my-bash/oh-my-bash.sh").is_file(),
@@ -2370,9 +2728,13 @@ mod tests {
         // (the qualified enable), then the undo receipt runs the bare-name
         // disable from the finish screen.
         enable("oh-my-bash/agnoster").expect("qualified theme enable");
-        assert!(rc_text().contains("OSH_THEME='agnoster'"), "{}", rc_text());
+        assert!(
+            loader_text().contains("OSH_THEME='agnoster'"),
+            "{}",
+            loader_text()
+        );
         disable("agnoster").expect("bare-name disable resolves to the claim owner");
-        assert!(!rc_text().contains("OSH_THEME="), "{}", rc_text());
+        assert!(!loader_text().contains("OSH_THEME="), "{}", loader_text());
         let spec = spec_text();
         assert!(
             spec.contains("theme = ''"),
@@ -2392,7 +2754,7 @@ mod tests {
     }
 
     #[test]
-    fn rc_lines_outside_the_managed_block_survive_edits() {
+    fn rc_lines_survive_verbs_because_nothing_writes_the_rc() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let origin = unique_temp_dir("omb-user-rc");
         write_omb_fixture(&origin);
@@ -2400,22 +2762,25 @@ mod tests {
         install(&origin);
         trust("oh-my-bash");
 
-        // A user-written rc keeps its content through enable/disable.
+        // A user-written rc keeps its content through enable/disable --
+        // byte-identically (niubash#359: no verb writes the rc; the
+        // selection lands in the generated loader instead).
         fs::write(
             rc_file(),
             "# my stuff\nexport MY_VAR=1\nalias ll='ls -la'\n",
         )
         .unwrap();
+        let before = rc_bytes_snapshot();
         enable("git").unwrap();
-        let rc = rc_text();
-        assert!(rc.contains("# my stuff"), "{rc}");
-        assert!(rc.contains("export MY_VAR=1"), "{rc}");
-        assert!(rc.contains("alias ll='ls -la'"), "{rc}");
+        assert_rc_bytes_unchanged(&before);
+        assert!(
+            loader_text().contains("plugins=('git')"),
+            "{}",
+            loader_text()
+        );
         disable("git").unwrap();
-        let rc = rc_text();
-        assert!(rc.contains("# my stuff"), "{rc}");
-        assert!(rc.contains("export MY_VAR=1"), "{rc}");
-        assert!(!rc.contains("plugins="), "{rc}");
+        assert_rc_bytes_unchanged(&before);
+        assert!(!loader_text().contains("plugins="), "{}", loader_text());
         let _ = fs::remove_dir_all(&origin);
         let _ = fs::remove_dir_all(&box_.temp);
     }
@@ -2434,12 +2799,16 @@ mod tests {
             .temp
             .join("sources/bash-it/enabled/350---base.plugin.bash");
         assert!(entry.is_file(), "enabled/ entry with declared priority");
-        let rc = rc_text();
-        assert!(rc.contains("BASH_IT="), "{rc}");
-        assert!(rc.contains(". \"$BASH_IT/bash_it.sh\""), "{rc}");
+        let loader = loader_section("bash-it");
+        assert!(loader.contains("BASH_IT="), "{loader}");
+        assert!(loader.contains(". \"$BASH_IT/bash_it.sh\""), "{loader}");
 
         enable("demox").expect("theme enable");
-        assert!(rc_text().contains("BASH_IT_THEME='demox'"), "{}", rc_text());
+        assert!(
+            loader_section("bash-it").contains("BASH_IT_THEME='demox'"),
+            "{}",
+            loader_text()
+        );
 
         // Completion from the completion/available dir.
         enable("docker").expect("completion enable");
@@ -2470,8 +2839,8 @@ mod tests {
         trust("bash-completion");
 
         enable("bash-completion").expect("whole-source enable");
-        let rc = rc_text();
-        assert!(rc.contains(". \"${NIU_PLUGIN_SOURCES_ROOT:-$HOME/.niubash/sources}/bash-completion/bash_completion\""), "{rc}");
+        let loader = loader_section("bash-completion");
+        assert!(loader.contains(". \"${NIU_PLUGIN_SOURCES_ROOT:-$HOME/.niubash/sources}/bash-completion/bash_completion\""), "{loader}");
         assert!(spec_text().contains("bash-completion"), "{}", spec_text());
         // Individual completions are informational only.
         let err = enable("git").expect_err("asset enable must explain");
@@ -2532,29 +2901,29 @@ mod tests {
         let err = enable(&record.id).expect_err("no unique entry for wild sources");
         assert!(err.to_string().contains("pick one"), "{err}");
         assert!(err.to_string().contains("spark.bash"), "{err}");
-        assert!(rc_text().is_empty(), "nothing sourced yet");
+        assert!(loader_text().is_empty(), "nothing sourced yet");
 
-        // Per-file enable writes one guarded source line.
+        // Per-file enable publishes one guarded source line in the loader.
         enable("spark.bash").expect("file enable");
-        let rc = rc_text();
+        let loader = loader_section(&record.id);
         assert!(
-            rc.contains(&format!(
+            loader.contains(&format!(
                 "if [ -f \"${{NIU_PLUGIN_SOURCES_ROOT:-$HOME/.niubash/sources}}/{}/spark.bash\" ]; then",
                 record.id
             )),
-            "{rc}"
+            "{loader}"
         );
         assert!(
-            rc.contains(&format!(
+            loader.contains(&format!(
                 "  . \"${{NIU_PLUGIN_SOURCES_ROOT:-$HOME/.niubash/sources}}/{}/spark.bash\"",
                 record.id
             )),
-            "{rc}"
+            "{loader}"
         );
 
-        // Disable drops the line (and the block with it).
+        // Disable drops the line (and the section with it).
         disable("spark.bash").expect("file disable");
-        assert!(!rc_text().contains("spark.bash"), "{}", rc_text());
+        assert!(!loader_text().contains("spark.bash"), "{}", loader_text());
         let _ = fs::remove_dir_all(&holder);
         let _ = fs::remove_dir_all(&box_.temp);
     }
@@ -2578,7 +2947,11 @@ mod tests {
         assert!(err.to_string().contains("oh-my-bash/git"), "{err}");
 
         enable("oh-my-bash/git").expect("qualified enable");
-        assert!(rc_text().contains("plugins=('git')"), "{}", rc_text());
+        assert!(
+            loader_text().contains("plugins=('git')"),
+            "{}",
+            loader_text()
+        );
         let _ = fs::remove_dir_all(&omb);
         let _ = fs::remove_dir_all(&bc);
         let _ = fs::remove_dir_all(&box_.temp);
@@ -2609,27 +2982,32 @@ mod tests {
         trust("oh-my-bash");
         trust("bash-it");
 
-        // Pick demox from oh-my-bash: OSH block carries it, spec claims it.
+        // Pick demox from oh-my-bash: the loader carries it, the spec
+        // claims it, and the rc is untouched (niubash#359).
         enable("oh-my-bash/demox").expect("omb pick");
-        let rc = rc_text();
-        assert!(rc.contains("OSH_THEME='demox'"), "{rc}");
+        let loader = loader_text();
+        assert!(loader.contains("OSH_THEME='demox'"), "{loader}");
         assert!(spec_text().contains("id = 'oh-my-bash'"), "{}", spec_text());
         assert!(spec_text().contains("theme = 'demox'"), "{}", spec_text());
-        let picked_rc = rc_text();
+        let picked_loader = loader_text();
 
-        // A plain sync is a no-op (byte-stable).
+        // A plain sync is a no-op (byte-stable generation).
         super::super::sync::sync_spec(super::super::sync::SyncOptions::default()).unwrap();
-        assert_eq!(rc_text(), picked_rc, "sync must keep the picked theme");
+        assert_eq!(
+            loader_text(),
+            picked_loader,
+            "sync must keep the picked theme"
+        );
 
-        // Re-pick demox from bash-it: the claim MOVES — the OSH theme line
+        // Re-pick demox from bash-it: the claim MOVES -- the OSH theme line
         // goes (the theme-only omb declaration follows it), the bash-it
-        // block carries the theme, and the spec names bash-it as the owner.
+        // section carries the theme, and the spec names bash-it as owner.
         enable("bash-it/demox").expect("bash-it pick");
-        let rc = rc_text();
-        assert!(rc.contains("BASH_IT_THEME='demox'"), "{rc}");
+        let loader = loader_text();
+        assert!(loader.contains("BASH_IT_THEME='demox'"), "{loader}");
         assert!(
-            !rc.contains("OSH_THEME"),
-            "the losing framework's theme block must go: {rc}"
+            !loader.contains("OSH_THEME"),
+            "the losing framework's theme section must go: {loader}"
         );
         let spec = spec_text();
         assert!(spec.contains("id = 'bash-it'"), "{spec}");
@@ -2637,19 +3015,19 @@ mod tests {
             !spec.contains("id = 'oh-my-bash'"),
             "the theme-only loser declaration is gone: {spec}"
         );
-        let moved_rc = rc_text();
+        let moved_loader = loader_text();
         super::super::sync::sync_spec(super::super::sync::SyncOptions::default()).unwrap();
         assert_eq!(
-            rc_text(),
-            moved_rc,
+            loader_text(),
+            moved_loader,
             "byte-stable across syncs after the move"
         );
 
         // And back again.
         enable("oh-my-bash/demox").expect("omb re-pick");
-        let rc = rc_text();
-        assert!(rc.contains("OSH_THEME='demox'"), "{rc}");
-        assert!(!rc.contains("BASH_IT_THEME"), "{rc}");
+        let loader = loader_text();
+        assert!(loader.contains("OSH_THEME='demox'"), "{loader}");
+        assert!(!loader.contains("BASH_IT_THEME"), "{loader}");
 
         let _ = fs::remove_dir_all(&omb);
         let _ = fs::remove_dir_all(&bit);
@@ -2690,8 +3068,12 @@ mod tests {
     /// restore) must fail enable/disable HONESTLY (wt83 #175): the verbs
     /// exit with the writer's reason and the rc is left untouched — never
     /// a success print over an rc that was not written.
+    /// A legacy rc whose managed block lost its end marker (hand edit,
+    /// partial restore) no longer BLOCKS anything (niubash#359: the verbs
+    /// never parse or rewrite the rc), and the scan reports the malformed
+    /// span so the doctor/migrate-rc can name it. The rc stays untouched.
     #[test]
-    fn malformed_block_fails_enable_and_disable_honestly() {
+    fn malformed_legacy_block_does_not_block_verbs_and_is_reported() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let origin = unique_temp_dir("malformed-origin");
         write_omb_fixture(&origin);
@@ -2700,26 +3082,45 @@ mod tests {
         trust("oh-my-bash");
 
         enable("git").expect("clean enable first");
-        // Corrupt: drop the end marker line.
+        // Seed the write-era block, then corrupt it: drop the end marker
+        // line (a partial hand edit an old rc could carry).
+        seed_legacy_block(
+            "oh-my-bash",
+            "OSH_THEME='robbyrussell'\n. \"$OSH/oh-my-bash.sh\"\n",
+        );
         let rc = rc_text();
         let end = "# <<< niu source oh-my-bash <<<\n";
         assert!(rc.contains(end), "{rc}");
         let broken = rc.replace(end, "");
         fs::write(rc_file(), &broken).unwrap();
-        let broken = rc_text();
+        let broken_bytes = fs::read(rc_file()).unwrap();
 
-        let err = disable("git").expect_err("disable must not print success over a failed write");
-        assert!(err.to_string().contains("no end marker"), "{err}");
-        assert!(
-            err.to_string()
-                .contains("rc update for 'oh-my-bash' failed"),
-            "{err}"
+        // The verbs do not parse the rc: they publish the loader and leave
+        // the malformed block exactly where the user left it.
+        disable("git").expect("disable succeeds (the rc is not the write target)");
+        enable("agnoster").expect("enable succeeds the same way");
+        assert_eq!(
+            fs::read(rc_file()).unwrap(),
+            broken_bytes,
+            "the rc is untouched by the verbs"
         );
-        assert_eq!(rc_text(), broken, "the rc is untouched by the failed verb");
+        assert!(
+            !loader_text().contains("plugins=('git')"),
+            "the disable landed in the loader: {}",
+            loader_text()
+        );
+        assert!(
+            loader_text().contains("OSH_THEME='agnoster'"),
+            "{}",
+            loader_text()
+        );
 
-        let err = enable("agnoster").expect_err("enable must fail the same way");
-        assert!(err.to_string().contains("no end marker"), "{err}");
-        assert_eq!(rc_text(), broken, "the rc is untouched by the failed verb");
+        // The scan reports the malformed span honestly.
+        let blocks = super::super::loader::scan_legacy_blocks(&rc_text()).unwrap();
+        assert!(
+            blocks.iter().any(|b| b.id == "oh-my-bash" && b.end_missing),
+            "{blocks:?}"
+        );
 
         let _ = fs::remove_dir_all(&origin);
         let _ = fs::remove_dir_all(&box_.temp);
@@ -2729,49 +3130,64 @@ mod tests {
     /// sync must not call the file "in sync" — it reports the anomaly and
     /// collapses the duplicates into one canonical block — and a source
     /// disable removes EVERY matching pair, leaving zero residue (wt83 #175).
+    /// Duplicate legacy blocks (whole-file backup-restore concatenation)
+    /// are the USER's file state: no verb collapses or removes them anymore
+    /// (niubash#359), the loader generation ignores them, and the scan
+    /// reports every span so migrate-rc can name them for hand removal.
     #[test]
-    fn duplicate_blocks_are_reported_by_sync_and_fully_removed_by_disable() {
+    fn duplicate_legacy_blocks_are_reported_and_left_to_the_user() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let origin = unique_temp_dir("dup-origin");
         write_omb_fixture(&origin);
         let box_ = sandbox("duplicate");
         install(&origin);
         trust("oh-my-bash");
-        enable("git").expect("clean enable first");
-        let one = rc_text();
+        enable("git").expect("loader published first");
+        let _ = loader_text();
 
-        // Duplicate the whole rc onto itself.
+        // Seed the write-era block, then duplicate the whole rc onto itself.
+        seed_legacy_block("oh-my-bash", &OMB_BLOCK);
+        let one = rc_text();
         fs::write(rc_file(), format!("{one}{one}")).unwrap();
         let count = |needle: &str| rc_text().matches(needle).count();
-        assert_eq!(count(">>> niu source oh-my-bash"), 2, "{:?}", rc_text());
+        assert_eq!(count(">>> niu source oh-my-bash"), 2, "{}", rc_text());
+        let duplicated = fs::read(rc_file()).unwrap();
 
-        // Sync reports the anomaly (a `merged` row, so the report is not
-        // "clean") and repairs to one canonical block.
+        // Sync does not repair the file: the rc is untouched, the loader
+        // generation is the (unchanged) activation plane.
         let report = super::super::sync::sync_spec(super::super::sync::SyncOptions::default())
             .expect("sync runs");
         assert!(
-            report.rows.iter().any(|row| row.id == "oh-my-bash"
-                && row.action == "merged"
-                && row.detail.contains("duplicate managed blocks")),
+            !report.rows.iter().any(|row| row.action == "failed"),
             "{:?}",
             report.rows
         );
-        assert_eq!(count(">>> niu source oh-my-bash"), 1, "{}", rc_text());
-        assert!(rc_text().contains("plugins=('git')"), "{}", rc_text());
-
-        // Duplicate again, then disable the source: zero residue.
-        let one = rc_text();
-        fs::write(rc_file(), format!("{one}{one}")).unwrap();
-        assert_eq!(count(">>> niu source oh-my-bash"), 2);
-        disable("oh-my-bash").expect("source disable removes every block");
-        assert_eq!(count(">>> niu source oh-my-bash"), 0, "{}", rc_text());
-        assert_eq!(count("<<< niu source oh-my-bash"), 0, "{}", rc_text());
-        assert!(!rc_text().contains("oh-my-bash.sh"), "{}", rc_text());
+        assert_eq!(fs::read(rc_file()).unwrap(), duplicated, "no rc rewrite");
         assert!(
-            !spec_text().contains("target ="),
-            "the declaration is gone: {}",
-            spec_text()
+            loader_text().contains("plugins=('git')"),
+            "{}",
+            loader_text()
         );
+
+        // The scan reports BOTH spans with their line ranges.
+        let blocks = super::super::loader::scan_legacy_blocks(&rc_text()).unwrap();
+        let spans: Vec<(usize, usize)> = blocks
+            .iter()
+            .filter(|b| b.id == "oh-my-bash")
+            .map(|b| (b.start_line, b.end_line))
+            .collect();
+        assert_eq!(spans.len(), 2, "{blocks:?}");
+        assert!(spans[0].1 < spans[1].0, "disjoint spans: {blocks:?}");
+
+        // Disabling the source drops the LOADER section; the rc keeps its
+        // duplicated blocks (removal stays the user's edit).
+        disable("oh-my-bash").expect("source disable");
+        assert!(
+            !loader_text().contains("niu plugin source: oh-my-bash"),
+            "{}",
+            loader_text()
+        );
+        assert_eq!(fs::read(rc_file()).unwrap(), duplicated, "still no rewrite");
 
         let _ = fs::remove_dir_all(&origin);
         let _ = fs::remove_dir_all(&box_.temp);
@@ -2780,8 +3196,11 @@ mod tests {
     /// niubash#176 (CRLF): a rc the user maintains with CRLF endings stays
     /// CRLF through a managed-block rewrite — no whole-file flattening to
     /// LF, and byte-identical rewrites do not churn the file at all.
+    /// niubash#176 (CRLF) under the read-only regime: a rc the user
+    /// maintains with CRLF endings is never rewritten at all, so its line
+    /// endings survive trivially -- and the loader carries the selection.
     #[test]
-    fn crlf_rc_keeps_its_line_endings_through_block_writes() {
+    fn crlf_rc_is_never_touched_by_verbs() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let holder = unique_temp_dir("crlf-holder");
         let origin = holder.join("oh-my-fixture");
@@ -2792,18 +3211,30 @@ mod tests {
 
         install(&origin);
         trust("oh-my-bash");
-        enable("git").expect("enable writes the managed block");
+        enable("git").expect("enable publishes the loader");
 
         let text = rc_text();
         assert!(text.contains("alias ll='ls -l'"), "{text:?}");
-        assert!(text.contains("plugins=('git')"), "{text:?}");
+        assert!(!text.contains("plugins="), "no rc write happened: {text:?}");
         let stray_lf = text.replace("\r\n", "").contains('\n');
         assert!(!stray_lf, "every line stays CRLF: {text:?}");
+        assert!(
+            loader_section("oh-my-bash").contains("plugins=('git')"),
+            "{}",
+            loader_text()
+        );
 
-        // An unchanged second materialization is a byte-stable no-op.
+        // A repeated enable is a no-op for the rc and byte-stable for the
+        // loader.
         let before = fs::read(rc_file()).unwrap();
+        let loader_before = fs::read(super::super::loader::loader_path()).unwrap();
         enable("git").expect("second enable");
         assert_eq!(fs::read(rc_file()).unwrap(), before, "no churn");
+        assert_eq!(
+            fs::read(super::super::loader::loader_path()).unwrap(),
+            loader_before,
+            "byte-stable generation"
+        );
 
         let _ = fs::remove_dir_all(&holder);
         let _ = fs::remove_dir_all(&box_.temp);
@@ -2812,8 +3243,13 @@ mod tests {
     /// niubash#176 (silent drop): a user line hand-written INSIDE a managed
     /// block is migrated out (right below it, under a marker comment) when
     /// the block is rewritten — never silently discarded.
+    /// niubash#176 (silent drop), read-only edition: a user line
+    /// hand-written INSIDE a legacy managed block stays exactly where the
+    /// user put it -- no verb rewrites the rc, so nothing can drop or move
+    /// it. The scan still sees the block; migrate-rc's guidance tells the
+    /// user what to keep when THEY remove it.
     #[test]
-    fn user_lines_inside_a_managed_block_migrate_out() {
+    fn user_lines_inside_a_legacy_block_stay_untouched() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let holder = unique_temp_dir("migrate-holder");
         let origin = holder.join("oh-my-fixture");
@@ -2822,39 +3258,31 @@ mod tests {
         let box_ = sandbox("migrate");
         install(&origin);
         trust("oh-my-bash");
-        enable("git").expect("clean enable first");
+        enable("git").expect("loader published first");
 
-        // The user hand-writes a line inside the managed block.
-        let hijacked = rc_text().replacen(
-            "# <<< niu source oh-my-bash <<<",
-            "alias hh='history'\n# <<< niu source oh-my-bash <<<",
-            1,
+        // The user hand-writes a line inside the legacy block.
+        seed_legacy_block(
+            "oh-my-bash",
+            "plugins=('git')\nalias hh='history'\n. \"$OSH/oh-my-bash.sh\"",
         );
-        fs::write(rc_file(), &hijacked).unwrap();
+        let seeded = fs::read(rc_file()).unwrap();
 
-        // A selection change rewrites the block; the alias survives outside
-        // while the spec-dropped plugins line is dropped, not migrated.
-        enable("cargo").expect("enable rewrites the block");
+        // A selection change touches the loader only; the alias survives
+        // inside the block, byte for byte.
+        enable("cargo").expect("enable publishes the loader");
         let text = rc_text();
+        assert_eq!(fs::read(rc_file()).unwrap(), seeded, "rc untouched");
         assert!(text.contains("alias hh='history'"), "kept: {text}");
-        assert!(text.contains(MIGRATED_USER_LINES_HEADER), "{text}");
-        let begin = text.find(">>> niu source oh-my-bash").unwrap();
-        let end = text.find("<<< niu source oh-my-bash").unwrap();
-        let alias = text.find("alias hh='history'").unwrap();
         assert!(
-            alias > end && alias > begin,
-            "the alias moved OUT of the managed block: {text}"
+            loader_section("oh-my-bash").contains("aliases=('cargo')"),
+            "{}",
+            loader_text()
         );
-        assert!(text.contains("aliases=('cargo')"), "{text}");
         assert!(
-            text.contains("plugins=('git')"),
-            "the enable is additive; the managed line stays managed: {text}"
+            loader_section("oh-my-bash").contains("plugins=('git')"),
+            "the enable is additive; the managed line stays managed: {}",
+            loader_text()
         );
-
-        // The healed rc is stable: another rewrite does not re-migrate.
-        let before = rc_text();
-        enable("cargo").expect("second enable");
-        assert_eq!(rc_text(), before, "byte-stable after migration");
 
         let _ = fs::remove_dir_all(&holder);
         let _ = fs::remove_dir_all(&box_.temp);
@@ -2863,8 +3291,12 @@ mod tests {
     /// niubash#176 (near markers): a hand-edited marker block (missing a
     /// `>` / `<`) is repaired into the exact managed form — a fresh exact
     /// block is appended BESIDE it, never duplicating the loader.
+    /// niubash#176 (near markers), read-only edition: a hand-edited marker
+    /// block (missing a `>`) is never repaired in place anymore -- the rc
+    /// keeps the user's bytes -- and the scan still recognizes the near
+    /// shape so the double-execution guard and migrate-rc see it.
     #[test]
-    fn near_marker_block_is_repaired_not_duplicated() {
+    fn near_marker_legacy_block_is_reported_never_repaired() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let holder = unique_temp_dir("near-holder");
         let origin = holder.join("oh-my-fixture");
@@ -2873,44 +3305,41 @@ mod tests {
         let box_ = sandbox("near");
         install(&origin);
         trust("oh-my-bash");
-        enable("git").expect("clean enable first");
+        enable("git").expect("loader published first");
 
-        // Mangle the begin marker (drop one bracket); the end stays exact.
-        let mangled =
-            rc_text().replace("# >>> niu source oh-my-bash", "# >> niu source oh-my-bash");
-        fs::write(rc_file(), &mangled).unwrap();
+        // Seed a block whose begin marker lost one bracket; the end stays
+        // exact (the write-era near-marker shape).
+        let mut text = rc_text();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("# >> niu source oh-my-bash >>>\n");
+        text.push_str(OMB_BLOCK);
+        text.push('\n');
+        text.push_str("# <<< niu source oh-my-bash <<<\n");
+        fs::write(rc_file(), &text).unwrap();
+        let seeded = fs::read(rc_file()).unwrap();
         let count = |needle: &str| rc_text().matches(needle).count();
-        assert_eq!(
-            count("# >>> niu source oh-my-bash"),
-            0,
-            "mangled: {}",
-            rc_text()
-        );
         assert_eq!(count("# >> niu source oh-my-bash"), 1);
 
-        // A rewrite consumes the near-marker span; exactly one block remains.
+        // A rewrite consumes nothing: the near-marker span stays as-is.
         enable("cargo").expect("enable after the hand edit");
-        let text = rc_text();
-        assert_eq!(
-            count("# >>> niu source oh-my-bash"),
-            1,
-            "one exact begin: {text}"
-        );
-        assert_eq!(
-            count("# >> niu source oh-my-bash"),
-            0,
-            "the near-marker form is gone: {text}"
-        );
+        assert_eq!(fs::read(rc_file()).unwrap(), seeded, "no rc rewrite");
+        assert_eq!(count("# >> niu source oh-my-bash"), 1);
+        assert_eq!(count("# >>> niu source oh-my-bash"), 0);
         assert!(
-            text.contains("# >>> niu source oh-my-bash (managed"),
-            "exact markers restored: {text}"
+            loader_section("oh-my-bash").contains("aliases=('cargo')"),
+            "{}",
+            loader_text()
         );
-        assert!(text.contains("aliases=('cargo')"), "{text}");
+
+        // The scan reports the near span (exact = false).
+        let blocks = super::super::loader::scan_legacy_blocks(&rc_text()).unwrap();
         assert!(
-            !text
-                .lines()
-                .any(|line| line.trim() == "# >> niu source oh-my-bash >>>"),
-            "near marker gone: {text}"
+            blocks
+                .iter()
+                .any(|b| b.id == "oh-my-bash" && !b.exact && !b.end_missing),
+            "{blocks:?}"
         );
 
         let _ = fs::remove_dir_all(&holder);
@@ -2920,8 +3349,12 @@ mod tests {
     /// niubash#176 (backups): every plugin-verb rc rewrite backs the rc up
     /// into the wizard's backups dir, and the backup set is pruned to the
     /// most recent RC_BACKUP_KEEP files (the wizard era never cleaned up).
+    /// niubash#176 (backups), read-only edition: plugin verbs no longer
+    /// rewrite the rc, so they no longer create backups either -- and they
+    /// leave an existing backup set (including stale ones) exactly as the
+    /// user kept it.
     #[test]
-    fn plugin_verbs_backup_the_rc_and_prune_old_backups() {
+    fn plugin_verbs_never_touch_the_rc_or_its_backups() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let holder = unique_temp_dir("backup-holder");
         let origin = holder.join("oh-my-fixture");
@@ -2930,46 +3363,8 @@ mod tests {
         let box_ = sandbox("backup");
         fs::write(rc_file(), "alias ll='ls -l'\n").unwrap();
         let backup_dir = rc_backup_dir().unwrap();
-
-        let backup_count = || {
-            fs::read_dir(&backup_dir)
-                .map(|entries| {
-                    entries
-                        .filter_map(Result::ok)
-                        .filter(|entry| {
-                            entry
-                                .file_name()
-                                .to_str()
-                                .is_some_and(|name| name.ends_with(".bak"))
-                        })
-                        .count()
-                })
-                .unwrap_or(0)
-        };
-        assert_eq!(backup_count(), 0, "no backup before the first write");
-
-        install(&origin);
-        trust("oh-my-bash");
-        enable("git").expect("first write");
-        assert_eq!(backup_count(), 1, "the rewrite backed the rc up");
-        let first_backup = fs::read_dir(&backup_dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .find(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.ends_with(".bak"))
-            })
-            .unwrap();
-        let backed_up = fs::read_to_string(first_backup.path()).unwrap();
-        assert!(
-            backed_up.contains("alias ll='ls -l'") && !backed_up.contains("niu source"),
-            "the backup is the PRE-write rc: {backed_up}"
-        );
-
-        // Age 12 fake backups in, then rewrite again: the set is pruned to
-        // RC_BACKUP_KEEP (the fresh backup displaces the stale ones).
+        // A stale backup set from the write era.
+        fs::create_dir_all(&backup_dir).unwrap();
         let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
         for index in 0..12 {
             let path = backup_dir.join(format!(".niubashrc.stale-{index}.bak"));
@@ -2977,11 +3372,38 @@ mod tests {
             let file = fs::File::options().write(true).open(&path).unwrap();
             file.set_modified(stale).unwrap();
         }
-        enable("cargo").expect("second write");
+        let backup_names = || {
+            let mut names: Vec<String> = fs::read_dir(&backup_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.ends_with(".bak"))
+                })
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = backup_names();
+
+        install(&origin);
+        trust("oh-my-bash");
+        enable("git").expect("loader publish");
+        enable("cargo").expect("second loader publish");
+        disable("git").expect("disable");
+
+        assert_eq!(
+            backup_names(),
+            before,
+            "the backup set is untouched: no new backup, no pruning"
+        );
         assert!(
-            backup_count() <= RC_BACKUP_KEEP,
-            "pruned to {RC_BACKUP_KEEP}: {}",
-            backup_count()
+            loader_text().contains("aliases=('cargo')"),
+            "the verbs still worked: {}",
+            loader_text()
         );
 
         let _ = fs::remove_dir_all(&holder);
@@ -3100,18 +3522,27 @@ mod tests {
     /// exactly one complete guard, inside the managed block, zero
     /// moved-out sections, if/fi balanced file-wide — and then hold that
     /// state byte-stably across further verb rounds.
+    /// THE niubash#324 repro, read-only edition (gate case 359.6): after
+    /// the canonical oh-my-bash block, SIX consecutive copies of the
+    /// moved-out header + guard fragment, only the last carrying its `fi`
+    /// -- five dangling `if`s, a syntax error at every startup. The write
+    /// era CONVERGED this file on every verb; the read-only era PRESERVES
+    /// it: every plugin verb round leaves the corrupt bytes identical,
+    /// fixes nothing, worsens nothing -- the repair is the user's
+    /// (migrate-rc reports; the doctor names the debris).
     #[test]
-    fn corrupt_owner_rc_converges_to_one_in_block_guard_on_plugin_ops() {
+    fn corrupt_owner_rc_is_preserved_byte_identically_through_plugin_ops() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let origin = unique_temp_dir("i324-origin");
         write_omb_fixture(&origin);
         let box_ = sandbox("i324-converge");
         install(&origin);
         trust("oh-my-bash");
-        enable("git").expect("canonical block first");
+        enable("git").expect("loader generation first");
 
-        // The corrupt fixture: managed block + 5 fi-less fragments + the
+        // The corrupt fixture: write-era block + 5 fi-less fragments + the
         // final complete copy (issue #324's exact shape).
+        seed_legacy_block("oh-my-bash", &OMB_BLOCK);
         let base = rc_text().trim_end().to_string();
         let mut corrupt = base.clone();
         for with_fi in [false, false, false, false, false, true] {
@@ -3121,12 +3552,14 @@ mod tests {
             corrupt.push_str(&moved_out_guard("oh-my-bash", with_fi));
         }
         fs::write(rc_file(), &corrupt).unwrap();
+        let corrupt_bytes = fs::read(rc_file()).unwrap();
         let count = |needle: &str| rc_text().matches(needle).count();
         assert_eq!(count("moved out of a managed block"), 6, "{}", rc_text());
         let (opens, closes) = if_fi_balance(&rc_text());
         assert_eq!(opens - closes, 5, "five dangling ifs seeded: {}", rc_text());
 
-        // Six rounds of the plugin verbs, sync/enable/disable alternating.
+        // Six rounds of the plugin verbs, sync/enable/disable alternating:
+        // the rc stays byte-identical through every round.
         for _round in 0..6 {
             super::super::sync::sync_spec(super::super::sync::SyncOptions::default())
                 .expect("sync");
@@ -3134,48 +3567,42 @@ mod tests {
             enable("git").expect("asset enable");
             disable("oh-my-bash").expect("source disable");
             enable("oh-my-bash").expect("source enable");
+            assert_eq!(
+                fs::read(rc_file()).unwrap(),
+                corrupt_bytes,
+                "the corrupt rc is preserved through the verb round"
+            );
         }
         super::super::sync::sync_spec(super::super::sync::SyncOptions::default())
             .expect("final sync");
+        assert_eq!(
+            fs::read(rc_file()).unwrap(),
+            corrupt_bytes,
+            "the corrupt rc is preserved by sync"
+        );
 
-        let text = rc_text();
+        // The loader is still the working activation plane (the
+        // double-execution guard keeps it off while the legacy markers
+        // remain -- that is the correct transitional state).
+        assert!(
+            loader_section("oh-my-bash").contains("plugins=('git')"),
+            "the loader generation carries the selection: {}",
+            loader_text()
+        );
         assert_eq!(
             count("moved out of a managed block"),
-            0,
-            "every moved-out guard section converged away: {text}"
-        );
-        assert_eq!(
-            count("# drift guard (static)"),
-            1,
-            "exactly one complete guard remains: {text}"
-        );
-        assert_eq!(count("unset _niu_drift"), 1, "{text}");
-        assert_eq!(
-            if_fi_balance(&text).0,
-            if_fi_balance(&text).1,
-            "no dangling if survives: {text}"
-        );
-        let begin = text.find(">>> niu source oh-my-bash").unwrap();
-        let end = text.find("<<< niu source oh-my-bash").unwrap();
-        let guard = text.find("# drift guard (static)").unwrap();
-        assert!(
-            guard > begin && guard < end,
-            "the one guard lives INSIDE the managed block: {text}"
-        );
-        assert!(
-            text.contains("oh-my-bash.sh"),
-            "the source still loads (guarded loader intact): {text}"
+            6,
+            "nothing was cleaned: the file is the user's"
         );
 
         // Fixed point: a further identical verb round changes nothing.
-        let settled = rc_text();
         super::super::sync::sync_spec(super::super::sync::SyncOptions::default()).unwrap();
         disable("git").unwrap();
         enable("git").unwrap();
         disable("oh-my-bash").unwrap();
         enable("oh-my-bash").unwrap();
         super::super::sync::sync_spec(super::super::sync::SyncOptions::default()).unwrap();
-        assert_eq!(rc_text(), settled, "converged rc is a fixed point");
+        assert_eq!(fs::read(rc_file()).unwrap(), corrupt_bytes, "fixed point");
 
         let _ = fs::remove_dir_all(&origin);
         let _ = fs::remove_dir_all(&box_.temp);
@@ -3187,15 +3614,20 @@ mod tests {
     /// is re-rendered inside the block), and from then on the whole file
     /// is byte-stable with its `fi` intact — the loop regression the issue
     /// asks for.
+    /// The healthy #176 shape (legacy block + ONE moved-out section) must
+    /// never GROW across a plugin-verb loop. In the write era the verb
+    /// converged the debris; in the read-only era the whole file is simply
+    /// byte-stable from the first round -- no verb touches it.
     #[test]
-    fn moved_out_guard_region_converges_then_stays_byte_stable_across_verb_loops() {
+    fn moved_out_guard_region_stays_byte_stable_across_verb_loops() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let origin = unique_temp_dir("i324-healthy");
         write_omb_fixture(&origin);
         let box_ = sandbox("i324-stable");
         install(&origin);
         trust("oh-my-bash");
-        enable("git").expect("canonical block first");
+        enable("git").expect("loader generation first");
+        seed_legacy_block("oh-my-bash", &OMB_BLOCK);
         let base = rc_text().trim_end().to_string();
         let healthy = format!(
             "{base}\n{}\n{}",
@@ -3203,20 +3635,8 @@ mod tests {
             moved_out_guard("oh-my-bash", true)
         );
         fs::write(rc_file(), &healthy).unwrap();
+        let seeded = fs::read(rc_file()).unwrap();
 
-        // Warm-up round (the source disable/enable cycle legitimately
-        // rewrites the block once), then byte-stability across the loop.
-        super::super::sync::sync_spec(super::super::sync::SyncOptions::default()).unwrap();
-        disable("git").unwrap();
-        enable("git").unwrap();
-        disable("oh-my-bash").unwrap();
-        enable("oh-my-bash").unwrap();
-        let settled = rc_text();
-        assert_eq!(
-            settled.matches("moved out of a managed block").count(),
-            0,
-            "the pile was guard debris; it converged with the block re-rendered: {settled}"
-        );
         for _round in 0..6 {
             super::super::sync::sync_spec(super::super::sync::SyncOptions::default()).unwrap();
             disable("git").unwrap();
@@ -3224,8 +3644,8 @@ mod tests {
             disable("oh-my-bash").unwrap();
             enable("oh-my-bash").unwrap();
             assert_eq!(
-                rc_text(),
-                settled,
+                fs::read(rc_file()).unwrap(),
+                seeded,
                 "user-lines region byte-stable across the loop"
             );
         }
@@ -3240,29 +3660,33 @@ mod tests {
     /// block (restore-from-backup, an old installer, a hand edit) and is
     /// migrated a second time merges into the existing migrated section —
     /// the pile never grows a duplicate section per verb.
+    /// Move, not copy (niubash#324), read-only edition: a user line that
+    /// sits inside the block AND in an existing migrated section is never
+    /// duplicated by a verb -- because no verb rewrites the file at all.
+    /// The pile stays exactly as the user left it.
     #[test]
-    fn re_migrated_user_line_already_in_a_pile_is_never_copied_again() {
+    fn re_migrated_user_line_region_is_never_touched_again() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let origin = unique_temp_dir("i324-dedupe");
         write_omb_fixture(&origin);
         let box_ = sandbox("i324-dedupe");
         install(&origin);
         trust("oh-my-bash");
-        enable("git").expect("canonical block first");
+        enable("git").expect("loader generation first");
 
         // The alias was already migrated out once; the SAME line is back
-        // inside the block.
-        let hijacked = rc_text().replacen(
-            "# <<< niu source oh-my-bash <<<",
+        // inside the legacy block.
+        seed_legacy_block(
+            "oh-my-bash",
             &format!(
-                "alias hh='history'\n# <<< niu source oh-my-bash <<<\n{}\nalias hh='history'",
+                "plugins=('git')\nalias hh='history'\n. \"$OSH/oh-my-bash.sh\"\n{}\nalias hh='history'",
                 MIGRATED_USER_LINES_HEADER
             ),
-            1,
         );
-        fs::write(rc_file(), &hijacked).unwrap();
+        let seeded = fs::read(rc_file()).unwrap();
 
-        enable("cargo").expect("the rewrite that re-migrates the alias");
+        enable("cargo").expect("the enable that would once have re-migrated");
+        assert_eq!(fs::read(rc_file()).unwrap(), seeded, "rc untouched");
         let text = rc_text();
         assert_eq!(
             text.matches("moved out of a managed block").count(),
@@ -3271,23 +3695,14 @@ mod tests {
         );
         assert_eq!(
             text.matches("alias hh='history'").count(),
-            1,
-            "one copy of the user line — the pile's: {text}"
+            2,
+            "the user's own copies, untouched: {text}"
         );
-        let begin = text.find(">>> niu source oh-my-bash").unwrap();
-        let end = text.find("<<< niu source oh-my-bash").unwrap();
-        let alias = text.find("alias hh='history'").unwrap();
         assert!(
-            alias > end && alias > begin,
-            "the alias lives outside the block: {text}"
+            loader_section("oh-my-bash").contains("aliases=('cargo')"),
+            "{}",
+            loader_text()
         );
-        assert!(text.contains("aliases=('cargo')"), "{text}");
-
-        // And the healed rc is stable across further rewrites.
-        let before = rc_text();
-        disable("cargo").unwrap();
-        enable("cargo").unwrap();
-        assert_eq!(rc_text(), before, "byte-stable after the merge");
 
         let _ = fs::remove_dir_all(&origin);
         let _ = fs::remove_dir_all(&box_.temp);

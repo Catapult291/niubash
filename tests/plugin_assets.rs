@@ -95,6 +95,20 @@ fn rc_of(sandbox: &Sandbox) -> String {
     fs::read_to_string(sandbox.home.join(".niubashrc")).unwrap_or_default()
 }
 
+/// The generated loader's text in the sandbox (niubash#359: the activation
+/// plane the verbs publish; the rc is never written).
+fn loader_of(sandbox: &Sandbox) -> String {
+    fs::read_to_string(loader_path_of(sandbox)).unwrap_or_default()
+}
+
+fn loader_path_of(sandbox: &Sandbox) -> std::path::PathBuf {
+    sandbox
+        .home
+        .join(".niubash")
+        .join("generated")
+        .join("plugins.niu")
+}
+
 /// Full OMB first-class lifecycle: catalog add (`--path` keeps it offline)
 /// -> trust -> enable plugin/alias/completion/theme through the manager's
 /// own rc arrays -> engine load of the enabled plugin -> undo.
@@ -146,12 +160,17 @@ fn oh_my_bash_assets_enable_disable_through_rc_arrays() {
         let enable = run_niu_with_env(&["plugin", "enable", target], &envs);
         assert_success(&enable, &format!("enable {target}"));
     }
-    let rc = rc_of(&sandbox);
-    assert!(rc.contains("OSH_THEME='agnoster'"), "{rc}");
-    assert!(rc.contains("plugins=('git')"), "{rc}");
-    assert!(rc.contains("aliases=('cargo')"), "{rc}");
-    assert!(rc.contains("completions=('gradle')"), "{rc}");
-    assert!(rc.contains("if [ -f "), "{rc}");
+    let loader = loader_of(&sandbox);
+    assert!(loader.contains("OSH_THEME='agnoster'"), "{loader}");
+    assert!(loader.contains("plugins=('git')"), "{loader}");
+    assert!(loader.contains("aliases=('cargo')"), "{loader}");
+    assert!(loader.contains("completions=('gradle')"), "{loader}");
+    assert!(loader.contains("if [ -f "), "{loader}");
+    assert!(
+        !rc_of(&sandbox).contains("OSH_THEME"),
+        "the rc was never written: {}",
+        rc_of(&sandbox)
+    );
 
     // The overview marks the enabled assets and the activation.
     let list = run_niu_with_env(&["plugin", "list"], &envs);
@@ -180,13 +199,17 @@ fn oh_my_bash_assets_enable_disable_through_rc_arrays() {
     let disable = run_niu_with_env(&["plugin", "disable", "agnoster"], &envs);
     assert_success(&disable, "disable theme");
     assert!(
-        !rc_of(&sandbox).contains("OSH_THEME="),
+        !loader_of(&sandbox).contains("OSH_THEME="),
         "{}",
-        rc_of(&sandbox)
+        loader_of(&sandbox)
     );
     let disable_source = run_niu_with_env(&["plugin", "disable", "oh-my-bash"], &envs);
     assert_success(&disable_source, "disable source");
-    assert!(!rc_of(&sandbox).contains(">>> niu source oh-my-bash"));
+    assert!(
+        !loader_of(&sandbox).contains("niu plugin source: oh-my-bash"),
+        "{}",
+        loader_of(&sandbox)
+    );
     assert!(
         sandbox
             .sources_root
@@ -234,9 +257,9 @@ fn bash_it_assets_activate_through_enabled_dir() {
         .join("bash-it/enabled/350---base.plugin.bash");
     assert!(entry.is_file(), "enabled/ entry carries the priority");
 
-    // Engine end-to-end: the rc block sources bash_it.sh (libs + enabled/
-    // entries + theme), so _base_fn exists and PS1 took the theme.
-    let rc = sandbox.home.join(".niubashrc");
+    // Engine end-to-end: the generated loader sources bash_it.sh (libs +
+    // enabled/ entries + theme), so _base_fn exists and PS1 took the theme.
+    let rc = loader_path_of(&sandbox);
     let load = format!(". {}; _base_fn; printf '%s' \"$PS1\"", rc.to_string_lossy());
     let engine = run_niu_with_env(&["-c", &load], &envs);
     assert_success(&engine, "engine bash-it load");
@@ -258,7 +281,7 @@ fn bash_it_assets_activate_through_enabled_dir() {
     // theme remains (calling _base_fn now would be a command-not-found).
     let theme_only = format!(
         ". {}; printf '%s' \"$PS1\"",
-        sandbox.home.join(".niubashrc").to_string_lossy()
+        loader_path_of(&sandbox).to_string_lossy()
     );
     let engine2 = run_niu_with_env(&["-c", &theme_only], &envs);
     assert_success(&engine2, "engine bash-it after disable");
@@ -301,8 +324,8 @@ fn bash_completion_activates_as_a_whole_source() {
         &run_niu_with_env(&["plugin", "enable", "bash-completion"], &envs),
         "whole-source enable",
     );
-    let rc = rc_of(&sandbox);
-    assert!(rc.contains("bash_completion\" ]"), "{rc}");
+    let loader = loader_of(&sandbox);
+    assert!(loader.contains("bash_completion\" ]"), "{loader}");
 
     // Individual completions stay informational.
     let refused = run_niu_with_env(&["plugin", "enable", "git"], &envs);
@@ -313,10 +336,10 @@ fn bash_completion_activates_as_a_whole_source() {
         String::from_utf8_lossy(&refused.stderr)
     );
 
-    // Engine proof: sourcing the rc runs the guarded loader.
+    // Engine proof: sourcing the generated loader runs the guarded loader.
     let load = format!(
         ". {}; printf '%s' \"$BASH_COMPLETION_STUB\"",
-        sandbox.home.join(".niubashrc").to_string_lossy()
+        loader_path_of(&sandbox).to_string_lossy()
     );
     let engine = run_niu_with_env(&["-c", &load], &envs);
     assert_success(&engine, "engine bash-completion load");
@@ -557,28 +580,29 @@ fn omb_framework_assets_enable_only_through_the_native_loader() {
     let enable = run_niu_with_env(&["plugin", "enable", "oh-my-bash/bashmarks"], &envs);
     assert_success(&enable, "enable oh-my-bash/bashmarks");
 
-    // Negative half: the managed block selects the asset through the
+    // Negative half: the loader section selects the asset through the
     // framework's own array and sources only the framework loader — never
     // the asset file directly.
-    let rc = rc_of(&sandbox);
-    assert!(rc.contains("plugins=('bashmarks')"), "{rc}");
+    let loader = loader_of(&sandbox);
+    assert!(loader.contains("plugins=('bashmarks')"), "{loader}");
     assert!(
-        rc.contains(". \"$OSH/oh-my-bash.sh\""),
-        "the block sources the native loader: {rc}"
+        loader.contains(". \"$OSH/oh-my-bash.sh\""),
+        "the section sources the native loader: {loader}"
     );
     assert!(
-        !rc.contains("plugins/bashmarks"),
-        "the block must not bypass the loader by sourcing the asset file: {rc}"
+        !loader.contains("plugins/bashmarks"),
+        "the section must not bypass the loader by sourcing the asset file: {loader}"
     );
     assert!(
-        !rc.contains("_omb_"),
-        "the block defines no framework-lib shim (owner ruling: no reimplementation): {rc}"
+        !loader.contains("_omb_"),
+        "the section defines no framework-lib shim (owner ruling: no reimplementation): {loader}"
     );
 
-    // Positive half: interactive session — the rc runs the guarded loader,
-    // the loader consumes plugins=('bashmarks') like the real one, and the
-    // plugin's functions are usable (dispatcher + save/list roundtrip).
-    let script = ". \"$HOME/.niubashrc\"\n\
+    // Positive half: interactive session — the host loads the generated
+    // loader before the rc, it consumes plugins=('bashmarks') like the
+    // real one, and the plugin's functions are usable (dispatcher +
+    // save/list roundtrip).
+    let script = ". \"$HOME/.niubash/generated/plugins.niu\"\n\
                   declare -F bm _bashmarks_save\n\
                   bm -h\n\
                   bm -a mark\n\
