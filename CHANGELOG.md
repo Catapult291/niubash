@@ -13,7 +13,12 @@ All notable changes to Niubash are documented in this file.
   verify-before-record rule (a face that cannot execute prints the failure
   note, never a fast number), structural annotations (size, hardlink count,
   same-file-as-payload), a `Measure-Command` cross-check mode, and a
-  timing-ratio-only `--check` gate (niubash#377). Measured on the 1.4.0
+  deterministic `--check-links` gate: every declared face must be the same
+  file as the payload `niu.exe`. A measured-time-ratio gate was tried first
+  and rejected with data — shimmed faces measured 1.04–1.46x the payload
+  while healthy relinked faces measured 0.91–1.26x, overlapping intervals,
+  so no ratio separates the states without false kills (niubash#377 CR).
+  Measured on the 1.4.0
   install (faces still the 243,200 B rubash forwarders): payload
   `niu -c exit` 27.2 ms avg, faces 42.1–47.3 ms (+9.8 to +15.0 ms, one extra
   process), the .NET slot 80.6 ms (+48 ms, two extra processes); after

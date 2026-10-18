@@ -91,7 +91,9 @@ Type: files; Name: "{app}\niu.exe.old-*"
 ; relinker parks as <name>.niu-old-<pid> and drops it, but a crash between
 ; the two steps leaves the parked shape behind. PATHEXT matches none of
 ; these, so nothing is shadowed — sweep the retired-name shapes anyway,
-; never the live entry names.
+; never the live entry names. The wildcards match generated shapes only;
+; a user file deliberately named with one of these suffixes inside these
+; two app-owned directories would be swept with them.
 Type: files; Name: "{app}\winuxcmd\bin\*.bak-*"
 Type: files; Name: "{app}\winuxcmd\bin\*.old-*"
 Type: files; Name: "{app}\winuxcmd\bin\*.niu-old-*"

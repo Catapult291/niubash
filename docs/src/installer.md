@@ -142,8 +142,10 @@ installation provider calls `niu --relink-shells` (or implements the
 
 ## The PATH Entry Directory Contract
 
-Exactly one directory of the installation goes on the process `PATH`:
-`<root>\winuxcmd\bin`. The contract for what may live there (niubash#376):
+Only two directories of the installation ever appear on the process `PATH`:
+`{app}` itself (so `niu` resolves) and `<root>\winuxcmd\bin` — the single
+*command* directory. The contract for what may live in the command directory
+(niubash#376):
 
 - **Hardlinks to the payload only, never forwarding launchers.** A hardlink is
   the same file — the spawn cost equals the payload's (`git.exe` there measured
@@ -157,10 +159,14 @@ Exactly one directory of the installation goes on the process `PATH`:
   (installer `[Run]`) materializes the package-declared links, and
   `niu --relink-shells` keeps the shell faces on the current `niu.exe` inode.
   An undeclared link survives as a stale binary while the payload moves on.
-- **Dead payloads are swept, not kept.** Retired shapes (`*.bak-*`,
-  `*.old-*` — parked by the relinker or older updaters) are removed by the
+- **Dead payloads are swept, not kept.** Retired shapes — `*.bak-*` and
+  `*.old-*` left by earlier updaters, and `*.niu-old-*`, the relinker's park
+  name when a crash lands between park and drop — are removed by the
   installer's `[InstallDelete]`/`[UninstallDelete]` sweeps; a directory on
-  `PATH` must stay auditable.
+  `PATH` must stay auditable. The sweeps match only these generated shapes
+  inside the two app-owned directories; a user file that borrows one of these
+  suffixes there would be removed with them, so keep user files out of the
+  installation tree.
 
 Accepted limitation: in a GUI-launched process `bash` still resolves to the
 WSL launcher (`System32` and `WindowsApps` sit ahead of the user `PATH`);

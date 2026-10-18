@@ -19,14 +19,25 @@ A row is only recorded after the face proves it executes: `<face> -c
 "echo <marker>"` must print the marker, otherwise the cell says "n/a"
 with the failure note instead of a broken face being reported as a fast
 measurement. Structural facts (size, hardlink count, same file as the
-payload) are reported per row as annotations; the `--check` gate asserts
-ONLY on measured time ratios, never on bytes.
+payload) are reported per row as annotations.
+
+Gating (niubash#377 CR round): the gate is `--check-links` and it is
+DETERMINISTIC — every declared face (`winuxcmd\bin\bash.exe`,
+`winuxcmd\bin\sh.exe`, `winuxcmd\usr\bin\bash.exe`, `winuxcmd\usr\bin\sh.exe`)
+must be the SAME FILE as the payload `niu.exe`. The gate exists to catch a
+link degenerating back into a forwarder, and inode identity is exactly that
+fact, which the script computes either way. A measured-time-ratio gate was
+tried first and rejected with data: shimmed faces measured 1.04-1.46x the
+payload while healthy relinked faces measured 0.91-1.26x — the intervals
+overlap, so no ratio threshold separates the two states without false
+kills. The timing columns stay informational. The Git-bin convention slot
+is never gated; it is not a declared face (niubash#398).
 
 Usage:
 
     python scripts/perf/shell-face-startup.py
     python scripts/perf/shell-face-startup.py --root D:/sandbox/Niubash
-    python scripts/perf/shell-face-startup.py --check 1.20
+    python scripts/perf/shell-face-startup.py --check-links
     python scripts/perf/shell-face-startup.py --json report.json
     python scripts/perf/shell-face-startup.py --powershell-crosscheck
 
@@ -63,6 +74,11 @@ FACE_NAMES = (
     ("winuxcmd\\usr\\bin", "bash.exe"),
     ("winuxcmd\\usr\\bin", "sh.exe"),
 )
+
+# The faces niubash#397 owns: `--check-links` requires each of these to be
+# the same file as the payload. Declared explicitly so the gate fails on a
+# face that is missing, not just on one that degenerated into a forwarder.
+DECLARED_FACES = tuple(f"{subdir}\\{name}" for subdir, name in FACE_NAMES)
 
 
 def default_root():
@@ -175,8 +191,9 @@ def main():
     parser.add_argument("--n", type=int, default=20, help="timed samples per row (default 20)")
     parser.add_argument("--warmup", type=int, default=3, help="untimed warmup runs per row")
     parser.add_argument("--timeout", type=int, default=60, help="per-run timeout in seconds")
-    parser.add_argument("--check", type=float, metavar="RATIO",
-                        help="exit 1 when a verified face's avg exceeds payload avg * RATIO")
+    parser.add_argument("--check-links", action="store_true",
+                        help="gate: every declared face must be the same file as the "
+                             "payload niu.exe (deterministic; timing ratios cannot gate)")
     parser.add_argument("--powershell-crosscheck", action="store_true",
                         help="re-time every row with Measure-Command (N samples each)")
     parser.add_argument("--json", help="write the report as JSON to this path")
@@ -216,9 +233,6 @@ def main():
     print(header)
     print("-" * len(header))
 
-    payload_avg = None
-    checked = 0
-    failed_gate = []
     for label, path in rows:
         ok, note = verify_face(path)
         info = structural(path)
@@ -241,8 +255,6 @@ def main():
             anno.append(f"{info['bytes']:,} B")
         if info.get("hardlinks"):
             anno.append(f"nlink={info['hardlinks']}")
-        if label.startswith("niu.exe"):
-            payload_avg = timing["avg"]
         row = {"face": label, "path": path, "ok": True, "bytes": info.get("bytes"),
                "hardlinks": info.get("hardlinks"),
                "same_file_as_payload": payload_id is not None and info.get("file_id") == payload_id,
@@ -257,25 +269,60 @@ def main():
         print(f"{label:44s} {timing['avg']:7.1f} {timing['min']:7.1f} "
               f"{timing['median']:7.1f} {timing['p95']:7.1f}  {', '.join(anno)}")
         report["rows"].append(row)
-        checked += 1
-        if args.check is not None and payload_avg and not label.startswith("niu.exe"):
-            budget = payload_avg * args.check
-            if timing["avg"] > budget:
-                failed_gate.append((label, timing["avg"], budget))
 
-    if args.check is not None:
-        print(f"\n--check {args.check}: {checked} face(s) timed, payload avg {payload_avg:.1f} ms")
-        if failed_gate:
-            for label, avg, budget in failed_gate:
-                print(f"  FAIL {label}: {avg:.1f} ms > {budget:.1f} ms (payload * {args.check})")
-            print("gate: FAIL — a face pays more than the allowed ratio of the payload spawn")
-            return 1
-        print("gate: PASS — every face is within the allowed ratio of the payload spawn")
+    gate_code = 0
+    if args.check_links:
+        gate_code = print_link_gate(report, root, payload_id)
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2)
         print(f"\nreport: {args.json}")
+    return gate_code
+
+
+def print_link_gate(report, root, payload_id):
+    """Deterministic gate (niubash#377 CR): declared faces == payload inode.
+
+    Returns the process exit code: 0 pass, 1 fail, 2 cannot evaluate.
+    """
+    if payload_id is None:
+        print(
+            "\n--check-links: cannot evaluate — no payload niu.exe found"
+            f" under root={root or '(none)'}; pass --root pointing at an"
+            " installation that contains niu.exe",
+            file=sys.stderr,
+        )
+        return 2
+
+    by_label = {
+        os.path.normcase(row["face"]): row
+        for row in report["rows"]
+        if not row["face"].startswith("niu.exe") and "slot:" not in row["face"]
+    }
+    print(f"\n--check-links: {len(DECLARED_FACES)} declared face(s), payload"
+          f" niu.exe under {root}")
+    failures = 0
+    for face in DECLARED_FACES:
+        row = by_label.get(os.path.normcase(face))
+        if row is None:
+            print(f"  FAIL {face}: declared face not present under root")
+            failures += 1
+        elif not row.get("ok"):
+            print(f"  FAIL {face}: face did not execute ({row.get('note', 'no note')})")
+            failures += 1
+        elif not row.get("same_file_as_payload"):
+            print(f"  FAIL {face}: distinct from payload — a forwarder/copy where"
+                  " the hardlink should be; repair with `niu --relink-shells --force`"
+                  " (shims are sanctioned only on layouts without hardlink support)")
+            failures += 1
+        else:
+            print(f"  PASS {face}: same file as payload (nlink={row.get('hardlinks')})")
+    if failures:
+        print("gate: FAIL — a declared face is missing, broken, or no longer the"
+              " payload file (the degenerated-forwarder case this gate exists for)")
+        return 1
+    print("gate: PASS — every declared face is the payload file itself")
     return 0
 
 
