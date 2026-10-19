@@ -25,8 +25,8 @@ sandbox and the real `~/.niubash` is never touched).
 
 | Step | The user's move | The gate asserts |
 | --- | --- | --- |
-| J1 fresh-install first contact | install, run `niu`, no `~/.niubash` anything | the v-banner + wizard appear: welcome block, environment panel, "No external themes installed yet" |
-| J2 wizard full run | collection **full** → Apply → watch the clones → **Trust now (现在信任)** → gallery → pick `powerline-multiline` | clone progress lines appear; the trust question appears; gallery lists >60 themes; `~/.niubashrc` written with the theme, `~/.niubash/plugins.toml` written, undo receipts listed on the finish screen; the REPL prompt is alive afterwards |
+| J1 fresh-install first contact | install, run `niu`, no `~/.niubash` anything | the `Niubash <version>` welcome line + the dim first-run hint naming the explicit `niu setup` verb; first contact lands at the REPL prompt — the wizard never auto-starts (#359 stage 1: startup zero-write) |
+| J2 wizard full run, entered through the explicit `niu setup` verb | at the J1 prompt: `niu setup` → the wizard welcome block (v-banner, environment panel, "No external themes installed yet") → collection **full** → Apply → watch the clones → **Trust now (现在信任)** → gallery → pick `powerline-multiline` | clone progress lines appear; the trust question appears; gallery lists >60 themes; `~/.niubashrc` written with the pick's ownership note (the #359 generated loader carries the activation), `~/.niubash/plugins.toml` written, undo receipts listed on the finish screen; the REPL prompt is alive afterwards |
 | J3 activation | `source ~/.niubashrc` in the live session | ZERO syntax errors anywhere |
 | J4 new terminal ×3 | open three fresh `niu` sessions | no `Cloning into` (no re-downloads), no "not declared" nags, at most the documented per-source `awaiting-trust` notices, prompt renders |
 | J5 daily battery | `ls \| wc -l`, `echo hi \| cat -n`, `cd ~ && pwd`, `[[ a != b ]] && echo ok` | each produces output, not errors; prompt still alive after each |
