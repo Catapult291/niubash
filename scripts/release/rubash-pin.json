@@ -1,11 +1,11 @@
 {
   "schema": 1,
-  "rubash_rev": "f6dbed27f0dea3fb5d038a16fb89967a42ed5393",
+  "rubash_rev": "45f537ea41d978fbea93dcfb2a06ac9b9b3c6a5b",
   "rubash_version": "1.4.1",
   "description": "Rubash source pin for niubash releases (rubash#827, conclusion B). Every release job fetches exactly this rubash commit into ../rubash -- where the [patch] path override in Cargo.toml deterministically picks it up -- and fails the release unless the checked-out HEAD equals rubash_rev. This is the source-level twin of winuxcmd-pin.json (niubash#312/#327): the bundled WinuxCmd was already pinned, but the compiled engine was 'whatever rubash master HEAD was at build time'.",
   "notes": [
-    "Recorded from rubash v1.4.1 (2026-10-19, tag on master f6dbed27) — the first healthy re-release after the #827 finding: v1.4.0 release assets were built from a floating-clone source state. This pin is verified by release.yml against the tagged commit (fail-hard on mismatch).",
-    "Bumping the pin is a deliberate release decision: update rubash_rev and rubash_version together.",
+    "Recorded from rubash v1.4.1 (2026-10-19, tag on master 45f537ea = #862 version bump + #863 lock self-entry fix) — the first healthy re-release after the #827 finding: v1.4.0 release assets were built from a floating-clone source state. This pin is verified by release.yml against the tagged commit (fail-hard on mismatch).",
+    "NOTE: the rev includes #863 — rubash's own Cargo.lock self-entry must be 1.4.1 or the release build's --locked cargo calls (bash shim) fail inside the pinned clone.",
     "verify with: python scripts/release/verify-rubash-pin.py --fetch-self-test"
   ]
 }
