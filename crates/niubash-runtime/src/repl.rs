@@ -670,11 +670,21 @@ struct PasteChunkEditMode {
     /// Ctrl+R dead key. A CONTROL chord always ends the window: the verb it
     /// invokes (search, cancel, EOF) owns the next Enter.
     menu_possible: bool,
-    /// niubash#420: put probe-consumed events BACK at the head of the input
-    /// stream. The live console cannot unread, so the events are written
-    /// back into the kernel input queue (`WriteConsoleInputW`, the #417
-    /// reinjection face); the scripted test queue pushes front, which
-    /// preserves order exactly.
+    /// niubash#420: put probe-consumed events BACK into the input stream.
+    /// The live console cannot unread, so the events are written back into
+    /// the kernel input queue (`WriteConsoleInputW`, the #417 reinjection
+    /// face). MSDN pins WriteConsoleInput as APPENDING behind the pending
+    /// events — a tail write it cannot do head placement with on its own.
+    /// The face therefore compensates (`requeue_console_input`): it drains
+    /// the pending tail first and rewrites it BEHIND the re-queued records,
+    /// so the events land at the head slot, the position the probe took
+    /// them from. That ordering is load-bearing for the #417 submit
+    /// writeback (a plain append would let line 2's `ead...` run before
+    /// the parked `r` of `read` and shred the burst); #420's shapes were
+    /// benign under the plain append too (the canonical wedge requeues
+    /// onto an empty queue, tail = head) and stay exact under the
+    /// compensated one. The scripted test queue pushes FRONT: it models
+    /// the head slot the production face now guarantees.
     unread: Unread,
 }
 
@@ -683,9 +693,13 @@ struct PasteChunkEditMode {
 type Lookahead = Box<dyn FnMut(Duration) -> Option<crossterm29::event::Event> + Send>;
 
 /// The requeue source of [`PasteChunkEditMode`]: hand events the probe
-/// consumed but the submit decision did NOT need back to the HEAD
-/// of the input stream, verbatim and in order — #420's partner CR and
-/// #417's submit-parked typeahead both ride it.
+/// consumed but the submit decision did NOT need back into the
+/// input stream, verbatim and in order — #420's partner CR and
+/// #417's submit-parked typeahead both ride it. Raw `WriteConsoleInput`
+/// appends at the queue tail (MSDN semantics — see the `unread` field
+/// doc); the production face wraps that primitive with a drain-and-rewrite
+/// so the re-queued events land at the head slot, the position the probe
+/// took them from. The scripted test queue models the head slot directly.
 type Unread = Box<dyn FnMut(&[crossterm29::event::Event]) + Send>;
 
 /// The production lookahead: wait up to `budget` for the next console input
@@ -891,8 +905,11 @@ impl PasteChunkEditMode {
     }
 
     /// The test constructor: a scripted lookahead queue in place of the
-    /// live console queue. The requeue pushes FRONT, so order is preserved
-    /// exactly.
+    /// live console queue. The requeue pushes FRONT — the same head slot
+    /// the production face guarantees by draining the pending tail and
+    /// rewriting it behind the re-queued records (see the `unread` field
+    /// doc); the scripted queue models the slot directly, without the
+    /// drain-rewrite dance.
     #[cfg(test)]
     fn with_scripted_queue(
         inner: Box<dyn EditMode>,
@@ -957,11 +974,13 @@ impl PasteChunkEditMode {
     /// the line echoed and parked in the continuation buffer forever (the
     /// shared-driver wedge of PR #418's Ctrl+R E2E). GNU typeahead semantics
     /// win: the first CR SUBMITS, and the partner CR — already consumed by
-    /// the probe — goes back to the head of the input stream (the #417
-    /// requeue face) to submit the empty line, or to accept+submit the
-    /// Ctrl+R match, on its own dispatch. A chunk only opens on paste
-    /// evidence now: the LF partner (humans never send Ctrl+J), or an
-    /// already-pending chunk (see the mid-chunk fold below).
+    /// the probe — goes back into the input stream (the #417 requeue face;
+    /// the drain-and-rewrite behind it lands the CR at the queue's head
+    /// slot, the next submit nothing has to drain past) to submit the
+    /// empty line, or to accept+submit the Ctrl+R match, on its own
+    /// dispatch. A chunk only opens on paste evidence now: the LF partner
+    /// (humans never send Ctrl+J), or an already-pending chunk (see the
+    /// mid-chunk fold below).
     fn enter_opens_chunk(&mut self, enter: &crossterm29::event::KeyEvent) -> bool {
         // A bare LF (Enter + CONTROL) with no chunk pending is a paste
         // newline by itself: humans submit with Enter, never Ctrl+J, while
@@ -4443,7 +4462,7 @@ mod tests {
     /// submit-Enter. The bytes are IDENTICAL to the WT KEY_EVENT empty-line
     /// paste (niubash#341), so a CR partner alone is no longer paste
     /// evidence: the first CR SUBMITS and the probe-consumed partner goes
-    /// back to the head of the input stream (the #417 requeue face — a
+    /// back into the input stream (the #417 requeue face — a
     /// pushback would cross reedline's batch boundary: R2 translates it as
     /// a batch-leading Enter and R3's first-Exits drop shreds the batch's
     /// queued text, the #341 byte loss). The requeued CR then submits the

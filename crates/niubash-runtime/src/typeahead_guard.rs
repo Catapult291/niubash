@@ -29,10 +29,17 @@
 //!   shell, where probing children cannot reach it.
 //! - [`TypeaheadGuard::disarm_and_reinject`] stops the sweeper and
 //!   writes the buffered records back into the console input queue with
-//!   `WriteConsoleInputW`, so the line editor reads them exactly as if
-//!   they had waited in the queue the whole time. Records are copied
-//!   verbatim (press/release pairs, mouse and focus events, UTF-16
-//!   surrogate halves), so nothing is transformed or lost.
+//!   `WriteConsoleInputW`. Per MSDN, `WriteConsoleInput` APPENDS to the
+//!   end of the pending event queue — it cannot prepend — so the saved
+//!   records re-enter at the tail, not at their original position. The
+//!   difference is benign: in the wedge window the guard protects, the
+//!   queue is empty at reinjection (the shell is about to read and
+//!   nothing else is pending), where tail and head are the same slot.
+//!   A key typed into the last sweep-interval sliver before disarm
+//!   would be read ahead of the earlier saved typeahead, which is a
+//!   one-off ordering inversion no scenario in niubash#167 depends on.
+//!   Records are copied verbatim (press/release pairs, mouse and focus
+//!   events, UTF-16 surrogate halves), so nothing is transformed or lost.
 //!
 //! Scope, deliberately narrow: the guard is armed only over the
 //! prompt-rebuild window (rc bootstrap at startup plus the pre-prompt
@@ -72,8 +79,11 @@ impl TypeaheadGuard {
     }
 
     /// Stop sweeping and write every saved record back into the console
-    /// input queue, in order, for the line editor to read next. Safe to
-    /// call repeatedly; also runs on drop.
+    /// input queue, in order, for the line editor to read. The write
+    /// appends behind any events still pending (MSDN `WriteConsoleInput`
+    /// semantics); in the prompt-rebuild window the queue is empty at
+    /// this point, so the editor reads the saved typeahead first exactly
+    /// as intended. Safe to call repeatedly; also runs on drop.
     pub fn disarm_and_reinject(&mut self) {
         if let Some(guard) = self.inner.take() {
             guard.disarm_and_reinject();
@@ -321,14 +331,20 @@ pub(crate) fn stdin_console_handle() -> Option<imp::OwnedHandle> {
 /// Put input records back at the HEAD of the console input queue
 /// (niubash#417's writeback face, shared with #420's partner-CR requeue).
 ///
-/// `WriteConsoleInputW` appends at the tail, but the probed events sat
-/// AHEAD of everything still queued — a tail append would invert the order
-/// of a fast typeahead burst ("echo one\r" submitted with "echo two\r"
-/// behind it: the probe parks the 'e' of the second line, and a tail append
-/// would let `cho two` reach the editor before the parked 'e', shredding
-/// the line). The pending records are therefore drained first and rewritten
-/// after `records`: the queue then reads [records ++ previously pending] —
-/// the exact order the probe found, with the re-queued events back in front.
+/// Same primitive as the guard's own reinjection above — MSDN pins
+/// `WriteConsoleInput` as APPENDING to the end of the pending queue, it
+/// cannot prepend — but a different consumer with a harder constraint:
+/// the probed events sat AHEAD of everything still queued, and a plain
+/// tail append would invert the order of a fast typeahead burst ("echo
+/// one\r" submitted with "echo two\r" behind it: the probe parks the 'e'
+/// of the second line, and a tail append would let `cho two` reach the
+/// editor before the parked 'e', shredding the line). The pending records
+/// are therefore drained first and rewritten after `records`: the queue
+/// then reads [records ++ previously pending] — the exact order the probe
+/// found, with the re-queued events back in front. The guard can settle
+/// for the bare tail append (its queue is empty at reinjection, where
+/// tail and head are the same slot); this face cannot, so it buys the
+/// head slot with the drain-and-rewrite.
 ///
 /// Best-effort, like the guard's own reinjection: on a non-console stdin
 /// (the probe can never have consumed anything there) or a failed drain or
