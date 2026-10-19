@@ -116,8 +116,8 @@ Guards: #157, #159, #85, #143, KNOWN_FAIL `bash-preexec-recipe-entry`, #161 (out
 
 | Step | The user's move | Assertions | Feasibility | Priority |
 | --- | --- | --- | --- | --- |
-| P1-S1 *(=J1)* | fresh HOME → run `niu` | v-banner + wizard: welcome, environment panel, "No external themes installed yet" | `conpty` | — |
-| P1-S2 *(=J2)* | collection `full` → Apply → watch clones → Trust now → gallery → pick `powerline-multiline` | clone lines; rc + spec + journal written; undo receipts listed; >60 themes on disk; REPL alive | `conpty` | — |
+| P1-S1 *(=J1)* | fresh HOME → run `niu` | `Niubash <version>` welcome line + the dim first-run hint naming `niu setup`; REPL prompt alive; the wizard never auto-starts (#359 stage 1) | `conpty` | — |
+| P1-S2 *(=J2)* | at the J1 prompt: `niu setup` → collection `full` → Apply → watch clones → Trust now → gallery → pick `powerline-multiline` | wizard welcome block (v-banner, environment panel, "No external themes installed yet"); clone lines; rc (the pick's ownership note) + the generated loader (theme activation) + spec + journal written; undo receipts listed; >60 themes on disk; REPL alive | `conpty` | — |
 | P1-S3 | same walk but **Decline** the trust question | no trust flip; next startup shows the documented per-source `awaiting-trust` notice and prints the exact `niu plugin trust <id>` (plugins-guide contract: "Declining changes nothing"); enable refuses while untrusted | `conpty` | 2 |
 | P1-S4 | per-question input integrity: one DOWN = exactly one row (highlight row-number delta 1); ESC takes the documented default; Enter never double-advances to the question after next | guards #85's three symptoms as a class (menu single-key semantics), not one republish of each | `conpty` | 3 |
 | P1-S5 | apply honesty: a collection entry that fails (`failed` lines, e.g. the bash-preexec seed) keeps the step RED until its ticket lands | stays a registered KNOWN_FAIL; never absorbed as green | `conpty` (exists) | — |

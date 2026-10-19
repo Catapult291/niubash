@@ -11,14 +11,21 @@ sandboxed HOME (USERPROFILE and HOME both overridden — USERPROFILE wins in
 this product, a known pitfall, so both point at the sandbox):
 
   J1 fresh-install first contact
-     no ~/.niubash anything -> run `niu` -> the v-banner + wizard appear
-     (welcome block, environment panel, "No external themes installed yet").
-  J2 wizard full run
-     collection "full" -> Apply -> the real `git clone`s progress on the
-     terminal -> trust-now question -> "Trust now" (现在信任) -> theme
-     gallery lists >60 themes -> pick `powerline-multiline` -> rc written,
-     spec written, undo receipts listed on the finish screen -> the
-     about-tour keypress -> the live REPL prompt.
+     no ~/.niubash anything -> run `niu` -> the `Niubash <version>`
+     welcome line plus the dim first-run hint naming the explicit
+     `niu setup` verb, then the live REPL prompt. The wizard never
+     auto-starts (the #359 stage-1 contract — startup is zero-write;
+     release run 39223964675 died here on the retired auto-wizard
+     expectation).
+  J2 wizard full run, entered through the explicit `niu setup` verb
+     at the J1 prompt: `niu setup` -> the wizard welcome block (the
+     v-banner, environment panel, "No external themes installed yet")
+     -> collection "full" -> Apply -> the real `git clone`s progress on
+     the terminal -> trust-now question -> "Trust now" (现在信任) -> theme
+     gallery lists >60 themes -> pick `powerline-multiline` -> rc written
+     (the pick's ownership note; the activation itself lives in the #359
+     generated loader), spec written, undo receipts listed on the finish
+     screen -> the live REPL prompt again.
   J3 activation
      source ~/.niubashrc in a live session -> ZERO syntax errors anywhere.
   J4 new-terminal x3
@@ -2210,9 +2217,14 @@ def journey(exe: Path, root: Path, verdict: Verdict,
     }
     phases = [p for p in (phases or []) if p in PHASE_RUNNERS]
 
-    # ── J1 + J2 share one session: on a fresh install `niu` IS the wizard.
+    # ── J1: first contact on a fresh install. Since #359 stage 1 the
+    # wizard NEVER auto-starts: startup prints the `Niubash <version>`
+    # line plus the dim first-run hint naming the explicit `niu setup`
+    # verb, then lands at the REPL prompt (release run 39223964675 died
+    # here waiting for the retired auto-wizard).
     step = verdict.step(
-        "J1", "fresh-install first contact: v-banner + wizard")
+        "J1", "fresh-install first contact: banner + first-run hint, "
+              "no auto-wizard")
     session = None
     j1_ok = True
     try:
@@ -2225,26 +2237,34 @@ def journey(exe: Path, root: Path, verdict: Verdict,
         j1_ok = False
     if j1_ok:
         try:
-            session.wait_for("Welcome to Niubash", timeout=90)
-            step.check("welcome v-banner appears", True)
+            session.wait_for("Niubash ", timeout=90)
+            step.check("welcome banner appears", True)
         except TimeoutError as err:
-            step.check("welcome v-banner appears", False, str(err))
+            step.check("welcome banner appears", False, str(err))
             j1_ok = False
-        body = session.text()
-        step.check("banner carries the version (v{CARGO_PKG_VERSION})",
-                   re.search(r"v\d+\.\d+\.\d+", body) is not None)
-        for needle, name in (
-            ("Environment", "environment panel appears"),
-            ("No external themes installed yet",
-             "empty-ecosystem note (no external themes yet)"),
-        ):
-            try:
-                session.wait_for(needle, timeout=30)
-                step.check(name, True)
-            except TimeoutError as err:
-                step.check(name, False, str(err))
-                j1_ok = False
+        body = session.raw_stripped()
+        step.check("banner carries the version (Niubash "
+                   "{CARGO_PKG_VERSION})",
+                   re.search(r"Niubash \d+\.\d+\.\d+", body) is not None)
+        # The hint is the #359 stage-1 replacement for the auto-wizard: it
+        # names the explicit verb (`niu setup`) a real user must type.
+        try:
+            session.wait_for("niu setup", timeout=30)
+            step.check("first-run hint names the explicit `niu setup` verb",
+                       True)
+        except TimeoutError as err:
+            step.check("first-run hint names the explicit `niu setup` verb",
+                       False, str(err))
+            j1_ok = False
         verdict.capture("J1-fresh-install", session)
+        # First contact lands at the prompt; the wizard welcome block must
+        # never appear on its own (the wizard owns the terminal when it
+        # runs, so a prompt plus an absent welcome block is the contract).
+        alive = prompt_alive(session, "J1_ALIVE")
+        step.check("first contact lands at the REPL prompt", alive)
+        step.check("wizard never auto-starts (no welcome block)",
+                   "Welcome to Niubash" not in session.raw_stripped())
+        j1_ok = j1_ok and alive
     step.finish()
 
     def block_rest(reason):
@@ -2263,10 +2283,34 @@ def journey(exe: Path, root: Path, verdict: Verdict,
         block_rest("J1 failed")
         return verdict.seal()
 
-    # ── J2: the wizard full run, same session.
+    # ── J2: the wizard full run — setup is an EXPLICIT verb since #359
+    # stage 1 (the wizard never auto-starts), so the fresh REPL J1 left
+    # open is asked for it.
     step = verdict.step(
-        "J2", "wizard full run: full -> trust now -> powerline-multiline")
+        "J2", "wizard full run via `niu setup`: full -> trust now -> "
+              "powerline-multiline")
     try:
+        # Entering the verb draws the full wizard welcome block (the
+        # v-banner, the environment panel, the empty-ecosystem note) —
+        # the first-contact assertions the auto-wizard era carried on J1.
+        try:
+            session.send_line("niu setup", anchor=False)
+            session.wait_for("Welcome to Niubash", timeout=90)
+            step.check("wizard welcome v-banner appears", True)
+        except TimeoutError as err:
+            raise AssertionError(f"wizard welcome never appeared: {err}")
+        step.check("welcome block carries the version "
+                   "(v{CARGO_PKG_VERSION})",
+                   re.search(r"v\d+\.\d+\.\d+", session.raw_stripped())
+                   is not None)
+        for needle, name in (
+            ("Environment", "environment panel appears"),
+            ("No external themes installed yet",
+             "empty-ecosystem note (no external themes yet)"),
+        ):
+            session.wait_for(needle, timeout=30)
+            step.check(name, True)
+
         try:
             session.wait_for("Plugin collection?", timeout=60)
             session.answer("4\r")  # 4 = full (both frameworks + hooks)
@@ -2276,9 +2320,9 @@ def journey(exe: Path, root: Path, verdict: Verdict,
 
         # Q2.6 (the 2026-10-12 wizard surface; the step niubash#322 added to
         # the d3 smoke journey too): the TAB completion style menu runs on
-        # every first run AND re-run. The current effective style (gnu on a
-        # fresh install) is pre-highlighted, so Enter is a no-op pick — no
-        # rc line is written when the pick equals the effective style.
+        # every first run AND re-run. The current effective style is
+        # pre-highlighted, so Enter is a no-op pick — no rc line is written
+        # when the pick equals the effective style.
         try:
             session.wait_for("TAB completion style?", timeout=60)
             session.answer(ENTER)
@@ -2288,12 +2332,19 @@ def journey(exe: Path, root: Path, verdict: Verdict,
             raise AssertionError(
                 f"TAB completion style question never appeared: {err}")
 
+        # Q3 is CONDITIONAL (niubash#230 follow-up): an installation whose
+        # bundle already carries niu-git (opt/niugit) skips the question
+        # silently — it records the "installed" answer and moves straight
+        # on to Q4. Wait briefly; on a bare install the menu appears and
+        # takes its highlighted Skip default.
         try:
-            session.wait_for("niu-git", timeout=60)
+            session.wait_for("niu-git", timeout=10)
             session.answer(ENTER)  # default Skip
             step.check("niu-git question answered with Skip", True)
-        except TimeoutError as err:
-            raise AssertionError(f"niu-git question never appeared: {err}")
+        except TimeoutError:
+            step.check("niu-git question answered with Skip", True,
+                       "question skipped: the bundle already carries "
+                       "niu-git (niubash#230) — nothing to answer")
 
         # Q4: external completion providers (carapace-bin) — Skip is the
         # highlighted default and writes no rc snippet; the journey never
@@ -2410,7 +2461,9 @@ def journey(exe: Path, root: Path, verdict: Verdict,
         session.answer(ENTER)  # delivery-verified confirm
 
         # The wizard prints its finish screen with the undo receipts, then
-        # the about-tour takes over (clears the screen, waits for a key).
+        # returns to the prompt (the #180 in-session handoff re-sources the
+        # new configuration; the about-tour, if this surface prints one,
+        # takes a key first).
         try:
             session.wait_for("Undo this run", timeout=120)
             step.check("finish screen listed undo receipts", True)
@@ -2421,7 +2474,8 @@ def journey(exe: Path, root: Path, verdict: Verdict,
             session.answer(" ")  # delivery-verified tour keypress
         except TimeoutError:
             pass  # tour skipped (non-tty guard); the REPL marker still runs
-        step.check("REPL alive after the wizard (first run continues)",
+        step.check("REPL alive after the wizard (the in-session handoff "
+                   "returns to the prompt)",
                    prompt_alive(session, "J2_ALIVE"))
         verdict.capture("J2-repl-alive", session)
     except AssertionError as err:
@@ -2443,10 +2497,26 @@ def journey(exe: Path, root: Path, verdict: Verdict,
     finish_file = verdict.transcripts / "J2-finish.txt"
     if finish_file.is_file():
         finish_text = finish_file.read_text(encoding="utf-8")
-    step.check("~/.niubashrc written with the picked theme active",
-               "OSH_THEME='powerline-multiline'" in rc
-               or "BASH_IT_THEME='powerline-multiline'" in rc,
+    # The #359 contract: the rc carries the pick as a human-facing note
+    # and NEVER as a theme line — the activation lives in the generated
+    # loader (probe evidence, 2026-10-19: "# Prompt owned by the oh-my-bash
+    # theme 'powerline-multiline'; PS1 renders via the bash-compatible
+    # channel." + ~/.niubash/generated/plugins.niu holding the OSH_THEME
+    # line).
+    loader_path = home / ".niubash" / "generated" / "plugins.niu"
+    loader = (loader_path.read_text(encoding="utf-8")
+              if loader_path.is_file() else "")
+    step.check("~/.niubashrc written with the pick's ownership note "
+               "(theme lines retired from the rc — #359)",
+               rc_path.is_file()
+               and ("# Prompt owned by the oh-my-bash theme "
+                    "'powerline-multiline'") in rc,
                f"rc exists: {rc_path.is_file()}")
+    step.check("generated loader carries the picked theme (the #359 "
+               "activation plane)",
+               "OSH_THEME='powerline-multiline'" in loader
+               or "BASH_IT_THEME='powerline-multiline'" in loader,
+               f"loader exists: {loader_path.is_file()}")
     step.check("plugin spec written (oh-my-bash declared)",
                "oh-my-bash" in spec, f"spec exists: {spec_path.is_file()}")
     step.check("plugin spec declares bash-completion",
