@@ -119,7 +119,7 @@ mod imp {
     /// A console-input handle closed on drop, so a detached sweeper can
     /// never leak one. Visible to the tests, which stage their own records
     /// through a duplicate of the same console handle (niubash#287).
-    pub(super) struct OwnedHandle(pub(super) HANDLE);
+    pub(crate) struct OwnedHandle(pub(crate) HANDLE);
     // Safety: the handle is the process-wide console input buffer, which
     // is valid on any thread; each OwnedHandle is exclusively owned by
     // exactly one thread (the guard's reinject copy never crosses a
@@ -304,6 +304,18 @@ mod imp {
             Some(duplicate)
         }
     }
+}
+
+/// A fresh duplicate of the interactive console's input handle, for callers
+/// outside the guard that must write console input records (niubash#420's
+/// probe requeue writes a consumed bare Enter back into the kernel queue).
+/// The caller owns the handle and drops it (closed on drop).
+#[cfg(windows)]
+pub(crate) fn stdin_console_handle() -> Option<imp::OwnedHandle> {
+    if !stdin_is_console() {
+        return None;
+    }
+    Some(imp::OwnedHandle(imp::duplicate_stdin_console_handle()?))
 }
 
 /// Whether the shell's stdin is an interactive console (the only shape

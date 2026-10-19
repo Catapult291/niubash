@@ -67,18 +67,24 @@ fn continuation_double_quote_ps2_and_completes() {
 
 /// Unclosed `'` keeps the session in PS2; closing it completes the command
 /// (the newline inside the quotes is preserved in the output, like bash).
+///
+/// The closing `'` lands INSIDE the single-quoted word, so the whole word
+/// `'$CONT_SQUOTE_OUT<newline>closed'` is LITERAL — GNU bash (5.3, msys,
+/// oracle run 2026-10-13) prints `$V` verbatim for the same shape. The
+/// pre-fix expectation wanted expansion inside single quotes and failed
+/// byte-stable on every host (part of niubash#420's baseline five); the
+/// assertion now pins the bash semantics niu actually implements.
 #[test]
 fn continuation_single_quote_ps2_and_completes() {
     if !require_pty_or_skip("continuation_single_quote_ps2_and_completes") {
         return;
     }
-    let rc = format!("{}\nCONT_SQUOTE_OUT=single-line\n", driver::default_rc());
-    let mut s = NiuSession::spawn_custom("cont-squote", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
+    let mut s = NiuSession::spawn("cont-squote");
     s.wait_ready();
     s.send_line("printf '%s\\n' '$CONT_SQUOTE_OUT");
     s.expect_continuation();
     s.send_line("closed'");
-    s.expect("single-line");
+    s.expect("$CONT_SQUOTE_OUT");
     s.expect("closed");
     s.expect_prompt();
 }
@@ -104,6 +110,13 @@ fn continuation_brace_group_completes() {
 }
 
 /// An open `(` subshell spans lines until `)` closes it.
+///
+/// The closing line once ended `");)"` — a stray `)` after the list
+/// separator. GNU bash 5.3 (msys, oracle run 2026-10-13) tolerates that
+/// tail (`(printf a; printf b);)` runs the subshell, exit 0) while rubash's
+/// parser rejects it (`syntax error near unexpected token ')'`) — an
+/// engine parser divergence filed for rubash, not a driver wedge. The test
+/// pins the intended shape with a clean closing `)` both shells accept.
 #[test]
 fn continuation_subshell_paren_completes() {
     if !require_pty_or_skip("continuation_subshell_paren_completes") {
@@ -117,7 +130,7 @@ fn continuation_subshell_paren_completes() {
     s.wait_ready();
     s.send_line("(printf '%s\\n' \"$CONT_PAREN_ONE\";");
     s.expect_continuation();
-    s.send_line("printf '%s\\n' \"$CONT_PAREN_TWO\");)");
+    s.send_line("printf '%s\\n' \"$CONT_PAREN_TWO\")");
     s.expect("sub-one");
     s.expect("sub-two");
     s.expect_prompt();
@@ -252,7 +265,13 @@ fn ctrl_c_interrupts_external_command() {
         HEAVY_TIMEOUT,
     );
     s.wait_ready();
-    s.send_line("ping -n 20 127.0.0.1");
+    // Absolute path on purpose: rubash's bare-name exec lookup is
+    // case-sensitive and this host's System32 ships PING.EXE uppercase —
+    // bare `ping` (and `ping.exe`) reports "command not found" while
+    // `type -a ping` resolves and the full path runs (verified 2026-10-13;
+    // rubash follow-up). The absolute form keeps the test's intent: a long
+    // EXTERNAL command interrupted by Ctrl-C.
+    s.send_line("/c/Windows/System32/ping.exe -n 20 127.0.0.1");
     // `TTL=` appears in the first reply in every ping locale.
     s.expect("TTL=");
     s.send(CTRL_C);
@@ -340,7 +359,9 @@ fn ctrl_d_after_background_job_exits() {
         HEAVY_TIMEOUT,
     );
     s.wait_ready();
-    s.send_line("ping -n 20 127.0.0.1 &");
+    // Absolute path on purpose (see ctrl_c_interrupts_external_command:
+    // rubash bare-name exec lookup vs PING.EXE casing on this host).
+    s.send_line("/c/Windows/System32/ping.exe -n 20 127.0.0.1 &");
     s.expect_prompt();
     s.send_line("jobs");
     let window = s.expect("ping");
@@ -1242,6 +1263,57 @@ fn wt_paste_bare_cr_single_line_still_submits_341() {
     s.wait_ready();
     s.send("echo $WT341\r");
     s.expect("KEYEVENT-OK");
+    s.expect_prompt();
+}
+
+/// niubash#420, the minimal wedge: a typeahead burst ending in a bare
+/// `\r\r` — "submit the line, submit the empty line" in GNU typeahead
+/// semantics (two send_line Enters written in one pty write; an expect
+/// script's back-to-back Enters). The bytes are identical to the WT
+/// KEY_EVENT paste's empty line, and the pre-fix Enter probe folded the
+/// pair as paste data: the line echoed but parked in the PS2 continuation
+/// buffer forever — the shared-driver wedge of PR #418's Ctrl+R E2E. The
+/// probe-consumed partner CR now goes back to the head of the input stream
+/// and the line submits on the FIRST CR. Echo-proof (#367): the marker is
+/// an rc variable's value — only execution can produce it.
+#[test]
+fn typeahead_bare_cr_pair_submits_per_line_420() {
+    if !require_pty_or_skip("typeahead_bare_cr_pair_submits_per_line_420") {
+        return;
+    }
+    let rc = format!("{}\nW420A=CR-PAIR-OUT\n", driver::default_rc());
+    let mut s = NiuSession::spawn_custom("w420-cr-pair", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
+    s.wait_ready();
+    s.send("echo $W420A\r\r");
+    s.expect("CR-PAIR-OUT");
+    s.expect_prompt();
+}
+
+/// niubash#420, the PR #418 shape that found the wedge: the Ctrl+R
+/// reverse-search accept-Enter and the submit-Enter land as ONE burst
+/// (`\r\r` after the query). The accepting Enter must LOAD the match and
+/// the requeued second Enter must SUBMIT it — no second send, no pacing.
+/// Echo-proof: the seed line echoes an rc variable, so the search UI's
+/// history preview (command text) can never satisfy the assertion; only
+/// the executed output can, and the first occurrence is consumed before
+/// the search begins.
+#[test]
+fn ctrl_r_accept_submit_in_one_burst_420() {
+    if !require_pty_or_skip("ctrl_r_accept_submit_in_one_burst_420") {
+        return;
+    }
+    let rc = format!("{}\nW420SEED=CR-SEED-OUT\n", driver::default_rc());
+    let mut s = NiuSession::spawn_custom("w420-ctrlr", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
+    s.wait_ready();
+    s.send_line("echo $W420SEED");
+    s.expect("CR-SEED-OUT");
+    s.expect_prompt();
+    s.send("\u{12}");
+    std::thread::sleep(Duration::from_millis(120));
+    s.send("SEED");
+    std::thread::sleep(Duration::from_millis(120));
+    s.send("\r\r");
+    s.expect("CR-SEED-OUT");
     s.expect_prompt();
 }
 
@@ -2206,10 +2278,41 @@ fn gitbash_factory_prompt_renders_and_tracks_the_branch() {
     run("add f.txt");
     run("commit -m init");
 
+    // The branch segment is rendered by git_prompt spawning `git` through
+    // the session PATH; the sandbox PATH (System32 + Windows) has no git,
+    // so the branch could never render and the tail of this test failed
+    // byte-stable on every host (part of niubash#420's baseline five — a
+    // test-design gap, not a wedge: the `cd` submit itself always ran).
+    // Discover the host git the same way the `run` helper above does and
+    // prepend its dir to the session PATH.
+    let git_where = std::process::Command::new("where.exe")
+        .arg("git")
+        .output()
+        .expect("locate git for the session PATH");
+    let git_exe = String::from_utf8_lossy(&git_where.stdout)
+        .lines()
+        .next()
+        .expect("git.exe path from where.exe")
+        .trim()
+        .to_string();
+    let git_dir = std::path::Path::new(&git_exe)
+        .parent()
+        .expect("git.exe parent dir")
+        .to_string_lossy()
+        .to_string();
+    let system_root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    let session_path = format!(
+        "{git_dir};{};{}",
+        system_root.join("System32").display(),
+        system_root.display()
+    );
+    let extra_env = vec![("PATH".to_string(), session_path)];
     let mut session = driver::NiuSession::spawn_custom(
         "gitbash-floor",
         "", // empty rc: no theme, no PS1 claim — the factory floor shows
-        &[],
+        &extra_env,
         (120, 30),
         driver::DEFAULT_TIMEOUT,
     );
