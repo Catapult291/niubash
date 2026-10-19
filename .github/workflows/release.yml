@@ -531,39 +531,101 @@ jobs:
           $stage = "dist/niubash-v${{ steps.release.outputs.version }}-win-${{ matrix.arch }}"
           $usrBin = Join-Path $stage "winuxcmd\usr\bin"
 
-          foreach ($face in @("bash", "sh")) {
-            $exe = Join-Path $usrBin "$face.exe"
-            if (-not (Test-Path -LiteralPath $exe)) {
-              throw "$face.exe is missing from the staged package at $exe"
-            }
+          # The behavioral face check runs the staged shims on THIS runner.
+          # The arm64 leg cross-compiles on an x64 windows-2025 host, and
+          # x64 Windows has no ARM64 user-mode emulator, so correctly-built
+          # aarch64 shims can never start here (run 39233051251: "The
+          # specified executable is not a valid application for this OS
+          # platform" — the shims were aarch64 as the package demands; the
+          # host simply cannot execute them). On such a foreign-arch leg the
+          # gate degrades to a structural PE-machine check: bash.exe,
+          # sh.exe, niu.exe and the staged winuxcmd.exe must each carry the
+          # target arch's machine type — the property the behavioral check
+          # would have exercised the invocation-face forwarding through.
+          # The pre-install fail-open contract above already degrades the
+          # same way (an arm64 wpm client cannot run on this host either).
+          $targetMachines = @{ "x64" = 0x8664; "arm64" = 0xAA64 }
+          $targetMachine = $targetMachines["${{ matrix.arch }}"]
+          if (-not $targetMachine) { throw "unknown arch ${{ matrix.arch }}" }
+          $hostArch = (Get-CimInstance -ClassName Win32_Processor |
+            Select-Object -First 1).Architecture
+          $canRunNatively = ($hostArch -eq 9 -and "${{ matrix.arch }}" -eq "x64") -or
+            ($hostArch -eq 12 -and "${{ matrix.arch }}" -eq "arm64")
 
-            $help = (& $exe --help 2>&1 | Out-String)
-            if ($LASTEXITCODE -ne 0) {
-              throw "$face --help exited $LASTEXITCODE inside the staged package"
+          # PE header machine field (IMAGE_FILE_MACHINE_*), parsed without
+          # external tooling.
+          function Get-PEMachine([string]$path) {
+            $fs = [System.IO.File]::OpenRead($path)
+            try {
+              $br = New-Object System.IO.BinaryReader($fs)
+              if ($br.ReadUInt16() -ne 0x5A4D) { throw "not an MZ image: $path" }
+              $null = $fs.Seek(0x3C, [System.IO.SeekOrigin]::Begin)
+              $peOffset = $br.ReadUInt32()
+              $null = $fs.Seek($peOffset, [System.IO.SeekOrigin]::Begin)
+              if ($br.ReadUInt32() -ne 0x00004550) { throw "not a PE image: $path" }
+              return $br.ReadUInt16()
             }
-            if ($help -notmatch "GNU bash, version" -or $help -notmatch "GNU long options:") {
-              throw "$face --help did not print the GNU usage form; the shim is not forwarding the invocation face`n$help"
+            finally {
+              $fs.Dispose()
             }
-
-            $version = (& $exe --version 2>&1 | Out-String)
-            if ($LASTEXITCODE -ne 0 -or $version -notmatch "GNU bash, version") {
-              throw "$face --version did not print the GNU version banner"
-            }
-
-            $zero = (& $exe -c 'echo $0' 2>&1 | Out-String).Trim()
-            if ($LASTEXITCODE -ne 0 -or $zero -ne $face) {
-              throw "$face -c 'echo `$0' printed '$zero' instead of '$face'; the invocation face did not reach the packaged niu.exe"
-            }
-
-            Write-Host "$face --help: GNU usage OK; `$0 = $zero"
           }
 
-          $niu = Join-Path $stage "niu.exe"
-          $productHelp = (& $niu --help 2>&1 | Out-String)
-          if ($LASTEXITCODE -ne 0 -or $productHelp -notmatch "Niubash ") {
-            throw "the niu face no longer prints the product help"
+          if ($canRunNatively) {
+            foreach ($face in @("bash", "sh")) {
+              $exe = Join-Path $usrBin "$face.exe"
+              if (-not (Test-Path -LiteralPath $exe)) {
+                throw "$face.exe is missing from the staged package at $exe"
+              }
+
+              $help = (& $exe --help 2>&1 | Out-String)
+              if ($LASTEXITCODE -ne 0) {
+                throw "$face --help exited $LASTEXITCODE inside the staged package"
+              }
+              if ($help -notmatch "GNU bash, version" -or $help -notmatch "GNU long options:") {
+                throw "$face --help did not print the GNU usage form; the shim is not forwarding the invocation face`n$help"
+              }
+
+              $version = (& $exe --version 2>&1 | Out-String)
+              if ($LASTEXITCODE -ne 0 -or $version -notmatch "GNU bash, version") {
+                throw "$face --version did not print the GNU version banner"
+              }
+
+              $zero = (& $exe -c 'echo $0' 2>&1 | Out-String).Trim()
+              if ($LASTEXITCODE -ne 0 -or $zero -ne $face) {
+                throw "$face -c 'echo `$0' printed '$zero' instead of '$face'; the invocation face did not reach the packaged niu.exe"
+              }
+
+              Write-Host "$face --help: GNU usage OK; `$0 = $zero"
+            }
+
+            $niu = Join-Path $stage "niu.exe"
+            $productHelp = (& $niu --help 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0 -or $productHelp -notmatch "Niubash ") {
+              throw "the niu face no longer prints the product help"
+            }
+            Write-Host "niu --help: product help OK"
           }
-          Write-Host "niu --help: product help OK"
+          else {
+            # Foreign-arch leg: structural verification only. Fails the job
+            # on a wrong-arch shim (the v1.4.0-era failure shape: an x64
+            # shim smuggled into the arm64 package would run on the host
+            # but ship broken), so the gate still pins the package's
+            # architecture honestly.
+            Write-Host "host arch $($hostArch) cannot execute ${{ matrix.arch }} binaries; running the structural PE-machine face check"
+            foreach ($rel in @("winuxcmd\usr\bin\bash.exe", "winuxcmd\usr\bin\sh.exe", "niu.exe", "winuxcmd\usr\bin\winuxcmd.exe")) {
+              $path = Join-Path $stage $rel
+              if (-not (Test-Path -LiteralPath $path)) {
+                throw "$rel is missing from the staged package at $path"
+              }
+              $machine = Get-PEMachine $path
+              if ($machine -ne $targetMachine) {
+                throw ("{0} carries PE machine 0x{1:X4}, expected 0x{2:X4} for the {3} package" -f `
+                  $rel, $machine, $targetMachine, "${{ matrix.arch }}")
+              }
+              Write-Host ("{0}: PE machine 0x{1:X4} matches the {2} package" -f `
+                $rel, $machine, "${{ matrix.arch }}")
+            }
+          }
 
       - name: Install Inno Setup
         shell: pwsh

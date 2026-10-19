@@ -1321,6 +1321,16 @@ class SandboxSeed:
         except OSError:
             return b""
 
+    def loader_bytes(self) -> bytes:
+        """The generated plugin loader's bytes. Since #359 this file — not
+        the rc — carries the managed source blocks and the theme assignment
+        (the activation plane the theme assertions guard)."""
+        try:
+            return (self.home / ".niubash" / "generated"
+                    / "plugins.niu").read_bytes()
+        except OSError:
+            return b""
+
     def spec_text(self) -> str:
         try:
             return self.spec_path.read_text(encoding="utf-8")
@@ -1422,11 +1432,13 @@ def p3_s1_reopen(exe, home, env, verdict, seed, state):
                    "no prompt-ish row ever rendered"
                    if row is None else f"first prompt row: {row.strip()[:100]}")
         rc_bytes = seed.rc_bytes()
-        rc_text = rc_bytes.decode("utf-8", errors="replace")
+        loader_bytes = seed.loader_bytes()
+        loader_text = loader_bytes.decode("utf-8", errors="replace")
         theme_line = state.get("theme_line")
-        step.check("theme persists in the rc (the wizard's pick intact)",
-                   bool(theme_line) and theme_line in rc_text,
-                   f"expected {theme_line!r} in the rc"
+        step.check("theme persists in the generated loader (the wizard's "
+                   "pick intact; the #359 activation plane)",
+                   bool(theme_line) and theme_line in loader_text,
+                   f"expected {theme_line!r} in the loader"
                    if theme_line else "the wizard snapshot carried no theme "
                    "line (J2 carried the failure)")
         spec_text = seed.spec_text()
@@ -1446,6 +1458,7 @@ def p3_s1_reopen(exe, home, env, verdict, seed, state):
             await_bare_line(session, P3_MARKER_VALUE, timeout=30))
         verdict.capture("P3-S1-reopen", session)
         state["rc_bytes"]["after-reopen"] = rc_bytes
+        state["loader_bytes"]["after-reopen"] = loader_bytes
         state["raw_texts"]["P3-S1"] = session.raw_stripped()
     except Exception as err:  # noqa: BLE001 - a stalled walk is the fail
         step.check("P3-S1 walk completed", False, f"{err}")
@@ -1474,7 +1487,7 @@ def p3_s2_rc_stability(exe, home, env, verdict, seed, state):
     theme_line = state.get("theme_line") or ""
     theme_var = state.get("theme_var") or "OSH_THEME"
     other_var = "BASH_IT_THEME" if theme_var == "OSH_THEME" else "OSH_THEME"
-    baseline = state["rc_bytes"].get("after-wizard", b"")
+    baseline = state["loader_bytes"].get("after-wizard", b"")
     raws = state["raw_texts"]
     rows = {}
     try:
@@ -1500,6 +1513,7 @@ def p3_s2_rc_stability(exe, home, env, verdict, seed, state):
             drain_notices(live)
             verdict.capture("P3-S2-after-source", live)
             state["rc_bytes"]["after-source"] = seed.rc_bytes()
+            state["loader_bytes"]["after-source"] = seed.loader_bytes()
             raws["P3-S2-source"] = live.raw_stripped()
         finally:
             live.close()
@@ -1517,6 +1531,7 @@ def p3_s2_rc_stability(exe, home, env, verdict, seed, state):
                 drain_notices(term)
                 verdict.capture(f"P3-S2-terminal-{i}", term)
                 state["rc_bytes"][f"after-term{i}"] = seed.rc_bytes()
+                state["loader_bytes"][f"after-term{i}"] = seed.loader_bytes()
                 raws[f"P3-S2-term{i}"] = term.raw_stripped()
             finally:
                 term.close()
@@ -1532,11 +1547,11 @@ def p3_s2_rc_stability(exe, home, env, verdict, seed, state):
         # break) — materializing it is sync's job (wt87 recalibration).
         for milestone in ("after-reopen", "after-source", "after-term1",
                           "after-term2"):
-            snap = state["rc_bytes"].get(milestone)
+            snap = state["loader_bytes"].get(milestone)
             snap_text = (snap or b"").decode("utf-8", errors="replace")
             base_text = baseline.decode("utf-8", errors="replace")
-            base_block = rc_managed_block(base_text, THEMED_SOURCE_ID)
-            snap_block = rc_managed_block(snap_text, THEMED_SOURCE_ID)
+            base_block = loader_managed_block(base_text, THEMED_SOURCE_ID)
+            snap_block = loader_managed_block(snap_text, THEMED_SOURCE_ID)
             stable = (bool(snap) and base_block is not None
                       and snap_block == base_block)
             diff = "" if stable else " | ".join(first_diff_lines(
@@ -1558,7 +1573,7 @@ def p3_s2_rc_stability(exe, home, env, verdict, seed, state):
             # every open exactly once. A flip (an enable/disable life
             # cycle across sessions) adds a second block or drops this
             # one — that IS a theme-state change, in either direction.
-            blocks_now = rc_managed_block_count(snap_text, THEMED_SOURCE_ID)
+            blocks_now = loader_managed_block_count(snap_text, THEMED_SOURCE_ID)
             check_theme_stability(
                 step,
                 f"theme block present exactly once after {milestone} "
@@ -1602,7 +1617,7 @@ def p3_s2_rc_stability(exe, home, env, verdict, seed, state):
         # (b) the picked theme's variable still present, unchanged, on
         # the SAME framework (the rebound re-points or flips it).
         for milestone in ("after-source", "after-term1", "after-term2"):
-            text = (state["rc_bytes"].get(milestone) or b"").decode(
+            text = (state["loader_bytes"].get(milestone) or b"").decode(
                 "utf-8", errors="replace")
             present = bool(theme_line) and theme_line in text
             flipped = re.search(
@@ -1917,8 +1932,9 @@ def p8_s4_remove_active_theme_source(exe, home, env, verdict, seed, state):
     registry_path = seed.sources_root / "registry.toml"
     try:
         rc_text = seed.rc_bytes().decode("utf-8", errors="replace")
+        loader_text = loader_text_for(home)
         spec_text = seed.spec_text()
-        vars_now = rc_theme_vars(rc_text)
+        vars_now = rc_theme_vars(loader_text)
         omb_entry = spec_entry(spec_text, "oh-my-bash")
         declared = entry_field(omb_entry, "theme") if omb_entry else None
         active_var = ("OSH_THEME" if "OSH_THEME" in vars_now
@@ -1928,7 +1944,7 @@ def p8_s4_remove_active_theme_source(exe, home, env, verdict, seed, state):
         block_vars = {var: val.strip().strip("'\"")
                       for var, val in re.findall(
                           THEME_VAR_LINE,
-                          rc_managed_block(rc_text, "oh-my-bash") or "")}
+                          loader_managed_block(loader_text, "oh-my-bash") or "")}
         # Themed state: one active variable, the spec's oh-my-bash entry
         # declares the same theme, and the assignment lives in the
         # oh-my-bash managed block (a mismatch is an rc/spec disagreement
@@ -2151,18 +2167,20 @@ def p8_s4_remove_active_theme_source(exe, home, env, verdict, seed, state):
                        "no prompt-ish row ever rendered")
             drain_notices(final)
             verdict.capture("P8-S4-restored-terminal", final)
-            rc_text = seed.rc_bytes().decode("utf-8", errors="replace")
-            blocks = rc_text.count(">>> niu source oh-my-bash")
+            loader_text = loader_text_for(home)
+            blocks = loader_managed_block_count(loader_text, "oh-my-bash")
             step.check("theme restored: the active theme line is active in "
-                       "the rc again",
-                       (theme_line_now in rc_text) if themed
-                       else not rc_theme_vars(rc_text),
+                       "the generated loader again (the #359 activation "
+                       "plane)",
+                       (theme_line_now in loader_text) if themed
+                       else not rc_theme_vars(loader_text),
                        f"expected {theme_line_now!r}" if themed else
                        f"theme variables still on file: "
-                       f"{sorted(rc_theme_vars(rc_text).items())}")
+                       f"{sorted(rc_theme_vars(loader_text).items())}")
             step.check("no orphan blocks: exactly one oh-my-bash managed "
                        "block", blocks == 1,
-                       f"{blocks} oh-my-bash block(s) in the rc")
+                       f"{blocks} oh-my-bash block(s) in the generated "
+                       f"loader")
             step.check("the spec declares oh-my-bash again",
                        "oh-my-bash" in seed.spec_text())
             verdict_for_syntax_errors(
@@ -2211,8 +2229,10 @@ def journey(exe: Path, root: Path, verdict: Verdict,
     seed = SandboxSeed(home)
     state = {
         "rc_bytes": {},      # milestone -> rc bytes (P3-S2's equality grid)
+        "loader_bytes": {},  # milestone -> generated-loader bytes (the #359
+                             # activation plane; same equality grid subject)
         "raw_texts": {},     # label -> ANSI-stripped raw stream
-        "theme_line": None,  # the exact rc theme line the wizard wrote
+        "theme_line": None,  # the exact loader theme line the wizard wrote
         "theme_var": None,   # OSH_THEME / BASH_IT_THEME
         "themed_prompt_row": None,
         "marker_file": P3_MARKER_FILE,
@@ -2542,11 +2562,16 @@ def journey(exe: Path, root: Path, verdict: Verdict,
     step.finish()
 
     # W1 baseline for P3-S2's byte-stability grid: the rc exactly as the
-    # wizard left it, plus the picked theme's exact line and variable.
+    # wizard left it, plus — on the #359 activation plane, the generated
+    # loader, which is where the picked theme's exact line and variable
+    # live now — the theme snapshot P3-S1/S2 and P8-S4 guard.
     state["rc_bytes"]["after-wizard"] = rc_path.read_bytes() \
         if rc_path.is_file() else b""
+    loader_path = home / ".niubash" / "generated" / "plugins.niu"
+    state["loader_bytes"]["after-wizard"] = loader_path.read_bytes() \
+        if loader_path.is_file() else b""
     picked = re.search(r"^((?:OSH|BASH_IT)_THEME)='powerline-multiline'$",
-                       rc, re.M)
+                       loader, re.M)
     if picked:
         state["theme_var"] = picked.group(1)
         state["theme_line"] = picked.group(0)
@@ -3001,6 +3026,51 @@ THEME_VAR_LINE = re.compile(
     r"^(?:export\s+)?(OSH_THEME|BASH_IT_THEME)=(.+)$", re.M)
 
 
+def loader_text_for(home: Path) -> str:
+    """The generated plugin loader (the #359 activation plane). Its source
+    sections carry the SAME BODY the retired rc managed blocks did (theme
+    line, selection arrays, guarded loader snippet — loader.rs), wrapped in
+    the loader's own `# --- niu plugin source: <id> ---` markers, so the
+    managed-block assertions below parse this file through the
+    loader_managed_block* helpers."""
+    return read_text(home / ".niubash" / "generated" / "plugins.niu")
+
+
+LOADER_BEGIN_MARK = "# --- niu plugin source: {sid} ---"
+LOADER_END_MARK = "# --- end niu plugin source: {sid} ---"
+
+
+def loader_managed_block(loader_text: str, source_id: str):
+    """One loader source section INCLUDING its marker lines, or None —
+    the loader twin of rc_managed_block (plugins/loader.rs section_begin/
+    section_end spelling)."""
+    begin = LOADER_BEGIN_MARK.format(sid=source_id)
+    end = LOADER_END_MARK.format(sid=source_id)
+    lines = loader_text.splitlines()
+    for start, line in enumerate(lines):
+        if line.strip() != begin:
+            continue
+        out = [line]
+        for later in lines[start + 1:]:
+            out.append(later)
+            if later.strip() == end:
+                return "\n".join(out)
+        return None  # begin marker without its end: report as absent
+    return None
+
+
+def loader_managed_block_count(loader_text: str, source_id: str) -> int:
+    begin = LOADER_BEGIN_MARK.format(sid=source_id)
+    return sum(1 for line in loader_text.splitlines()
+               if line.strip() == begin)
+
+
+def loader_without_block(loader_text: str, source_id: str) -> str:
+    block = loader_managed_block(loader_text, source_id)
+    return loader_text.replace(block, "", 1) if block is not None \
+        else loader_text
+
+
 def rc_theme_vars(rc_text: str) -> dict:
     """The theme variables actually set in the rc (non-empty values) — the
     same two assignments setup_wizard.rs current_theme_pick reads to name
@@ -3174,24 +3244,37 @@ def hop_terminal_asserts(step, verdict: Verdict, exe, home, env, tag: str,
                          marker: str, picked: str, rc_path: Path,
                          spec_path: Path, journal_path: Path):
     """The user-visible state one wizard theme hop must leave, plus the
-    fresh-terminal leg: rc guard block rewritten to the pick, exactly one
-    framework's theme variable, journal + backup receipts, and — the niu#168
-    gate — the pick STICKING across the terminal (rc block + spec agree).
-    Green expected since wt72/themeback landed (1.3.4); a red is a plain
-    #168 regression — the wt73 label retired with the fix."""
+    fresh-terminal leg: the generated loader's managed block rewritten to
+    the pick (the #359 activation plane; the rc carries only the ownership
+    note), exactly one framework's theme variable, journal + backup
+    receipts, and — the niu#168 gate — the pick STICKING across the
+    terminal (loader + spec agree). Green expected since wt72/themeback
+    landed (1.3.4); a red is a plain #168 regression — the wt73 label
+    retired with the fix."""
     rc = read_text(rc_path)
-    block = rc_managed_block(rc, "oh-my-bash")
-    step.check(f"{tag}: the rc guard block carries the pick",
+    loader = loader_text_for(Path(home))
+    # The #359 activation plane: the pick lives in the generated loader's
+    # managed block (the rc keeps only the ownership note and must never
+    # regress to carrying a theme line).
+    block = loader_managed_block(loader, "oh-my-bash")
+    step.check(f"{tag}: the generated loader carries the pick",
                block is not None and f"OSH_THEME='{picked}'" in block,
                "block missing" if block is None else "\n".join(
                    line for line in block.splitlines() if "THEME" in line)[:160])
-    vars_ = rc_theme_vars(rc)
+    vars_ = rc_theme_vars(loader)
     step.check(f"{tag}: OSH_THEME/BASH_IT_THEME never both present",
                not ("OSH_THEME" in vars_ and "BASH_IT_THEME" in vars_),
                f"theme variables on file: {sorted(vars_.items())}")
-    count = rc_managed_block_count(rc, "oh-my-bash")
-    step.check(f"{tag}: exactly one oh-my-bash guard block (no orphans)",
+    count = loader_managed_block_count(loader, "oh-my-bash")
+    step.check(f"{tag}: exactly one oh-my-bash managed block in the loader "
+               f"(no orphans)",
                count == 1, f"count = {count}")
+    note = f"# Prompt owned by the oh-my-bash theme '{picked}'"
+    step.check(f"{tag}: the rc carries the pick's ownership note and no "
+               f"theme line (the #359 rc contract)",
+               note in rc and not rc_theme_vars(rc),
+               f"note present: {note in rc}; rc theme variables: "
+               f"{sorted(rc_theme_vars(rc).items())}")
     journal = read_text(journal_path)
     step.check(f"{tag}: journal records the pick",
                journal_value(journal, "theme") == picked,
@@ -3207,10 +3290,10 @@ def hop_terminal_asserts(step, verdict: Verdict, exe, home, env, tag: str,
         themed = alive and prompt_is_themed(terminal, marker)
         if themed:
             step.check(f"{tag}: fresh terminal renders a themed prompt", True)
-        elif f"OSH_THEME='{picked}'" in (rc_managed_block(read_text(rc_path),
-                                                          "oh-my-bash") or ""):
-            # rc still carries the pick but the prompt fell back: a render
-            # bug, not the rebound — plain red.
+        elif f"OSH_THEME='{picked}'" in (loader_managed_block(
+                loader_text_for(home), "oh-my-bash") or ""):
+            # the loader still carries the pick but the prompt fell back:
+            # a render bug, not the rebound — plain red.
             step.check(f"{tag}: fresh terminal renders a themed prompt", False,
                        "the rc still carries the pick but the prompt fell "
                        "back to the default shape")
@@ -3232,18 +3315,18 @@ def hop_terminal_asserts(step, verdict: Verdict, exe, home, env, tag: str,
     finally:
         terminal.close()
 
-    rc = read_text(rc_path)
+    loader = loader_text_for(Path(home))
     omb_entry = spec_entry(read_text(spec_path), "oh-my-bash")
     declared = entry_field(omb_entry, "theme") if omb_entry else None
-    block_now = rc_managed_block(rc, "oh-my-bash") or ""
+    block_now = loader_managed_block(loader, "oh-my-bash") or ""
     if f"OSH_THEME='{picked}'" in block_now and declared == picked:
-        step.check(f"{tag}: the pick sticks (rc block + spec agree)", True)
+        step.check(f"{tag}: the pick sticks (loader + spec agree)", True)
     else:
         check_with_known_fail(
-            step, f"{tag}: the pick sticks (rc block + spec agree)",
+            step, f"{tag}: the pick sticks (loader + spec agree)",
             f"niu#168 theme ownership disagrees: "
-            f"after the fresh terminal the rc carries "
-            f"{sorted(rc_theme_vars(rc).items())} while the spec's oh-my-bash "
+            f"after the fresh terminal the loader carries "
+            f"{sorted(rc_theme_vars(loader).items())} while the spec's oh-my-bash "
             f"entry declares theme = {declared!r} (picked {picked!r}) — the "
             "next sync re-materializes the stale claim over the pick")
 
@@ -3273,10 +3356,10 @@ def phase_p4(exe, home, env, verdict, seed=None, state=None):
     block_a_original = None
     s1_failed = False
     try:
-        rc_before = read_text(rc_path)
-        block_a_original = rc_managed_block(rc_before, "oh-my-bash")
-        step.check("pre-state: the base gate left theme A in the rc guard "
-                   "block",
+        loader_before = loader_text_for(home)
+        block_a_original = loader_managed_block(loader_before, "oh-my-bash")
+        step.check("pre-state: the base gate left theme A on the #359 "
+                   "activation plane (the generated loader's managed block)",
                    block_a_original is not None
                    and f"OSH_THEME='{theme_a}'" in block_a_original)
         omb_entry = spec_entry(read_text(spec_path), "oh-my-bash")
@@ -3302,17 +3385,17 @@ def phase_p4(exe, home, env, verdict, seed=None, state=None):
                        prompt_alive(terminal, "P4S1_ALIVE"))
         finally:
             terminal.close()
-        block_now = rc_managed_block(read_text(rc_path), "oh-my-bash")
+        block_now = loader_managed_block(loader_text_for(home), "oh-my-bash")
         omb_entry = spec_entry(read_text(spec_path), "oh-my-bash")
         declared = entry_field(omb_entry, "theme") if omb_entry else None
         if (block_now is not None and f"OSH_THEME='{theme_a}'" in block_now
                 and declared == theme_a):
-            step.check("one theme state: rc block and spec agree on A", True)
+            step.check("one theme state: loader block and spec agree on A", True)
         else:
             check_with_known_fail(
-                step, "one theme state: rc block and spec agree on A",
-                f"niu#168 theme rebound: rc block "
-                f"theme vars {sorted(rc_theme_vars(read_text(rc_path)).items())}, "
+                step, "one theme state: loader block and spec agree on A",
+                f"niu#168 theme rebound: loader block "
+                f"theme vars {sorted(rc_theme_vars(loader_text_for(home)).items())}, "
                 f"spec declares {declared!r} — expected both to agree on "
                 f"{theme_a!r}")
     except AssertionError as err:
@@ -3361,10 +3444,10 @@ def phase_p4(exe, home, env, verdict, seed=None, state=None):
         hop_terminal_asserts(step, verdict, exe, home, env,
                              "P4-S2 hop B-A", "P4S2A_ALIVE", theme_a,
                              rc_path, spec_path, journal_path)
-        block_restored = rc_managed_block(read_text(rc_path), "oh-my-bash")
+        block_restored = loader_managed_block(loader_text_for(home), "oh-my-bash")
         step.check("returning to A restores the managed block byte-identically",
                    block_restored == block_a_original,
-                   "the oh-my-bash guard block bytes differ from the "
+                   "the oh-my-bash managed block bytes differ from the "
                    "pre-phase snapshot"
                    if block_restored != block_a_original else "")
     except AssertionError as err:
@@ -3427,8 +3510,8 @@ def phase_p4(exe, home, env, verdict, seed=None, state=None):
             else:
                 step.check(name, False, evidence)
 
-        block_now = rc_managed_block(read_text(rc_path), "oh-my-bash") or ""
-        s3_check("after the receipts the rc block no longer activates a "
+        block_now = loader_managed_block(loader_text_for(home), "oh-my-bash") or ""
+        s3_check("after the receipts the loader block no longer activates a "
                  "theme", "OSH_THEME" not in block_now,
                  "\n".join(line for line in block_now.splitlines()
                            if "THEME" in line)[:160])
@@ -3441,8 +3524,8 @@ def phase_p4(exe, home, env, verdict, seed=None, state=None):
             step.check("session after the undo boots",
                        prompt_alive(verify, "P4S3_SYNC_READY"))
             verify.send_line("niu plugin sync", anchor_timeout=90)
-            block_after = rc_managed_block(read_text(rc_path),
-                                           "oh-my-bash") or ""
+            block_after = loader_managed_block(loader_text_for(home),
+                                               "oh-my-bash") or ""
             s3_check("nothing resurrects at the next sync (F4)",
                      "OSH_THEME" not in block_after)
             verdict_for_syntax_errors(
@@ -3485,10 +3568,11 @@ def phase_p4(exe, home, env, verdict, seed=None, state=None):
             raise AssertionError(f"gallery walk picked {picked!r}, wanted "
                                  f"{dual_theme!r}")
         # Immediately after the pick: exactly ONE framework's block may
-        # activate the same-named theme.
-        rc_now = read_text(rc_path)
-        vars_now = rc_theme_vars(rc_now)
-        omb_block = rc_managed_block(rc_now, "oh-my-bash") or ""
+        # activate the same-named theme (on the #359 activation plane — the
+        # generated loader's managed block).
+        loader_now = loader_text_for(home)
+        vars_now = rc_theme_vars(loader_now)
+        omb_block = loader_managed_block(loader_now, "oh-my-bash") or ""
         step.check(f"the same-name pick routed to oh-my-bash (gallery "
                    f"priority): OSH_THEME='{dual_theme}'",
                    f"OSH_THEME='{dual_theme}'" in omb_block,
@@ -3503,14 +3587,14 @@ def phase_p4(exe, home, env, verdict, seed=None, state=None):
         declared_bashit = (entry_field(bash_it_entry, "theme")
                            if bash_it_entry else None)
         if declared_omb == dual_theme and declared_bashit in (None, ""):
-            step.check("spec framework attribution agrees with the rc guard "
-                       "block", True)
+            step.check("spec framework attribution agrees with the loader "
+                       "managed block", True)
         else:
             check_with_known_fail(
-                step, "spec framework attribution agrees with the rc guard "
-                      "block",
+                step, "spec framework attribution agrees with the loader "
+                      "managed block",
                 f"niu#168 theme ownership disagrees: "
-                f"the rc guard block carries OSH_THEME='{dual_theme}' but the "
+                f"the loader managed block carries OSH_THEME='{dual_theme}' but the "
                 f"spec's oh-my-bash entry declares theme = {declared_omb!r} "
                 f"and the bash-it entry {declared_bashit!r} — the wizard's "
                 "pick never reached the spec, so the next sync re-materializes "
@@ -3530,9 +3614,9 @@ def phase_p4(exe, home, env, verdict, seed=None, state=None):
                 step.check("zero syntax errors in the second terminal", True)
         finally:
             terminal.close()
-        rc_later = read_text(rc_path)
-        vars_later = rc_theme_vars(rc_later)
-        block_later = rc_managed_block(rc_later, "oh-my-bash") or ""
+        loader_later = loader_text_for(home)
+        vars_later = rc_theme_vars(loader_later)
+        block_later = loader_managed_block(loader_later, "oh-my-bash") or ""
         if (f"OSH_THEME='{dual_theme}'" in block_later
                 and "BASH_IT_THEME" not in vars_later):
             step.check("second terminal does not flip the framework or lose "
@@ -3542,9 +3626,9 @@ def phase_p4(exe, home, env, verdict, seed=None, state=None):
                 step, "second terminal does not flip the framework or lose "
                       "the pick",
                 f"niu#168 theme rebound: after the "
-                f"second terminal the rc carries "
+                f"second terminal the loader carries "
                 f"{sorted(vars_later.items())} — expected "
-                f"OSH_THEME='{dual_theme}' in the oh-my-bash guard block only")
+                f"OSH_THEME='{dual_theme}' in the oh-my-bash managed block only")
     except AssertionError as err:
         step.check("P4-S4 completed", False, str(err))
     step.finish()
@@ -3633,37 +3717,43 @@ def phase_p7(exe, home, env, verdict, seed=None, state=None):
     # documented hand_added ∪ next(spec) rule, §14.6).
     step = verdict.step("P7-S2", "sync merge semantics: hand + wizard entries "
                                  "coexist; hand-added selection survives")
+    loader_file = home / ".niubash" / "generated" / "plugins.niu"
     try:
-        rc_before = read_text(rc_path)
+        # The #359 plane: managed source blocks — including the wizard's
+        # oh-my-bash entry with its plugins=() selection — live in the
+        # generated loader, so the hand edit and the merge-semantics
+        # assertions land there (the rc carries no managed block anymore).
+        loader_before = read_text(loader_file)
         spec_before = read_bytes(spec_path)
-        block = rc_managed_block(rc_before, "oh-my-bash")
+        block = loader_managed_block(loader_before, "oh-my-bash")
         if block is None:
-            raise AssertionError("no oh-my-bash managed block to hand-edit")
+            raise AssertionError("no oh-my-bash managed block to hand-edit "
+                                 "in the generated loader")
         marker_line = RC_BEGIN_MARK.format(sid="oh-my-bash")
-        rc_hand = rc_before.replace(
+        loader_hand = loader_before.replace(
             block,
             block.replace(marker_line + "\n",
                           marker_line + "\nplugins=('git')\n", 1), 1)
-        rc_path.write_bytes(rc_hand.encode("utf-8"))
+        loader_file.write_bytes(loader_hand.encode("utf-8"))
         session.send_line("niu plugin sync", anchor_timeout=120)
         try:
             session.wait_for("selection materialized", timeout=90)
         except TimeoutError:
             pass  # the file state below is the assertion, not the wording
-        rc_after = read_text(rc_path)
-        rc_after_bytes = read_bytes(rc_path)
-        block_after = rc_managed_block(rc_after, "oh-my-bash") or ""
+        loader_after = read_text(loader_file)
+        loader_after_bytes = read_bytes(loader_file)
+        block_after = loader_managed_block(loader_after, "oh-my-bash") or ""
         step.check("the hand-added selection survives the materialization",
                    "plugins=('git')" in block_after,
                    "\n".join(line for line in block_after.splitlines()
                              if "plugins" in line)[:160])
         step.check("the merge touched nothing outside the edited block",
-                   rc_without_block(rc_after, "oh-my-bash")
-                   == rc_without_block(rc_hand, "oh-my-bash"))
+                   loader_without_block(loader_after, "oh-my-bash")
+                   == loader_without_block(loader_hand, "oh-my-bash"))
         step.check("the merge left the theme variables untouched",
-                   rc_theme_vars(rc_after) == rc_theme_vars(rc_before),
-                   f"before {sorted(rc_theme_vars(rc_before).items())}, "
-                   f"after {sorted(rc_theme_vars(rc_after).items())}")
+                   rc_theme_vars(loader_after) == rc_theme_vars(loader_before),
+                   f"before {sorted(rc_theme_vars(loader_before).items())}, "
+                   f"after {sorted(rc_theme_vars(loader_after).items())}")
         spec_now = read_text(spec_path)
         step.check("hand entry and wizard entries coexist (no clobber)",
                    spec_entry(spec_now, "tinysh") is not None
@@ -3672,9 +3762,9 @@ def phase_p7(exe, home, env, verdict, seed=None, state=None):
         step.check("the sync left the spec file byte-identical",
                    read_bytes(spec_path) == spec_before)
         session.send_line("niu plugin sync", anchor_timeout=120)
-        step.check("second sync: rc byte-identical (hand entry stays "
+        step.check("second sync: loader byte-identical (hand entry stays "
                    "hand-added, not re-merged)",
-                   read_bytes(rc_path) == rc_after_bytes)
+                   read_bytes(loader_file) == loader_after_bytes)
         step.check("second sync: spec byte-identical",
                    read_bytes(spec_path) == spec_before)
         omb_entry = spec_entry(read_text(spec_path), "oh-my-bash") or ""

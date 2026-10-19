@@ -1,11 +1,12 @@
 {
   "schema": 1,
-  "rubash_rev": "45f537ea41d978fbea93dcfb2a06ac9b9b3c6a5b",
+  "rubash_rev": "cd456ca3ac6d8bb3a1652c8549920119d999c499",
   "rubash_version": "1.4.1",
   "description": "Rubash source pin for niubash releases (rubash#827, conclusion B). Every release job fetches exactly this rubash commit into ../rubash -- where the [patch] path override in Cargo.toml deterministically picks it up -- and fails the release unless the checked-out HEAD equals rubash_rev. This is the source-level twin of winuxcmd-pin.json (niubash#312/#327): the bundled WinuxCmd was already pinned, but the compiled engine was 'whatever rubash master HEAD was at build time'.",
   "notes": [
     "Recorded from rubash v1.4.1 (2026-10-19, tag on master 45f537ea = #862 version bump + #863 lock self-entry fix) — the first healthy re-release after the #827 finding: v1.4.0 release assets were built from a floating-clone source state. This pin is verified by release.yml against the tagged commit (fail-hard on mismatch).",
     "NOTE: the rev includes #863 — rubash's own Cargo.lock self-entry must be 1.4.1 or the release build's --locked cargo calls (bash shim) fail inside the pinned clone.",
+    "Release-blocker bump (2026-10-19, run 39233051251): 45f537ea -> cd456ca3 adds ONLY rubash#875/#877 — the mark_literal_ifs_chars $(...)/backtick raw-skip copy loops clamp to the buffer. Unclamped, an unclosed $( whose quoted span ends in a trailing backslash panics the whole shell at chars[len] (command_prepare.rs:3919) on EVERY session boot after a wizard theme pick — the release journey's P4-S4/P7 panic face. The same clamp the #743 followup gave the braced branch. Red/green verified locally: the regression tests panic at 3919:46 on 45f537ea and pass on cd456ca3; full lib suite 707 passed. Merge rubash#877 before re-cutting the tag.",
     "verify with: python scripts/release/verify-rubash-pin.py --fetch-self-test"
   ]
 }
