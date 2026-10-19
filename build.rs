@@ -53,13 +53,28 @@ fn emit_rubash_revision() {
 /// than the hash here: a tree with uncommitted edits is not reproducible, and
 /// the version banner is the only place a user can see that. This describes
 /// the build only while rubash is a path dependency.
+///
+/// A bare `-dirty` is honest but not verifiable (the rubash#827 blind spot:
+/// two machines building "the same" dirty tree can compile different bytes
+/// while printing identical banners), so the marker also carries a digest of
+/// the uncommitted diff: `<rev>-dirty-<8 hex>`. Same edits, same digest;
+/// anything else changes the banner. rubash#827 recommendation 3.
 fn rubash_revision_from_checkout() -> Option<String> {
     let Some(dir) = rubash_checkout_dir() else {
         return None;
     };
-    watch_rubash_refs(&dir);
+    revision_label_for_checkout(&dir)
+}
 
-    let head = git(&dir, &["rev-parse", "--short=12", "HEAD"])?;
+/// The stamp for one explicit checkout directory: `<short rev>` when the
+/// tracked tree matches HEAD, `<short rev>-dirty-<digest>` when it does not.
+/// Split from [`rubash_revision_from_checkout`] so tests can drive it against
+/// a fixture repo instead of whatever sits beside this crate (`pub` only so
+/// the `#[path]`-included tests reach it; a build script has no API surface).
+pub fn revision_label_for_checkout(dir: &Path) -> Option<String> {
+    watch_rubash_refs(dir);
+
+    let head = git(dir, &["rev-parse", "--short=12", "HEAD"])?;
     if !head.status.success() {
         return None;
     }
@@ -74,12 +89,40 @@ fn rubash_revision_from_checkout() -> Option<String> {
     // `git status --porcelain` alone also counts `??` entries, so a tree
     // whose only changes are untracked scratch files used to bake a bogus
     // `-dirty` into the version banner.
-    if let Some(status) = git(&dir, &["status", "--porcelain", "--untracked-files=no"]) {
+    if let Some(status) = git(dir, &["status", "--porcelain", "--untracked-files=no"]) {
         if status.status.success() && !String::from_utf8_lossy(&status.stdout).trim().is_empty() {
             revision.push_str("-dirty");
+            if let Some(digest) = worktree_digest(dir) {
+                revision.push('-');
+                revision.push_str(&digest);
+            }
         }
     }
     Some(revision)
+}
+
+/// A short digest over the uncommitted tracked changes (`git diff HEAD`,
+/// binary contents included), so a `-dirty` stamp names WHICH dirty state was
+/// compiled. `git diff HEAD` covers staged and unstaged tracked edits in one
+/// deterministic patch; untracked files are not part of it (matching the
+/// dirty rule above). Git is allowed to be absent or to fail here: the stamp
+/// then stays plain `-dirty`, which is still true, just less specific.
+fn worktree_digest(dir: &Path) -> Option<String> {
+    let diff = git(dir, &["diff", "HEAD", "--binary"])?;
+    if !diff.status.success() {
+        return None;
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(&diff.stdout);
+    // 8 hex chars: collision-proof enough for a display marker, short enough
+    // to stay readable in the banner.
+    Some(
+        digest
+            .iter()
+            .take(4)
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 
 /// `git` may be absent on a build host, and a source tarball has no `.git`
