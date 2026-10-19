@@ -434,7 +434,14 @@ class ConptySession:
     def write(self, data: str):
         try:
             self.proc.write(data)
-        except (OSError, ValueError):
+        except (EOFError, OSError, ValueError):
+            # EOFError: the pty's reader already saw the child exit (winpty
+            # ptyprocess raises EOFError('Pty is closed') on every later
+            # write). A session dying at teardown — or between an isalive()
+            # check and this write — must not kill the measurement pool
+            # (run 39233051251: one asset's dead session at the exit write
+            # crashed the whole gate out of the executor); the phase loops
+            # already mark a dead session's measurement error/timeout.
             pass
 
     def close(self):

@@ -5,14 +5,14 @@
   "packages": [
     {
       "name": "gawk",
-      "version": "5.4.1-unixwin1",
+      "version": "5.4.1-unixwin2",
       "commands": [
         "gawk"
       ],
       "sha256": {
-        "windows-x64": "afdce80fc4fac9d2d6886a9c3c75b9120bca84d2011a395b5b90909c74e24568"
+        "windows-x64": "25373ae83ec539dbe8b4208e1b4c1afa891f902df1a19138ecda5451ccded4b6"
       },
-      "purpose": "GNU Awk 5.4.1. bash-it plugins and completions hard-depend on awk (the gradle completion pipes through `awk '{print $1}'` on every use); gawk IS the GNU implementation, so plugin scripts written against GNU awk keep their dialect. The wpm `gawk` package is layout=shim: the payload (gawk.exe, awk.exe, and the three DLLs it imports - libgmp-10, libmpfr-6, libreadline8; revision unixwin1 drops the two unreferenced ones and the unused extension tree, 7.8 MB -> 4.4 MB) lands in <root>\\opt\\gawk and usr\\bin\\gawk.exe is a winuxcmd.exe hardlink shim that forwards there."
+      "purpose": "GNU Awk 5.4.1. bash-it plugins and completions hard-depend on awk (the gradle completion pipes through `awk '{print $1}'` on every use); gawk IS the GNU implementation, so plugin scripts written against GNU awk keep their dialect. The wpm `gawk` package is layout=shim: the payload (gawk.exe, awk.exe, and the DLLs its import closure requires - libgmp-10, libmpfr-6, libreadline8, and the transitively imported libncurses6 + libgcc_s_dw2-1; revision unixwin2 restores the last two after unixwin1 dropped them on a direct-import reading and gawk died with 0xC0000135 on clean machines - wpm-artifacts#2, release run 39233051251) lands in <root>\\opt\\gawk and usr\\bin\\gawk.exe is a winuxcmd.exe hardlink shim that forwards there."
     },
     {
       "name": "niugit",
@@ -64,7 +64,8 @@
     "Commands contract: every package entry carries `commands`, mirroring the wpm index's `commands` field — wpm materializes a usr\\bin shim per registered command (niugit ships git.exe, ripgrep ships rg.exe), never per package name, and the release verify step asserts on these (plus the shims entries), not on package names.",
     "Architecture: niugit and gawk exist as windows-x64 artifacts only in the wpm index; on the arm64 release leg those installs fail by design and the leg ships without them. ripgrep and fd carry windows-arm64 artifacts and pre-install on both legs. The post-package verify step hard-asserts only what the pre-install step reported as installed, per the fail-open contract.",
     "No symlinks, ever: shims are winuxcmd.exe hardlinks (copies on file systems without hardlink support). The issue red lines stand - no archive formats are added, no symbolic links are created, and the runtime never downloads binaries (the assembly happens here, in CI).",
-    "The staged package ships <root>\\usr\\bin shims and the <root>\\opt payload tree only - never the .wpm state directory (cache/staging/index)."
+    "The staged package ships <root>\\usr\\bin shims and the <root>\\opt payload tree only - never the .wpm state directory (cache/staging/index).",
+    "gawk pin history: v1.4.0 shipped 5.4.1 (25373ae8..., full five-DLL payload); the 1.4.1 prep moved to 5.4.1-unixwin1 (afdce80f..., slimmed) and run 39233051251 failed its staged verify with STATUS_DLL_NOT_FOUND — the slimming had dropped transitively-imported DLLs (wpm-artifacts#2). This pin is 5.4.1-unixwin2, published with the known-good payload bytes (sha256 equal to the v1.4.0-era full artifact; wpm-source#97 carries the index entry). DEPENDENCY: the wpm-source entry (#97) and the wpm-artifacts release must land before a re-tagged release ships gawk again; until then the pin check fail-opens (loud warning, the release ships without gawk per the fail-open contract) — it can never silently install bytes this manifest did not pin (niubash#312)."
   ],
   "excluded": [
     {
