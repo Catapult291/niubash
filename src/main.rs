@@ -1320,6 +1320,23 @@ fn run_repl_command(flag: &str, leading_options: &[String], rest: &[String]) -> 
 fn run_stdin_script() -> anyhow::Result<()> {
     let mut shell = niubash_runtime::Shell::new_for_stdin_script()?;
     shell.executor.inherit_process_stdin();
+    // unixwin/niubash#431: bind the diagnostic/$0 name the way the engine's
+    // own stdin driver does for `-s` (rubash script_driver run_stdin_script):
+    // GNU never rebinds $0 for a stdin script (shell.c:1613 is the
+    // script-FILE rebind), so the name stays argv[0] verbatim and parser
+    // diagnostics read `<argv0>: line N:` — not the engine's bare
+    // `bash: <message>` fallback, which also drops the line segment. Only
+    // bind when absent: internal respawns carry the parent's name through
+    // init.rs exactly as for `-s`.
+    if shell.executor.get_env("__RUBASH_SCRIPT_NAME").is_none() {
+        let argv0 = std::env::args_os()
+            .next()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "bash".to_string());
+        shell
+            .executor
+            .set_env("__RUBASH_SCRIPT_NAME", argv0.as_str());
+    }
     // niubash#399: a login-marked argv[0] (`-niu < script`) sources the
     // login profile chain; an `exit` in any sourced startup file ends the
     // invocation with its status before the first script line is read.
@@ -1328,6 +1345,12 @@ fn run_stdin_script() -> anyhow::Result<()> {
     }
     let mut line = String::new();
     let mut pending = Vec::new();
+    // Physical lines fully consumed by the reader so far. GNU's reader_loop
+    // keeps one line counter across the whole stdin stream, so a diagnostic
+    // in the Nth gathered batch reports the absolute physical line
+    // (unixwin/niubash#431: `cat f431.sh | niu` with `(printf a;\nprintf
+    // b);\n)` must blame `line 3`, like `bash -s` on the same stream).
+    let mut lines_read = 0usize;
 
     loop {
         line.clear();
@@ -1344,7 +1367,8 @@ fn run_stdin_script() -> anyhow::Result<()> {
         {
             0 => {
                 if !pending.is_empty() {
-                    let code = shell.execute_script(&pending.join("\n"))?;
+                    let offset = lines_read - pending.len();
+                    let code = shell.execute_script_at_line_offset(&pending.join("\n"), offset)?;
                     let code = shell.finish_with_exit_trap(code)?;
                     finish_one_shot(&shell, code);
                 }
@@ -1352,6 +1376,7 @@ fn run_stdin_script() -> anyhow::Result<()> {
             }
             _ => {}
         }
+        lines_read += 1;
 
         let line = line.trim_end_matches(['\r', '\n']);
         if pending.is_empty() && line.trim().is_empty() {
@@ -1363,13 +1388,14 @@ fn run_stdin_script() -> anyhow::Result<()> {
             continue;
         }
 
+        let offset = lines_read - pending.len();
         let code = match shell.stdin_current_shell_child(&script) {
             Some(child) => {
                 let mut child_stdin = String::new();
                 let _ = read_unbuffered_line(&mut child_stdin)?;
                 shell.execute_stdin_current_shell_child(child, &child_stdin)?
             }
-            None => shell.execute_script(&script)?,
+            None => shell.execute_script_at_line_offset(&script, offset)?,
         };
         if code != 0 {
             let code = shell.finish_with_exit_trap(code)?;

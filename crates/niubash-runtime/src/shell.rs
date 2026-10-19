@@ -2308,6 +2308,21 @@ impl Shell {
         self.execute_script_with_options(script, false, 0)
     }
 
+    /// Execute a script whose physical lines continue an input stream that
+    /// started `line_offset` lines earlier. The host stdin-script reader
+    /// (main.rs run_stdin_script) gathers complete batches and executes them
+    /// one at a time; GNU's reader_loop keeps ONE physical line counter
+    /// across the whole stream, so a diagnostic in the third gathered batch
+    /// still reports `line 3`, never a per-batch `line 1`
+    /// (unixwin/niubash#431).
+    pub fn execute_script_at_line_offset(
+        &mut self,
+        script: &str,
+        line_offset: usize,
+    ) -> anyhow::Result<i32> {
+        self.execute_script_with_options(script, false, line_offset)
+    }
+
     fn execute_script_with_options(
         &mut self,
         script: &str,
@@ -2434,7 +2449,64 @@ impl Shell {
         }
         rewrite_winuxcmd_command_shims(&mut tokens, interactive_terminal_colors);
 
-        let mut ast = parse(&tokens);
+        // unixwin/niubash#431: the engine's readers parse with the stray-close
+        // guard armed (script_driver run_source_impl arms
+        // ParseLoopOptions::stray_close_is_error — GNU parse.y rejects a `)'
+        // or case terminator reaching command position with `syntax error near
+        // unexpected token'); the default parse() keeps the pre-guard
+        // leniency, silently dropping the stray token and running the rest of
+        // the input. That leniency is how every host route that lands here
+        // (`-c`, `--encoded-command`, script file, piped/redirected stdin —
+        // anything but the engine's own stdin driver behind `-s`) executed
+        // `niu -c '(printf a; printf b);)'` with rc 0 where GNU bash 5.3.0
+        // exits 2 without running anything (WSL oracle, all four forms). Arm
+        // the same guard for the non-interactive fast path, threading the
+        // source text so the offending line echoes verbatim (GNU parse.y
+        // y.error; token reconstruction cannot recover the original spacing —
+        // the default path printed `` `echo a ;;' `` for input `echo a;;`).
+        // Interactive keeps the default parse: its reader-batch route above
+        // already hands semicolon/paren-bearing input to the engine, and its
+        // diagnostics take the interactive shape. When the armed parse trips,
+        // skip the host execution entirely and let the engine's group-wise
+        // driver run the input — that reproduces GNU's read-parse-execute
+        // split byte-for-byte (a `;`+newline-terminated list before the stray
+        // token still runs, then the diagnostic aborts with status 2), which
+        // a whole-string parse-then-execute cannot. Same admission shape as
+        // the unclosed-quote fall-through above: a false positive merely runs
+        // the engine's normal driver.
+        let mut ast = if self.interactive {
+            parse(&tokens)
+        } else {
+            let armed = rubash::parser::parse_with_options(
+                &tokens,
+                rubash::parser::ParseLoopOptions {
+                    stray_close_is_error: true,
+                    source_text: Some(script.clone().into()),
+                    diagnostic_text: None,
+                    source_line_offset: line_offset,
+                },
+            );
+            if allow_grouped_readers
+                && armed
+                    .commands
+                    .iter()
+                    .any(|command| Self::command_has_parse_error_marker(command))
+            {
+                let code = rubash::script_driver::run_source_with_line_offset(
+                    &mut self.executor,
+                    &script,
+                    false,
+                    line_offset,
+                    None,
+                    None,
+                );
+                self.sync_process_cwd_from_executor_pwd();
+                self.sync_process_path_from_executor_path();
+                self.sync_alias_mirror_from_executor();
+                return Ok(code);
+            }
+            armed
+        };
         normalize_bare_windows_drive_commands(&mut ast);
         normalize_cd_windows_drive_args(&mut ast);
         normalize_winuxcmd_slash_drive_args(&mut ast);
@@ -2481,6 +2553,21 @@ impl Shell {
         self.sync_process_path_from_executor_path();
         self.sync_alias_mirror_from_executor();
         Ok(code)
+    }
+
+    /// Whether a parse-loop command node carries one of the parser's error
+    /// markers (`__RUBASH_PARSE_ERROR*`). Top-level scan only: the stray-close
+    /// guard and every hoisting path in rubash's parse loop push their error
+    /// node at the list's top level, and that top-level delta is exactly what
+    /// arming the guard adds over the default parse (compound bodies keep
+    /// their own leniency — rubash's run_inline_section saves/restores the
+    /// flag). Mirrors the marker set script_driver's
+    /// command_tree_has_parse_error reads (rubash-internal there).
+    fn command_has_parse_error_marker(command: &rubash::parser::CommandNode) -> bool {
+        command
+            .assignments
+            .iter()
+            .any(|(name, _)| name.starts_with("__RUBASH_PARSE_ERROR"))
     }
 
     fn inject_process_stdin_for_rewritten_pipeline(&mut self, ast: &mut Ast) -> anyhow::Result<()> {

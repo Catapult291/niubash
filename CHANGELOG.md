@@ -123,6 +123,10 @@ All notable changes to Niubash are documented in this file.
   1.1.9 or newer (the POSIX-unlink hardlink break, unixwin/WinuxCmd#1183);
   the release pin already carries 1.1.10.
 
+### Fixed
+
+- **`(A;B);)` is a syntax error on every non-interactive route, like GNU** (unixwin/niubash#431). `niu -c '(printf a; printf b);)'` ran the subshell and exited 0 — and so did script files, `--encoded-command`, and piped/redirected stdin — where GNU bash 5.3.0 rejects the shape in every mode (`syntax error near unexpected token ')'`, rc 2, subshell unexecuted; the earlier "msys GNU tolerates the tail" record came from the `winuxcmd/usr/bin/bash.exe` launcher shim echoing niu back — rubash#852). The host fast path now parses with the engine's stray-close guard armed (`ParseLoopOptions::stray_close_is_error`, the same predicate rubash's readers arm) and hands a tripped parse to the engine's group-wise driver, so the diagnostic (verbatim offending-line echo, `$0: -c: line N:` attribution, rc 2) matches GNU byte-for-byte; the no-flag stdin route also binds the argv[0] diagnostic name and keeps one physical line counter across gathered batches like `bash -s`. Pinned in `tests/issue431_stray_close_paren.rs` and `tests/interactive.rs::continuation_subshell_stray_close_is_syntax_error`.
+
 ## [1.4.0] - 2026-10-10
 
 ### Changed

@@ -69,11 +69,14 @@ fn continuation_double_quote_ps2_and_completes() {
 /// (the newline inside the quotes is preserved in the output, like bash).
 ///
 /// The closing `'` lands INSIDE the single-quoted word, so the whole word
-/// `'$CONT_SQUOTE_OUT<newline>closed'` is LITERAL — GNU bash (5.3, msys,
-/// oracle run 2026-10-13) prints `$V` verbatim for the same shape. The
-/// pre-fix expectation wanted expansion inside single quotes and failed
-/// byte-stable on every host (part of niubash#420's baseline five); the
-/// assertion now pins the bash semantics niu actually implements.
+/// `'$CONT_SQUOTE_OUT<newline>closed'` is LITERAL — single quotes quote
+/// everything (GNU parse.y/make_word: no expansion inside `'…'`), so `$V`
+/// prints verbatim. (The old "GNU bash 5.3, msys, oracle run 2026-10-13"
+/// attribution here was the winuxcmd bash.exe shim — niu itself — so it
+/// proved only that niu is self-consistent; GNU's single-quote rule is the
+/// real authority.) The pre-fix expectation wanted expansion inside single
+/// quotes and failed byte-stable on every host (part of niubash#420's
+/// baseline five); the assertion pins the bash semantics niu implements.
 #[test]
 fn continuation_single_quote_ps2_and_completes() {
     if !require_pty_or_skip("continuation_single_quote_ps2_and_completes") {
@@ -112,11 +115,17 @@ fn continuation_brace_group_completes() {
 /// An open `(` subshell spans lines until `)` closes it.
 ///
 /// The closing line once ended `");)"` — a stray `)` after the list
-/// separator. GNU bash 5.3 (msys, oracle run 2026-10-13) tolerates that
-/// tail (`(printf a; printf b);)` runs the subshell, exit 0) while rubash's
-/// parser rejects it (`syntax error near unexpected token ')'`) — an
-/// engine parser divergence filed for rubash, not a driver wedge. The test
-/// pins the intended shape with a clean closing `)` both shells accept.
+/// separator. The note that "GNU bash 5.3 (msys, oracle run 2026-10-13)
+/// tolerates that tail" was a MIS-ORACLE: the `winuxcmd/usr/bin/bash.exe`
+/// binary used as the "GNU" baseline is a launcher shim that spawns niu
+/// itself, so the tolerant verdict was niu's own behavior echoed back
+/// (rubash#852). The authority — WSL GNU bash 5.3.0, re-run 2026-10-19 —
+/// rejects the stray tail in every mode (`-c`, script, piped `-i`, real PTY
+/// `-i`: `syntax error near unexpected token ')'`, rc 2, subshell not run),
+/// and the engine matches byte-for-byte. This test keeps pinning the clean
+/// closing `)` both accept; the stray shape is pinned to the GNU verdict by
+/// `continuation_subshell_stray_close_is_syntax_error` below and by
+/// `tests/issue431_stray_close_paren.rs`.
 #[test]
 fn continuation_subshell_paren_completes() {
     if !require_pty_or_skip("continuation_subshell_paren_completes") {
@@ -133,6 +142,35 @@ fn continuation_subshell_paren_completes() {
     s.send_line("printf '%s\\n' \"$CONT_PAREN_TWO\")");
     s.expect("sub-one");
     s.expect("sub-two");
+    s.expect_prompt();
+}
+
+/// `(printf …;` + PS2 `printf …);)` — the stray `)` after the list
+/// separator — is a syntax error at an interactive prompt too (GNU eval.c
+/// keeps the session alive after a parse error; only EOF ends it):
+/// the diagnostic prints, the subshell body never produces output, and PS1
+/// returns for the next command.
+#[test]
+fn continuation_subshell_stray_close_is_syntax_error() {
+    if !require_pty_or_skip("continuation_subshell_stray_close_is_syntax_error") {
+        return;
+    }
+    let rc = format!(
+        "{}\nCONT_STRAY_OUT=stray-out-zznever\n",
+        driver::default_rc()
+    );
+    let mut s = NiuSession::spawn_custom("cont-stray", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
+    s.wait_ready();
+    s.send_line("(printf '%s\\n' \"$CONT_STRAY_OUT\";");
+    s.expect_continuation();
+    s.send_line("printf '%s\\n' \"$CONT_STRAY\");)");
+    s.expect("syntax error");
+    // The marker only exists in *output* if the subshell executed; the typed
+    // text carries `$CONT_STRAY_OUT` unexpanded, so the echo can't match it.
+    s.expect_absent("stray-out-zznever", ABSENT_WINDOW);
+    s.expect_prompt();
+    s.send_line("echo session-alive-after-stray");
+    s.expect("session-alive-after-stray");
     s.expect_prompt();
 }
 
