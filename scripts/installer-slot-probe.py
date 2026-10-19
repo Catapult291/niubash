@@ -69,6 +69,13 @@ import sys
 import tempfile
 import time
 
+# Every spawn this probe makes is a console binary (niu.exe, powershell.exe).
+# Without a console to inherit — the usual case for a probe launched from an
+# agent or a scheduler — Windows allocates a fresh, visible console per child
+# and the desktop flickers for the whole run. CREATE_NO_WINDOW suppresses
+# that; it changes nothing about the pipes or the exit statuses.
+NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
 # niubash#398: the convention slot. Read-only for this probe — it is hashed,
 # never opened for writing.
 SLOT_CANDIDATES = (
@@ -264,6 +271,7 @@ class Probe:
                     stderr=subprocess.DEVNULL,
                     timeout=60,
                     check=False,
+                    creationflags=NO_WINDOW,
                 )
             except (OSError, subprocess.TimeoutExpired):
                 return None
@@ -322,6 +330,7 @@ class Probe:
             out = subprocess.run(
                 argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 timeout=120, text=True, check=False,
+                creationflags=NO_WINDOW,
             ).stdout or ""
         except (OSError, subprocess.TimeoutExpired) as error:
             self.check(False, f"process chain ({label}): instrument failed: {error}")
@@ -414,6 +423,7 @@ def main():
             [os.path.join(probe.app, "niu.exe"), "--relink-shells", "--force", "--quiet"],
             cwd=probe.app, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, timeout=300, check=False,
+            creationflags=NO_WINDOW,
         )
         probe.check(relink.returncode == 0,
                     f"--relink-shells exited 0 (rc={relink.returncode} {relink.stderr.strip()[:120]})")
