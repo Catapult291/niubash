@@ -994,20 +994,91 @@ mod tests {
         );
     }
 
+    /// The relative budget: the segment may cost at most this multiple of the
+    /// bare `git status` spawn it wraps, both measured in this process. The
+    /// segment is the spawn plus a worktree walk and a capped scratch read,
+    /// so a healthy ratio sits near 1.0-1.2; 1.5x still catches a second
+    /// spawn sneaking in (~2x), a drain thread (a scheduler quantum, ~15 ms —
+    /// the reason read_status uses a scratch file), or a hidden-console flag
+    /// (measured +28 ms) while leaving the ratio room to breathe on a loaded
+    /// runner.
+    #[cfg(windows)]
+    const VCS_BUDGET_RELATIVE_MULT: f64 = 1.5;
+    /// The old flat budget, demoted to a soft warn (#337's spirit): printed
+    /// for the forensics, never fatal — on the 2-core shared CI runner it
+    /// false-armed twice (#423: runs ce5f225e p50 47.7 ms and 76f148b1
+    /// p50 49.4 ms against max 73.2 ms, with the bare spawn alone costing
+    /// that much there).
+    #[cfg(windows)]
+    const VCS_BUDGET_SOFT_WARN_MS: u128 = 45;
+    /// The absolute hard cap (#337's hard gate): 3x the old flat budget. A
+    /// hang, an unbounded status sweep, or a wedged child must fail even on a
+    /// runner slow enough to drag the baseline up with it. The worst sample
+    /// ever observed on the shared runner was 73.2 ms — under half of this.
+    #[cfg(windows)]
+    const VCS_BUDGET_HARD_CAP_MS: u128 = 135;
+
+    /// One bare `git status`, shaped exactly like `git_prompt::read_status`'s
+    /// spawn (same flags, same cwd, null stdin, scratch-file stdout, discarded
+    /// stderr, same env): the in-process baseline the relative budget is keyed
+    /// to. Anything the segment does beyond this spawn is what the ratio gate
+    /// measures.
+    #[cfg(windows)]
+    fn bare_status_spawn(worktree: &Path) -> std::time::Duration {
+        let scratch =
+            std::env::temp_dir().join(format!("niu-budget-baseline-{}.out", std::process::id()));
+        let start = std::time::Instant::now();
+        if let Ok(sink) = std::fs::File::create(&scratch) {
+            if let Ok(mut child) = std::process::Command::new("git")
+                .arg("-c")
+                .arg("core.fsmonitor=false")
+                .arg("--no-optional-locks")
+                .args(["status", "--porcelain=v2", "--branch"])
+                .current_dir(worktree)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::from(sink))
+                .stderr(std::process::Stdio::null())
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .spawn()
+            {
+                let _ = child.wait();
+            }
+        }
+        let elapsed = start.elapsed();
+        let _ = std::fs::remove_file(&scratch);
+        elapsed
+    }
+
     #[cfg(windows)]
     #[test]
     fn vcs_segment_render_p50_within_the_render_budget() {
         // Issue #331 scope 4 originally held p50 <= 10ms around the in-process
         // git2 read. The segment now runs the user's own git by design (see
         // git_prompt.rs: fidelity is the point): one bounded
-        // `status --porcelain=v2 --branch` per prompt inside a repository.
-        // Measured p50 26 ms / max 37 ms on this machine — the same as the
-        // bare git call, so the segment adds no overhead of its own (the
-        // earlier CREATE_NO_WINDOW flag alone cost 28 ms by forcing a fresh
-        // hidden console for the child). Git Bash's `__git_ps1` forks three to
-        // five times for the same answer (100-300 ms). The bound leaves room
-        // for a loaded CI machine while still catching a hang, an unbounded
-        // status sweep, or a second spawn sneaking in.
+        // `status --porcelain=v2 --branch` per prompt inside a repository —
+        // the same as the bare git call, so the segment adds no overhead of
+        // its own (the earlier CREATE_NO_WINDOW flag alone cost 28 ms by
+        // forcing a fresh hidden console for the child). Git Bash's
+        // `__git_ps1` forks three to five times for the same answer
+        // (100-300 ms).
+        //
+        // The flat 45 ms budget was calibrated on a fast desktop (p50 26 ms)
+        // and false-armed twice on the 2-core shared CI runner (#423): a
+        // unit-level absolute p50 has no verdict on shared hardware. The gate
+        // is therefore a two-door composite:
+        //
+        //   1. Primary, #604's ratio shape: segment p50 <= 1.5x the p50 of the
+        //      bare spawn it wraps (VCS_BUDGET_RELATIVE_MULT), interleaved
+        //      sample-for-sample so runner-wide load lands on both
+        //      distributions alike. A uniform slowdown moves both numbers and
+        //      the ratio holds; a real regression does not — a second spawn
+        //      doubles the ratio, a fixed quantum shows up as ratio on any
+        //      machine.
+        //   2. Backstop: p50 over VCS_BUDGET_HARD_CAP_MS fails regardless of
+        //      the ratio, so a hang or an unbounded sweep cannot hide behind
+        //      an inflated baseline. VCS_BUDGET_SOFT_WARN_MS keeps the old
+        //      budget visible as a warn only.
         let tmp = tempfile::tempdir().unwrap();
         if !init_clean_repo(tmp.path()) {
             return;
@@ -1018,18 +1089,49 @@ mod tests {
         for _ in 0..3 {
             let _ = vcs_segment_content(); // warm-up
         }
-        let mut samples: Vec<std::time::Duration> = Vec::with_capacity(21);
-        for _ in 0..21 {
+        const SAMPLES: usize = 21;
+        let mut baseline: Vec<std::time::Duration> = Vec::with_capacity(SAMPLES);
+        let mut samples: Vec<std::time::Duration> = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            baseline.push(bare_status_spawn(tmp.path()));
             let start = std::time::Instant::now();
             let _ = vcs_segment_content();
             samples.push(start.elapsed());
         }
+        baseline.sort();
         samples.sort();
-        let p50 = samples[samples.len() / 2];
+        let baseline_p50 = baseline[SAMPLES / 2];
+        let p50 = samples[SAMPLES / 2];
+        // Floor guards the degenerate baseline (a spawn rounding to 0 ms)
+        // so the ratio can never collapse the budget to nothing.
+        let relative_budget = baseline_p50
+            .mul_f64(VCS_BUDGET_RELATIVE_MULT)
+            .max(std::time::Duration::from_millis(20));
+        eprintln!(
+            "VCS budget: baseline p50={baseline_p50:?} segment p50={p50:?} \
+             ratio budget={relative_budget:?} ({VCS_BUDGET_RELATIVE_MULT}x) \
+             max={max:?}",
+            max = samples[SAMPLES - 1],
+        );
+        if p50.as_millis() > VCS_BUDGET_SOFT_WARN_MS {
+            eprintln!(
+                "WARN: Vcs segment p50 {p50:?} is over the \
+                 {VCS_BUDGET_SOFT_WARN_MS}ms soft budget (baseline \
+                 {baseline_p50:?}) — slow runner, reported, not gated"
+            );
+        }
         assert!(
-            p50.as_millis() <= 45,
-            "Vcs segment p50 {p50:?} exceeds the 45ms budget (max {max:?})",
-            max = samples[samples.len() - 1]
+            p50 <= relative_budget,
+            "Vcs segment p50 {p50:?} exceeds {VCS_BUDGET_RELATIVE_MULT}x the \
+             in-process bare-spawn baseline {baseline_p50:?} (budget \
+             {relative_budget:?}) — the segment is adding cost of its own"
+        );
+        assert!(
+            p50.as_millis() <= VCS_BUDGET_HARD_CAP_MS,
+            "Vcs segment p50 {p50:?} exceeds the {VCS_BUDGET_HARD_CAP_MS}ms \
+             hard cap (baseline {baseline_p50:?}, max {max:?}) — hang or \
+             unbounded sweep",
+            max = samples[SAMPLES - 1],
         );
     }
 
