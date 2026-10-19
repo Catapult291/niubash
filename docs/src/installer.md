@@ -174,6 +174,30 @@ WSL launcher (`System32` and `WindowsApps` sit ahead of the user `PATH`);
 need a machine-scope `PATH` entry placed before `System32`, which a per-user
 install does not do.
 
+## The Git Bash Slot Is Never Claimed
+
+`C:\Program Files\Git\bin\bash.exe` is a convention slot that some IDEs may
+resolve. A machine was found with an unowned, unsigned .NET shim parked there
+forwarding into Niubash (niubash#398) — not placed by this installer and not
+rebuildable from any repository. The ruling (PR #414, now pinned by
+`tests/installer_surface.rs` and `scripts/installer-slot-probe.py`): the
+install tree does not claim the slot.
+
+- The installer runs with `PrivilegesRequired=lowest` and never elevates, so
+  it cannot write into an admin-walled directory like `C:\Program Files\Git\bin`.
+- `installer/niubash.iss` may not name an absolute foreign path at all; every
+  write, delete, shortcut and `[Run]` surface stays inside `{app}` and
+  Inno-managed shell folders, and the only registry value written is
+  `HKCU\Environment\Path`.
+- A full install/uninstall cycle must leave every foreign slot byte-identical
+  and leave no face name outside the removed tree. The cycle probe replays
+  the executable installer steps in a user-directory sandbox and checks
+  exactly that, so the ruling is a tested invariant rather than a promise.
+
+Revisit only with evidence that an editor actually resolves that exact path
+and an accepted opt-in elevated task — the same stale-link class niubash#376
+rule 5 bans otherwise.
+
 ## Plugin Ecosystem In Packages
 
 Release packages ship no plugin content. The built-in plugin/theme stack —
