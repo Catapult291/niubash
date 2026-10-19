@@ -29,10 +29,17 @@
 //!   shell, where probing children cannot reach it.
 //! - [`TypeaheadGuard::disarm_and_reinject`] stops the sweeper and
 //!   writes the buffered records back into the console input queue with
-//!   `WriteConsoleInputW`, so the line editor reads them exactly as if
-//!   they had waited in the queue the whole time. Records are copied
-//!   verbatim (press/release pairs, mouse and focus events, UTF-16
-//!   surrogate halves), so nothing is transformed or lost.
+//!   `WriteConsoleInputW`. Per MSDN, `WriteConsoleInput` APPENDS to the
+//!   end of the pending event queue — it cannot prepend — so the saved
+//!   records re-enter at the tail, not at their original position. The
+//!   difference is benign: in the wedge window the guard protects, the
+//!   queue is empty at reinjection (the shell is about to read and
+//!   nothing else is pending), where tail and head are the same slot.
+//!   A key typed into the last sweep-interval sliver before disarm
+//!   would be read ahead of the earlier saved typeahead, which is a
+//!   one-off ordering inversion no scenario in niubash#167 depends on.
+//!   Records are copied verbatim (press/release pairs, mouse and focus
+//!   events, UTF-16 surrogate halves), so nothing is transformed or lost.
 //!
 //! Scope, deliberately narrow: the guard is armed only over the
 //! prompt-rebuild window (rc bootstrap at startup plus the pre-prompt
@@ -72,8 +79,11 @@ impl TypeaheadGuard {
     }
 
     /// Stop sweeping and write every saved record back into the console
-    /// input queue, in order, for the line editor to read next. Safe to
-    /// call repeatedly; also runs on drop.
+    /// input queue, in order, for the line editor to read. The write
+    /// appends behind any events still pending (MSDN `WriteConsoleInput`
+    /// semantics); in the prompt-rebuild window the queue is empty at
+    /// this point, so the editor reads the saved typeahead first exactly
+    /// as intended. Safe to call repeatedly; also runs on drop.
     pub fn disarm_and_reinject(&mut self) {
         if let Some(guard) = self.inner.take() {
             guard.disarm_and_reinject();

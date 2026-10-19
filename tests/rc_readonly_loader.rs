@@ -994,3 +994,92 @@ fn startup_hint_marker_is_the_only_config_dir_write() {
         "hint shown once"
     );
 }
+
+/// niubash#422 hardening: the rbash × generated-loader combo. The loader
+/// step lives on the non-login rc branch of run_startup_files and the
+/// rbash face arms its restrictions at the finish_startup tail — AFTER
+/// the loader and the user rc have sourced — so an rbash-named session
+/// loads the generated plugin set, keeps the user override, starts
+/// zero-write, and only then runs restricted (PATH/SHELL/ENV/BASH_ENV/
+/// HISTFILE readonly, GNU shell.c maybe_make_restricted). Safe by
+/// construction; pinned here so the ordering cannot silently move.
+#[test]
+fn rbash_named_session_loads_the_generated_loader_then_restricts() {
+    let sandbox = Sandbox::new("rbash-loader");
+    fs::create_dir_all(sandbox.loader_path().parent().unwrap()).unwrap();
+    // HISTFILE FIRST: a readonly failure would abort the loader body
+    // before the marker, so "loaded" proves the loader ran while the
+    // restricted read-only gates were still off (they arm later, at the
+    // finish_startup tail).
+    fs::write(
+        sandbox.loader_path(),
+        loader_doc_with("HISTFILE=\"$HOME/loader-history\"\nexport NIU_LOADER_MARK=loaded"),
+    )
+    .unwrap();
+    // Same ordering probe for the rc: an ENV assignment only survives if
+    // the rc ran before the restrictions armed.
+    fs::write(
+        sandbox.rc_path(),
+        "ENV=\"${ENV-}rc\"\nexport NIU_RC_MARK=rc\n",
+    )
+    .unwrap();
+    let inventory = sandbox.config_inventory();
+    let rc_before = sandbox.rc_identity();
+    let loader_before = fs::read(sandbox.loader_path()).unwrap();
+
+    // The rbash face through the shim-forwarded invocation name, on the
+    // interactive dispatch whose startup takes the rc branch.
+    let probe = concat!(
+        r#"printf '%s|%s|' "${NIU_LOADER_MARK-}" "${NIU_RC_MARK-}"; "#,
+        r#"case $- in *r*) echo R-YES;; *) echo R-NO;; esac; "#,
+        r#"( PATH=/x ) 2>/dev/null; echo P=$?; "#,
+        r#"( SHELL=/x ) 2>/dev/null; echo S=$?; "#,
+        r#"( ENV=/x ) 2>/dev/null; echo E=$?; "#,
+        r#"( BASH_ENV=/x ) 2>/dev/null; echo B=$?; "#,
+        r#"( HISTFILE=/x ) 2>/dev/null; echo H=$?"#,
+    );
+    let mut command = Command::new(niu_binary());
+    command.args(["-i", "-c", probe]);
+    for (key, value) in &sandbox.envs {
+        command.env(key, value);
+    }
+    command.env("NIU_INVOKED_AS", "rbash");
+    command.env_remove("NIU_PLUGIN_LOADER");
+    let out = command.output().unwrap();
+    assert_success(&out, "rbash loader probe");
+
+    let stdout = stdout_text(&out);
+    for expected in [
+        "loaded|rc|", // loader before rc, both sourced
+        "R-YES",      // the body runs restricted (armed after startup)
+        "P=1",
+        "S=1",
+        "E=1",
+        "B=1",
+        "H=1", // the five readonly gates
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in rbash probe stdout:\n{stdout}\nstderr:\n{}",
+            stderr_text(&out)
+        );
+    }
+    assert!(
+        !stdout.contains("R-NO"),
+        "the body must not run unrestricted:\n{stdout}"
+    );
+
+    // Startup stays zero-write: no config-dir churn, rc untouched, and the
+    // loader document itself never rewritten.
+    assert_eq!(
+        sandbox.config_inventory(),
+        inventory,
+        "a restricted startup writes nothing into ~/.niubash"
+    );
+    sandbox.assert_rc_identity_unchanged(&rc_before);
+    assert_eq!(
+        fs::read(sandbox.loader_path()).unwrap(),
+        loader_before,
+        "loader document is never rewritten by startup"
+    );
+}

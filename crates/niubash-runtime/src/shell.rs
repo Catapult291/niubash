@@ -1176,6 +1176,18 @@ impl Shell {
         // the invocation with its status (niubash#399).
         if self.posix_mode_active() {
             let exit = self.execute_env_file("ENV");
+            if let Some(status) = exit {
+                // niubash#422: an ENV `exit` is a startup-file jump like any
+                // other (niubash#402) — return the status before the login
+                // tail runs. Letting the tail through made `sh -l -i` emit
+                // greeting output AFTER the ENV file had already ended the
+                // invocation; GNU (WSL bash 5.3.0 oracle: `sh -l -i`, $ENV =
+                // "echo ENV-RAN; exit 7") terminates silently with rc 7 and
+                // never renders the first prompt (the control run without
+                // the exit does). The same early return the profile and rc
+                // exit paths above take.
+                return Some(status);
+            }
             if login {
                 self.update_completion_state();
                 if repl {
@@ -1183,7 +1195,7 @@ impl Shell {
                     self.run_greeting_hooks();
                 }
             }
-            return exit;
+            return None;
         }
         if login {
             // The profile chain replaces the rc branch only (shell.c:1833);
@@ -6421,6 +6433,77 @@ complete -F _envtooldyn_hook envtooldyn
         assert_eq!(shell.executor.get_env("PRECMD_CD"), Some("1"));
         assert!(shell.startup_invocation.is_none());
         std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    /// niubash#422: on the login posix face (`sh -l -i`), an `exit` in the
+    /// `$ENV` file ends the startup BEFORE the login tail — greeting hooks
+    /// (and the completion sync) must not run after the file already ended
+    /// the invocation. GNU 5.3.0 oracle (WSL `sh -l -i`, $ENV = "echo
+    /// ENV-RAN; exit 7"): the marker prints, the shell exits 7, the first
+    /// prompt never renders (the no-exit control does render it). The same
+    /// early return the profile and rc exit paths take.
+    #[test]
+    fn login_posix_env_exit_skips_the_greeting_startup_tail() {
+        let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let env_file = temp.path().join("env422.src");
+        std::fs::write(&env_file, "export ENV_RAN=$((2+3))\nexit 7\n").unwrap();
+        let mut shell = test_shell(HookConfig {
+            greeting: vec!["export GREETING_RAN=$((6*7))".into()],
+            ..HookConfig::default()
+        });
+        shell.home_dir = temp.path().to_path_buf();
+        // The `sh -l -i` shape: posix mode (invoked as sh) plus the login
+        // marker, REPL dispatch (the greeting tail only runs with repl).
+        shell.executor.set_env("__RUBASH_POSIX_MODE", "1");
+        shell.executor.set_env("__RUBASH_LOGIN_SHELL", "1");
+        shell
+            .executor
+            .set_env("ENV", &env_file.to_string_lossy().into_owned());
+        let exit = shell.run_startup_files(true);
+        assert_eq!(
+            exit,
+            Some(7),
+            "the ENV file's exit status is the startup status"
+        );
+        assert_eq!(
+            shell.executor.get_env("ENV_RAN"),
+            Some("5"),
+            "the ENV file itself ran"
+        );
+        assert_eq!(
+            shell.executor.get_env("GREETING_RAN"),
+            None,
+            "no greeting hook may run after the ENV exit jump"
+        );
+        assert_ne!(
+            shell.executor.get_env("NIU_REPL_STARTUP"),
+            Some("1"),
+            "the REPL startup marker must not leak past the jump"
+        );
+    }
+
+    /// Control for the jump above: the same face WITHOUT the ENV exit still
+    /// runs the greeting tail (the guard is the exit jump, not the face).
+    #[test]
+    fn login_posix_env_without_exit_still_runs_the_greeting_tail() {
+        let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let env_file = temp.path().join("env422ctl.src");
+        std::fs::write(&env_file, "export ENV_RAN=$((2+3))\n").unwrap();
+        let mut shell = test_shell(HookConfig {
+            greeting: vec!["export GREETING_RAN=$((6*7))".into()],
+            ..HookConfig::default()
+        });
+        shell.home_dir = temp.path().to_path_buf();
+        shell.executor.set_env("__RUBASH_POSIX_MODE", "1");
+        shell.executor.set_env("__RUBASH_LOGIN_SHELL", "1");
+        shell
+            .executor
+            .set_env("ENV", &env_file.to_string_lossy().into_owned());
+        let exit = shell.run_startup_files(true);
+        assert_eq!(exit, None);
+        assert_eq!(shell.executor.get_env("GREETING_RAN"), Some("42"));
     }
 
     fn test_shell(hooks: HookConfig) -> Shell {
