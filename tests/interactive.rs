@@ -1317,6 +1317,49 @@ fn ctrl_r_accept_submit_in_one_burst_420() {
     s.expect_prompt();
 }
 
+/// niubash#417, the wedge this fix closes: the Enter signature probe reads
+/// the queue's next record to decide a bare Enter, and with typeahead
+/// behind it (the next line of a fast burst) that record used to PARK
+/// in-process while the accepted command ran — the command's engine `read`
+/// then saw an EMPTY kernel queue and blocked forever. The submit now
+/// writes the parked record back to the console queue's head before the
+/// command runs. Echo-proof (#367): the marker is the executed echo's
+/// output — the echoed input line carries the unexpanded `$R417`, so only
+/// a read that actually consumed the parked 'Z' can print it.
+#[test]
+fn probe_parked_typeahead_reaches_engine_read_417() {
+    if !require_pty_or_skip("probe_parked_typeahead_reaches_engine_read_417") {
+        return;
+    }
+    let mut s = NiuSession::spawn("w417-read");
+    s.wait_ready();
+    // ONE write: the submit Enter with its typeahead 'Z' immediately
+    // behind it — the probe must consume 'Z' to see it is not an LF
+    // partner, parking it; `read -n1` runs next against a kernel queue the
+    // fix has just refilled.
+    s.send("read -n1 R417; echo \"R417=[$R417]\"\rZ");
+    s.expect("R417=[Z]");
+    s.expect_prompt();
+}
+
+/// niubash#417, the typeahead-burst form (the #420 pair test's shape, one
+/// line further): three back-to-back lines in one write. Line 2's submit
+/// probe parks the 'W' of line 3; the accepted `read -n1` must get exactly
+/// that key — and the head writeback must NOT let line 2's own text run
+/// before it (a tail append would shred the burst into `ead -n1 ...`).
+#[test]
+fn typeahead_burst_read_line_gets_parked_key_417() {
+    if !require_pty_or_skip("typeahead_burst_read_line_gets_parked_key_417") {
+        return;
+    }
+    let mut s = NiuSession::spawn("w417-burst");
+    s.wait_ready();
+    s.send("echo ONE417\rread -n1 R417B; echo \"B=[$R417B]\"\rW");
+    s.expect("ONE417");
+    s.expect("B=[W]");
+    s.expect_prompt();
+}
+
 /// The niubash#341 owner script (issue #341, Windows Terminal,
 /// 2026-10-14): 76 non-empty lines of bash with 16 empty-line boundaries,
 /// including the two `if is_even` blocks whose line starts were shredded.

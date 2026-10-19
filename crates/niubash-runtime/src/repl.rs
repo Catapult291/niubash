@@ -589,8 +589,11 @@ fn build_edit_mode(
 ///   behind the CR proves paste data — the break(s) fold into the pending
 ///   chunk and the Enter never reaches reedline. Any other queued key
 ///   (typeahead text, a chord) or silence proves a typed submit: the Enter
-///   passes through and the lookahead's read is pushed back, so reedline
-///   sees it, in order, on the next dispatch. The LF of a CRLF is decisive
+///   passes through and the lookahead's read parks in-process, so reedline
+///   sees it, in order, on the next dispatch — and at the submit itself the
+///   parked keys are written back to the console queue's head, so the
+///   accepted command's own `read` sees them too (niubash#417). The LF of a
+///   CRLF is decisive
 ///   by itself, too: a bare `Enter + CONTROL` with no chunk pending opens
 ///   one directly (humans do not submit with Ctrl+J; a slow paste whose CR
 ///   already slipped through still gets absorbed from its first LF on).
@@ -645,7 +648,12 @@ struct PasteChunkEditMode {
     /// next raw event, so reedline never loses or reorders them. They
     /// cannot ride along on the Enter's own `Multiple`: reedline drops
     /// `Multiple` sub-events after the first `Exits` (engine.rs
-    /// `handle_editor_event`), and an Enter exits.
+    /// `handle_editor_event`), and an Enter exits. At a SUBMIT — a batch
+    /// whose dispatch hands the shell a line — whatever remains parked goes
+    /// back to the input stream's head ([`Unread`], niubash#417): the
+    /// accepted command's engine `read` reads the kernel queue next, and
+    /// events left in-process would be unreachable to it until the next
+    /// prompt.
     pushback: VecDeque<crossterm29::event::Event>,
     /// Where the lookahead reads the next queued event: the live console
     /// queue (`crossterm::event::poll` + `read`) in production, a scripted
@@ -674,9 +682,10 @@ struct PasteChunkEditMode {
 /// input event within `budget`, or `None` on silence.
 type Lookahead = Box<dyn FnMut(Duration) -> Option<crossterm29::event::Event> + Send>;
 
-/// The requeue source of [`PasteChunkEditMode`] (niubash#420): hand events
-/// the probe consumed but the submit decision did NOT need back to the HEAD
-/// of the input stream, verbatim and in order.
+/// The requeue source of [`PasteChunkEditMode`]: hand events the probe
+/// consumed but the submit decision did NOT need back to the HEAD
+/// of the input stream, verbatim and in order — #420's partner CR and
+/// #417's submit-parked typeahead both ride it.
 type Unread = Box<dyn FnMut(&[crossterm29::event::Event]) + Send>;
 
 /// The production lookahead: wait up to `budget` for the next console input
@@ -691,11 +700,13 @@ fn live_lookahead(budget: Duration) -> Option<crossterm29::event::Event> {
 }
 
 /// The production requeue: write the events back into the kernel console
-/// input queue, so the NEXT read (reedline's own, or a host command's) sees
-/// them in order. Only key presses the probe consumed are ever handed here
-/// (a bare Enter — niubash#420), so the record synthesis covers exactly
-/// that shape. A non-console stdin or a failed write drops the events:
-/// the worst case is one lost empty-line submit, never a wedged one.
+/// input queue, so the NEXT read (the accepted command's engine `read`, or
+/// reedline's own) sees them in order. Two callers feed it: #420's partner-CR
+/// requeue at chunk-open (a bare Enter the probe consumed) and #417's submit
+/// writeback (the typeahead keys the probe parked through a submitted
+/// batch). A non-console stdin or a failed write drops the events: the queue
+/// they came from does not exist (the probe only ever runs against one) or
+/// refused them.
 fn live_unread(events: &[crossterm29::event::Event]) {
     #[cfg(windows)]
     win_unread(events);
@@ -703,61 +714,175 @@ fn live_unread(events: &[crossterm29::event::Event]) {
     let _ = events;
 }
 
+/// One synthesized console key-down record's payload — platform-pure so the
+/// crossterm→`INPUT_RECORD` mapping is unit-testable off-Windows. Mirrors
+/// what conhost synthesizes for the same keystroke, so every reader on this
+/// path (reedline's Windows parser, the engine's console reader) decodes the
+/// re-injected record back into the event that was consumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(windows, test))]
+struct KeyRecordFields {
+    /// `wVirtualKeyCode`: the key identity for the keys every reader takes
+    /// from the VK (arrows, Backspace, Tab, ...), the base letter of a
+    /// control chord (Ctrl+R arrives as `uChar` 0x12 / VK 'R'), and the
+    /// letter/digit of printable keys; 0 where the readers decode from
+    /// `uChar` directly (non-ASCII, symbols).
+    virtual_key_code: u16,
+    /// `uChar.UnicodeChar`: one record per UTF-16 unit, so a non-BMP
+    /// character round-trips through crossterm's surrogate assembly exactly
+    /// as the terminal delivered it.
+    unicode_char: u16,
+    /// `dwControlKeyState`: SHIFT/LEFT_CTRL/LEFT_ALT — the subset the
+    /// console parser itself produces.
+    control_key_state: u32,
+}
+
+#[cfg(any(windows, test))]
+const SHIFT_PRESSED_FLAG: u32 = 0x0010;
+#[cfg(any(windows, test))]
+const LEFT_ALT_PRESSED_FLAG: u32 = 0x0002;
+#[cfg(any(windows, test))]
+const LEFT_CTRL_PRESSED_FLAG: u32 = 0x0008;
+
+/// Map a key event the probe consumed into the console key-down records that
+/// decode back to it. `wVirtualScanCode` is omitted (always 0): every reader
+/// on this path decodes from VK + `uChar` — crossterm's `parse_key_event_record`
+/// and the engine's `translate_console_key` never read the scan. Events the
+/// console parser cannot produce (releases never park in the pushback, and
+/// media/modifier keys never parse) map to nothing — they were never
+/// consumable here to begin with.
+#[cfg(any(windows, test))]
+fn key_press_records(key: &crossterm29::event::KeyEvent) -> Vec<KeyRecordFields> {
+    use crossterm29::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+    // Releases carry no text and no action upstream (the detector delegates
+    // them to `None`); the probe only ever parks Presses.
+    if key.kind != KeyEventKind::Press {
+        return Vec::new();
+    }
+    let mut state = 0u32;
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        state |= SHIFT_PRESSED_FLAG;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        state |= LEFT_CTRL_PRESSED_FLAG;
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        state |= LEFT_ALT_PRESSED_FLAG;
+    }
+    // VK codes mirror crossterm 0.29's `parse_key_event_record` table (the
+    // inverse mapping): exactly the VKs that parser matches on.
+    let record = |vk: u16, ch: u16| KeyRecordFields {
+        virtual_key_code: vk,
+        unicode_char: ch,
+        control_key_state: state,
+    };
+    match key.code {
+        KeyCode::Backspace => vec![record(0x08, 0x08)],
+        KeyCode::Esc => vec![record(0x1B, 0x1B)],
+        KeyCode::Enter => {
+            // The LF partner shape (`Enter + CONTROL`) rides VK_RETURN with
+            // the Ctrl state and the LF char, the record ConPTY synthesizes
+            // for a fed 0x0A byte. A BARE CR never reaches this mapping
+            // while parked (the #341 pushback invariant) — the #420 partner
+            // path requeues its own record — but the arm stays total.
+            vec![record(
+                0x0D,
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    0x0A
+                } else {
+                    0x0D
+                },
+            )]
+        }
+        KeyCode::Tab => vec![record(0x09, 0x09)],
+        KeyCode::BackTab => {
+            // Shift+Tab: the parser decides BackTab from VK_TAB + SHIFT.
+            state |= SHIFT_PRESSED_FLAG;
+            vec![KeyRecordFields {
+                virtual_key_code: 0x09,
+                unicode_char: 0x09,
+                control_key_state: state,
+            }]
+        }
+        KeyCode::Left => vec![record(0x25, 0)],
+        KeyCode::Right => vec![record(0x27, 0)],
+        KeyCode::Up => vec![record(0x26, 0)],
+        KeyCode::Down => vec![record(0x28, 0)],
+        KeyCode::Home => vec![record(0x24, 0)],
+        KeyCode::End => vec![record(0x23, 0)],
+        KeyCode::PageUp => vec![record(0x21, 0)],
+        KeyCode::PageDown => vec![record(0x22, 0)],
+        KeyCode::Insert => vec![record(0x2D, 0)],
+        KeyCode::Delete => vec![record(0x2E, 0)],
+        KeyCode::F(n) if (1..=24).contains(&n) => vec![record(0x70 + u16::from(n - 1), 0)],
+        KeyCode::Char(ch) => {
+            // Control chords: conhost encodes the control code in uChar and
+            // the base letter in the VK (Ctrl+R → 0x12 / 'R' /
+            // LEFT_CTRL_PRESSED) — crossterm's parser takes the 0x01..=0x1F
+            // uChar arm and re-derives the char from the VK.
+            if key.modifiers.contains(KeyModifiers::CONTROL) && ('\u{1}'..='\u{1a}').contains(&ch) {
+                return vec![record(b'A' as u16 + ch as u16 - 1, ch as u16)];
+            }
+            // Printable characters: the readers decode from uChar; the VK
+            // carries the letter/digit identity where one exists (cosmetic
+            // for the parser, exact for a layout-aware reader).
+            let vk = match ch {
+                'a'..='z' => ch.to_ascii_uppercase() as u16,
+                'A'..='Z' | '0'..='9' => ch as u16,
+                _ => 0,
+            };
+            // One char is at most two UTF-16 units (a surrogate pair); one
+            // record per unit round-trips through crossterm's surrogate
+            // assembly exactly as the terminal delivered it.
+            let mut units = [0u16; 2];
+            ch.encode_utf16(&mut units)
+                .iter()
+                .map(|unit| record(vk, *unit))
+                .collect()
+        }
+        // KeyCode::Null and the media/modifier keys never parse from console
+        // records (crossterm's Windows table maps their VKs to None), so
+        // they can never be parked here. Map to nothing rather than guess.
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(windows)]
 fn win_unread(events: &[crossterm29::event::Event]) {
     use windows_sys::Win32::System::Console::{
-        WriteConsoleInputW, INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD,
-        KEY_EVENT_RECORD_0,
+        INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0,
     };
 
-    fn enter_press_record(ev: &crossterm29::event::Event) -> Option<INPUT_RECORD> {
-        // The probe only ever requeues a bare Enter press (niubash#420);
-        // anything else is inert and dropped.
-        match ev {
-            crossterm29::event::Event::Key(crossterm29::event::KeyEvent {
-                code: crossterm29::event::KeyCode::Enter,
-                modifiers: crossterm29::event::KeyModifiers::NONE,
-                kind: crossterm29::event::KeyEventKind::Press,
-                ..
-            }) => {}
-            _ => return None,
-        }
-        Some(INPUT_RECORD {
+    let records: Vec<INPUT_RECORD> = events
+        .iter()
+        .filter_map(|event| match event {
+            // Non-key events (ConPTY focus flicker, mouse) are inert
+            // upstream — dropping them is observably identical to
+            // dispatching them (the probe's own skip, same justification).
+            crossterm29::event::Event::Key(key) => Some(key),
+            _ => None,
+        })
+        .flat_map(key_press_records)
+        .map(|fields| INPUT_RECORD {
             EventType: KEY_EVENT as u16,
             Event: INPUT_RECORD_0 {
                 KeyEvent: KEY_EVENT_RECORD {
                     bKeyDown: 1,
                     wRepeatCount: 1,
-                    wVirtualKeyCode: 0x0D, // VK_RETURN
-                    wVirtualScanCode: 0x1C,
+                    wVirtualKeyCode: fields.virtual_key_code,
+                    wVirtualScanCode: 0,
                     uChar: KEY_EVENT_RECORD_0 {
-                        UnicodeChar: 0x0D as u16,
+                        UnicodeChar: fields.unicode_char,
                     },
-                    dwControlKeyState: 0,
+                    dwControlKeyState: fields.control_key_state,
                 },
             },
         })
-    }
-
-    let records: Vec<INPUT_RECORD> = events.iter().filter_map(enter_press_record).collect();
-    if records.is_empty() {
-        return;
-    }
+        .collect();
     // The console handle only exists while stdin is the interactive console
     // — the only shape that ever reaches the probe.
-    let Some(handle) = crate::typeahead_guard::stdin_console_handle() else {
-        return;
-    };
-    unsafe {
-        let mut written = 0u32;
-        WriteConsoleInputW(
-            handle.0,
-            records.as_ptr(),
-            records.len() as u32,
-            &mut written,
-        );
-    }
-    drop(handle);
+    crate::typeahead_guard::requeue_console_input(&records);
 }
 
 impl PasteChunkEditMode {
@@ -867,8 +992,9 @@ impl PasteChunkEditMode {
     /// The structural paste test for a bare CR (niubash#284/#308): what is
     /// queued behind it? The probe consumes a partner when found (an LF
     /// pair partner, or the CR of a `\r\r` empty line); any other key event
-    /// — typeahead text, a chord — is pushed back for the next dispatch so
-    /// nothing is lost or reordered, and the CR is a typed submit; so is
+    /// — typeahead text, a chord — is parked in the pushback (and at the
+    /// submit written back to the stream's head, niubash#417) so nothing is
+    /// lost or reordered, and the CR is a typed submit; so is
     /// silence. Inert non-key events (ConPTY focus flicker) are skipped
     /// while hunting: they dispatch to nothing upstream. The probe is SOUND
     /// because reedline's own batch loop stops every batch at a bare Enter
@@ -923,6 +1049,10 @@ impl PasteChunkEditMode {
                         return PastePartner::CrPartner(crossterm29::event::Event::Key(key));
                     }
                     self.pushback.push_back(crossterm29::event::Event::Key(key));
+                    // Parked only until this batch's boundary: a submit
+                    // dispatches it back to the input stream's head
+                    // (niubash#417), any other terminal hands it to the
+                    // next batch's drain — both without loss or reorder.
                     return PastePartner::None;
                 }
                 // Non-key events are inert upstream; dropping them here is
@@ -951,8 +1081,10 @@ enum PastePartner {
     /// chunk-open it is requeued verbatim and the CR is a typed submit.
     CrPartner(crossterm29::event::Event),
     /// Any other queued Press key (typeahead text, a chord) or silence:
-    /// typed-submit evidence. The key is pushed back, in order, for the
-    /// next dispatch.
+    /// typed-submit evidence. The key is parked in the pushback and rides
+    /// the submit back to the input stream's head (niubash#417), in order,
+    /// for the accepted command's `read` — or the next dispatch if no
+    /// submit follows.
     None,
 }
 
@@ -1035,6 +1167,21 @@ impl EditMode for PasteChunkEditMode {
             if terminal {
                 break;
             }
+        }
+        // niubash#417: a batch ending in an Enter is (or leads to) a SUBMIT
+        // — reedline stops reading at it and hands the shell the line, and
+        // the accepted command's engine `read` then reads the KERNEL queue,
+        // which cannot see this in-process deque. Whatever the Enter probe
+        // parked (the typeahead that proved the submit) goes back to the
+        // input stream's head now, so a command that reads gets it and a
+        // command that does not finds it queued for the next prompt, in
+        // order. A validator-held Enter (PS2 continuation) re-reads the
+        // records through the same queue — same order, no observable
+        // change. Batches that do NOT end in a submit keep their park
+        // until the next dispatch (nothing leaves the read loop between).
+        if matches!(events.last(), Some(ReedlineEvent::Enter)) && !self.pushback.is_empty() {
+            let parked: Vec<crossterm29::event::Event> = self.pushback.drain(..).collect();
+            (self.unread)(&parked);
         }
         if events.len() == 1 {
             events.pop().expect("len checked")
@@ -4019,8 +4166,9 @@ mod tests {
 
     /// niubash#308 adjacency: typeahead (not an LF partner) queued behind a
     /// bare CR that lands on a pending chunk. The chunk flushes and submits,
-    /// and the typeahead key is pushed back so it lands, in order, in the
-    /// NEXT line's buffer — GNU typeahead semantics, never absorption.
+    /// and the typeahead key goes back to the input stream's head at the
+    /// submit (niubash#417), so it lands, in order, in the NEXT line's
+    /// buffer — GNU typeahead semantics, never absorption.
     #[test]
     fn paste_chunk_detector_pending_enter_with_typeahead_behind_submits_in_order() {
         let (mut detector, queue) = paste_detector_and_queue(vec![lf_key_event()]);
@@ -4050,21 +4198,38 @@ mod tests {
             other => panic!("expected flush + submit, got {other:?}"),
         }
         assert!(detector.pending.is_none());
-        assert_eq!(detector.pushback.len(), 1, "the typeahead key is kept");
-        // The next dispatch drains the pushback first: 'z' is an edit of
-        // the fresh line, not lost paste data.
+        // The probe-parked 'z' went back to the input stream at the submit —
+        // the accepted command's engine `read` must be able to reach it
+        // (niubash#417); nothing stays parked in-process.
+        assert!(
+            detector.pushback.is_empty(),
+            "the typeahead is requeued, not parked"
+        );
+        {
+            let requeued = queue.lock().expect("test queue");
+            assert_eq!(requeued.len(), 1, "'z' is back at the stream's head");
+            assert!(matches!(
+                requeued.front(),
+                Some(crossterm29::event::Event::Key(key))
+                    if matches!(key.code, crossterm29::event::KeyCode::Char('z'))
+            ));
+        }
+        // reedline re-reads the requeued key as the next raw event: an edit
+        // of the fresh line, not lost paste data.
+        let event = detector.parse_event(paste_key(
+            crossterm29::event::KeyCode::Char('z'),
+            crossterm29::event::KeyModifiers::NONE,
+        ));
+        assert!(
+            matches!(event, ReedlineEvent::Edit(_)),
+            "the requeued 'z' edits the fresh line: {event:?}"
+        );
+        // And the key typed after it ('w') follows in order.
         let event = detector.parse_event(paste_key(
             crossterm29::event::KeyCode::Char('w'),
             crossterm29::event::KeyModifiers::NONE,
         ));
-        match event {
-            ReedlineEvent::Multiple(events) => {
-                assert_eq!(events.len(), 2, "pushed-back 'z' precedes 'w'");
-                assert!(matches!(&events[0], ReedlineEvent::Edit(_)));
-                assert!(matches!(&events[1], ReedlineEvent::Edit(_)));
-            }
-            other => panic!("expected pushback + key edits, got {other:?}"),
-        }
+        assert!(matches!(event, ReedlineEvent::Edit(_)));
         assert!(detector.pushback.is_empty());
     }
 
@@ -4133,17 +4298,13 @@ mod tests {
     }
 
     /// Typeahead behind a typed Enter (a driver's next send_line, a
-    /// script's next line): the Enter submits, and the queued text is
-    /// pushed back so it lands, in order, in the NEXT line's buffer — GNU
-    /// typeahead semantics, never absorption into a paste chunk.
+    /// script's next line): the Enter submits, and the queued text goes
+    /// back to the input stream's head at the submit (niubash#417), so it
+    /// lands, in order, in the NEXT line's buffer — GNU typeahead
+    /// semantics, never absorption into a paste chunk.
     #[test]
     fn paste_chunk_detector_submits_enter_with_typeahead_behind_it() {
-        let mut detector = paste_detector_with_queue(vec![crossterm29::event::Event::Key(
-            crossterm29::event::KeyEvent::new(
-                crossterm29::event::KeyCode::Char('c'),
-                crossterm29::event::KeyModifiers::NONE,
-            ),
-        )]);
+        let (mut detector, queue) = paste_detector_and_queue(vec![char_key_event('c')]);
         for ch in "cmd1".chars() {
             detector.parse_event(paste_key(
                 crossterm29::event::KeyCode::Char(ch),
@@ -4155,23 +4316,83 @@ mod tests {
             matches!(event, ReedlineEvent::Enter),
             "a CR whose queued follower is not an LF is a typed submit: {event:?}"
         );
-        assert_eq!(detector.pushback.len(), 1, "the typeahead key is kept");
+        // niubash#417: the probe-parked 'c' went back to the input stream
+        // at the submit — the accepted command's engine `read` (the queue's
+        // next reader) must be able to reach it.
+        assert!(
+            detector.pushback.is_empty(),
+            "the typeahead is requeued, not parked in-process"
+        );
+        {
+            let requeued = queue.lock().expect("test queue");
+            assert_eq!(requeued.len(), 1, "'c' is back at the stream's head");
+            assert!(
+                matches!(
+                    requeued.front(),
+                    Some(crossterm29::event::Event::Key(key))
+                        if matches!(key.code, crossterm29::event::KeyCode::Char('c'))
+                ),
+                "'c' is requeued verbatim"
+            );
+        }
 
-        // The next dispatch (the queue's next key, 'm') drains the pushback
-        // first: 'c' then 'm', both edits, no paste absorption.
-        let event = detector.parse_event(paste_key(
-            crossterm29::event::KeyCode::Char('m'),
-            crossterm29::event::KeyModifiers::NONE,
-        ));
-        match event {
-            ReedlineEvent::Multiple(events) => {
-                assert_eq!(events.len(), 2, "pushed-back 'c' precedes 'm'");
-                assert!(matches!(&events[0], ReedlineEvent::Edit(_)));
-                assert!(matches!(&events[1], ReedlineEvent::Edit(_)));
-            }
-            other => panic!("expected pushback + key edits, got {other:?}"),
+        // reedline re-reads the requeued 'c' as the next raw event, then
+        // 'm': both edits of the fresh line, in order, no paste absorption.
+        for ch in ['c', 'm'] {
+            let event = detector.parse_event(paste_key(
+                crossterm29::event::KeyCode::Char(ch),
+                crossterm29::event::KeyModifiers::NONE,
+            ));
+            assert!(
+                matches!(event, ReedlineEvent::Edit(_)),
+                "requeued '{ch}' edits the fresh line: {event:?}"
+            );
         }
         assert!(detector.pushback.is_empty());
+    }
+
+    /// niubash#417, the head-vs-tail distinction this fix rides on: the
+    /// probe parks the FIRST key queued behind the submit Enter, and any
+    /// keys behind THAT stay in the queue. The requeue must land the parked
+    /// key back in FRONT of them (the order the typist produced), never
+    /// behind — a tail append would let line 2's `ead` run before the
+    /// parked `r` of `read` and shred the burst.
+    #[test]
+    fn paste_chunk_detector_submit_requeues_parked_typeahead_at_stream_head_417() {
+        let (mut detector, queue) =
+            paste_detector_and_queue(vec![char_key_event('r'), char_key_event('!')]);
+        detector.parse_event(paste_key(
+            crossterm29::event::KeyCode::Char('e'),
+            crossterm29::event::KeyModifiers::NONE,
+        ));
+        // The submit Enter: the probe parks 'r' (the next line's first
+        // key); '!' is still queued behind it.
+        let event = detector.parse_event(cr());
+        assert!(
+            matches!(event, ReedlineEvent::Enter),
+            "typeahead behind the Enter is a typed submit: {event:?}"
+        );
+        assert!(detector.pushback.is_empty());
+        // The queue reads [parked 'r', still-queued '!'] — the exact order
+        // the typist produced.
+        {
+            let requeued = queue.lock().expect("test queue");
+            let codes: Vec<char> = requeued
+                .iter()
+                .filter_map(|event| match event {
+                    crossterm29::event::Event::Key(key) => match key.code {
+                        crossterm29::event::KeyCode::Char(ch) => Some(ch),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                codes,
+                vec!['r', '!'],
+                "the parked key is re-queued AHEAD of what was queued behind it"
+            );
+        }
     }
 
     /// A bare Ctrl+J (the console's shape for a fed LF) with no chunk
@@ -4283,22 +4504,24 @@ mod tests {
 
     /// The pushback invariant behind #341, stated directly: whatever the
     /// probe meets in the queue, the pushback may hold text keys and chords
-    /// — never a bare CR.
+    /// — never a bare CR. At a submit the whole park empties into the input
+    /// stream's head (niubash#417), so what crosses a batch boundary is
+    /// never an unexamined CR.
     #[test]
     fn paste_chunk_detector_pushback_never_holds_a_bare_cr_341() {
-        // Text behind the CR: typed submit, the text key is parked.
-        let mut detector = paste_detector_with_queue(vec![char_key_event('z')]);
+        // Text behind the CR: typed submit, the text key requeued to the
+        // stream's head — never parked past the batch boundary.
+        let (mut detector, queue) = paste_detector_and_queue(vec![char_key_event('z')]);
         let event = detector.parse_event(cr());
         assert!(
             matches!(event, ReedlineEvent::Enter),
             "a CR with typeahead behind it is a typed submit: {event:?}"
         );
-        assert_eq!(detector.pushback.len(), 1);
-        assert!(!matches!(
-            detector.pushback.front(),
-            Some(crossterm29::event::Event::Key(key))
-                if is_bare_enter(key)
-        ));
+        assert!(
+            detector.pushback.is_empty(),
+            "a submit leaves nothing parked in the pushback (niubash#417)"
+        );
+        assert_eq!(queue.lock().expect("test queue").len(), 1);
         // A CR behind the CR at chunk-open: typed submit, the partner
         // requeued to the input stream's head — never the pushback
         // (niubash#420).
@@ -4346,6 +4569,137 @@ mod tests {
             crossterm29::event::KeyCode::Char('m'),
             crossterm29::event::KeyModifiers::NONE
         )));
+    }
+
+    // ---- #417 writeback face: the event→console-record synthesis ----
+
+    fn synth(
+        code: crossterm29::event::KeyCode,
+        modifiers: crossterm29::event::KeyModifiers,
+    ) -> Vec<KeyRecordFields> {
+        key_press_records(&crossterm29::event::KeyEvent::new(code, modifiers))
+    }
+
+    /// A plain character decodes from uChar; the VK carries the
+    /// letter/digit identity. Uppercase rides the SHIFT state exactly like
+    /// the record conhost synthesizes for shift+letter.
+    #[test]
+    fn key_records_synthesize_plain_characters() {
+        assert_eq!(
+            synth(
+                crossterm29::event::KeyCode::Char('e'),
+                crossterm29::event::KeyModifiers::NONE
+            ),
+            vec![KeyRecordFields {
+                virtual_key_code: b'E' as u16,
+                unicode_char: 'e' as u16,
+                control_key_state: 0,
+            }]
+        );
+        assert_eq!(
+            synth(
+                crossterm29::event::KeyCode::Char('Z'),
+                crossterm29::event::KeyModifiers::SHIFT
+            ),
+            vec![KeyRecordFields {
+                virtual_key_code: b'Z' as u16,
+                unicode_char: 'Z' as u16,
+                control_key_state: SHIFT_PRESSED_FLAG,
+            }]
+        );
+        // A symbol has no layout-independent VK: the readers decode from
+        // uChar (VK 0 falls through both parsers' special-key tables).
+        assert_eq!(
+            synth(
+                crossterm29::event::KeyCode::Char('!'),
+                crossterm29::event::KeyModifiers::SHIFT
+            )
+            .first()
+            .map(|r| (r.virtual_key_code, r.unicode_char)),
+            Some((0, '!' as u16))
+        );
+    }
+
+    /// A control chord round-trips the conhost convention the console
+    /// parser produced it with: control code in uChar, base letter in the
+    /// VK, LEFT_CTRL_PRESSED in the state — so crossterm's parser re-derives
+    /// the same event and the engine's reader decodes the same byte.
+    #[test]
+    fn key_records_synthesize_control_chords() {
+        assert_eq!(
+            synth(
+                crossterm29::event::KeyCode::Char('\u{12}'),
+                crossterm29::event::KeyModifiers::CONTROL
+            ),
+            vec![KeyRecordFields {
+                virtual_key_code: b'R' as u16,
+                unicode_char: 0x12,
+                control_key_state: LEFT_CTRL_PRESSED_FLAG,
+            }]
+        );
+    }
+
+    /// Special keys ride the VKs of crossterm's own parse table (the exact
+    /// inverse mapping); BackTab is decided from VK_TAB + SHIFT.
+    #[test]
+    fn key_records_synthesize_special_keys() {
+        assert_eq!(
+            synth(
+                crossterm29::event::KeyCode::Left,
+                crossterm29::event::KeyModifiers::NONE
+            )
+            .first()
+            .map(|r| (r.virtual_key_code, r.unicode_char)),
+            Some((0x25, 0))
+        );
+        assert_eq!(
+            synth(
+                crossterm29::event::KeyCode::F(12),
+                crossterm29::event::KeyModifiers::NONE
+            )
+            .first()
+            .map(|r| r.virtual_key_code),
+            Some(0x7B)
+        );
+        let back_tab = synth(
+            crossterm29::event::KeyCode::BackTab,
+            crossterm29::event::KeyModifiers::SHIFT,
+        );
+        assert_eq!(back_tab.len(), 1);
+        assert_eq!(back_tab[0].virtual_key_code, 0x09);
+        assert_eq!(
+            back_tab[0].control_key_state, SHIFT_PRESSED_FLAG,
+            "BackTab round-trips as VK_TAB + SHIFT"
+        );
+    }
+
+    /// A non-BMP character is one record per UTF-16 unit, so crossterm's
+    /// surrogate assembly reproduces the original Char event.
+    #[test]
+    fn key_records_split_non_bmp_characters_into_surrogate_units() {
+        let records = synth(
+            crossterm29::event::KeyCode::Char('\u{10437}'),
+            crossterm29::event::KeyModifiers::NONE,
+        );
+        let units: Vec<u16> = records.iter().map(|r| r.unicode_char).collect();
+        assert_eq!(units, vec![0xD801, 0xDC37]);
+    }
+
+    /// Releases and shapes the console parser cannot produce never map —
+    /// they could never be parked here to begin with.
+    #[test]
+    fn key_records_drop_releases_and_unparseable_codes() {
+        let mut release = crossterm29::event::KeyEvent::new(
+            crossterm29::event::KeyCode::Char('x'),
+            crossterm29::event::KeyModifiers::NONE,
+        );
+        release.kind = crossterm29::event::KeyEventKind::Release;
+        assert!(key_press_records(&release).is_empty());
+        assert!(synth(
+            crossterm29::event::KeyCode::Null,
+            crossterm29::event::KeyModifiers::NONE
+        )
+        .is_empty());
     }
 
     /// niubash#373 CR round: the menu-dismissal Esc rides an Enter ONLY
