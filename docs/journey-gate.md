@@ -413,7 +413,28 @@ sandbox under a directory you choose; it is kept on red, removed on
 green), `--phases IDS` (comma-separated: the base J1–J7 gate always runs
 first, then the named registered phases; `all` = every registered phase —
 the DEFAULT, the gate exercises everything; `base` = the bare release
-gate; legacy `--phase` words accepted: `full`, `gate`, `persist`).
+gate; legacy `--phase` words accepted: `full`, `gate`, `persist`),
+`--cleanup-sandbox DIR` (standalone verb, no `niu.exe` needed: delete a
+kept sandbox directory in the journey's own context — DACLs and the
+read-only attribute are restored to host-clearable first — and exit 0
+when the path is gone).
+
+### Sandbox landing + host-clearable teardown (niubash#428)
+
+A bare Python script has no git-bash-style path translation, so the
+repo's conventional `/d/tmp/x` is read as DRIVE-RELATIVE: with the cwd
+on D: the sandbox used to land at `D:\d\tmp\x` — the literal `/d`
+became a junk first directory (the `D:\d` junk tree). The `--keep-sandbox`,
+`--artifacts` and `--cleanup-sandbox` landing points therefore rewrite
+the single-letter-drive form (`/d/...` → `D:/...`, with a printed
+normalization note) and print the actual sandbox landing on every run;
+an explicit `D:/...` form never regresses. Teardown makes the whole
+sandbox tree host-clearable BEFORE it is deleted or kept (icacls
+`/reset` back to parent inheritance + read-only attribute cleared), so
+a kept-for-diagnosis tree deletes with one host command
+(`Remove-Item -Recurse`), and debris from older runs is removed by the
+`--cleanup-sandbox` verb (icacls → attrib → rmtree, escalating through
+takeown and `rd /s /q` while the tree survives).
 
 ### Phase composition (--phases)
 
