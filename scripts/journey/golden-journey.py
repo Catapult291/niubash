@@ -155,6 +155,7 @@ known-fail, 1 an unlabeled fail (or an unrecognized verdict), 2 skip
 id).
 
 Usage: python scripts/journey/golden-journey.py <niu.exe> [--artifacts DIR]
+        [--keep-sandbox DIR] [--cleanup-sandbox DIR]
         [--phases all|base|P3,P4,P7,P8,...|full|gate|persist]
 """
 
@@ -165,6 +166,8 @@ import os
 import random
 import re
 import shutil
+import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -3784,6 +3787,138 @@ def phase_p8(exe, home, env, verdict, seed, state):
     p8_s4_remove_active_theme_source(exe, home, env, verdict, seed, state)
 
 
+# ── Sandbox path + hygiene guards (issue #428, both root causes) ────────────
+# Root cause 1: the repo convention writes Windows paths git-bash style
+# (`/d/tmp/x`), and git/niu translate that — but a bare Python script has
+# no translation layer: pathlib reads `/d/...` as a DRIVE-RELATIVE path
+# (root `\` on the current drive), so with the cwd on D: the sandbox
+# landed at `D:\d\tmp\...` — the literal `/d` became a junk first
+# directory. The single-letter first segment is rewritten to the drive
+# form it spells; anything else passes through untouched (an explicit
+# `D:/...` never regresses).
+def normalize_posix_drive_form(raw: Path) -> Path:
+    if os.name != "nt":
+        return raw
+    parts = raw.parts  # ('\\', 'd', 'tmp', 'x') for '/d/tmp/x'
+    if (len(parts) >= 2 and parts[0] == "\\"
+            and len(parts[1]) == 1 and parts[1].isalpha()):
+        return Path(parts[1].upper() + ":\\", *parts[2:])
+    return raw
+
+
+def _run_quiet(cmd: list, timeout: int = 600) -> bool:
+    """One rescue command, output captured, errors swallowed — the
+    caller decides from the return code whether to escalate."""
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
+
+
+# Root cause 2: a journey run under a restricted-token context (the
+# coding-agent sandboxes) leaves the sandbox tree with DACLs that deny
+# the plain host user even enumeration — the #428 cleanup chain
+# (takeown / icacls / rd / Remove-Item) failed end to end on the debris
+# and the tree had to be quarantined by rename. The host must be able
+# to clean its own disk, so every teardown path restores parent-inherited
+# (host-clearable) DACLs and strips the read-only attribute (git loose
+# objects are 444 — a Windows attribute, invisible to icacls) over the
+# whole tree BEFORE it is deleted or kept.
+def make_host_clearable(root: Path) -> None:
+    """Best-effort, never raises: `icacls /reset /t /c /q` puts every
+    node's DACL back on parent inheritance (the owner keeps the implicit
+    WRITE_DAC that makes the reset itself possible), `attrib -R /S /D`
+    clears the read-only attribute. A no-op off Windows."""
+    if os.name != "nt":
+        return
+    _run_quiet(["icacls", str(root), "/reset", "/t", "/c", "/q"])
+    _run_quiet(["attrib", "-R", str(root) + "\\*", "/S", "/D"])
+
+
+def _rmtree_clearing_readonly(root: Path) -> None:
+    """shutil.rmtree that retries each entry after clearing the Windows
+    read-only attribute, and never raises (the old teardown's
+    ignore_errors=True semantics — a denied DACL stranded the debris
+    silently, which is exactly how #428's junk tree survived)."""
+    def _retry(func, target, _exc):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass  # best-effort, like ignore_errors
+    kwargs = ({"onexc": _retry} if sys.version_info >= (3, 12)
+              else {"onerror": _retry})
+    try:
+        shutil.rmtree(root, **kwargs)
+    except OSError:
+        pass  # absent root, denied top-level stat — the caller probes
+
+
+def _tree_present(root: Path) -> bool:
+    """Honest presence probe: a denied DACL makes Path.exists() (a stat
+    of the node itself) return False while the entry is still there —
+    ask the parent directory's enumeration first."""
+    try:
+        return any(entry.name == root.name
+                   for entry in os.scandir(root.parent))
+    except OSError:
+        return root.exists()
+
+
+def force_rmtree(root: Path) -> tuple[bool, str]:
+    """Delete a tree a plain rmtree may not be able to (denied DACLs
+    from a restricted-context run, read-only git objects): reset the
+    ACLs, clear the attributes, rmtree — escalating to takeown + a
+    second reset + `rd /s /q` only while the tree survives. Returns
+    (removed, what did it / why not)."""
+    make_host_clearable(root)
+    _rmtree_clearing_readonly(root)
+    if not _tree_present(root):
+        return True, "ACL/attribute reset was enough"
+    if os.name == "nt":
+        if _run_quiet(["takeown", "/F", str(root), "/R", "/D", "Y"]):
+            make_host_clearable(root)
+            _rmtree_clearing_readonly(root)
+            if not _tree_present(root):
+                return True, "takeown + ACL reset was enough"
+        if (_run_quiet(["cmd", "/c", "rd", "/s", "/q", str(root)])
+                and not _tree_present(root)):
+            return True, "takeown + rd /s /q"
+    return False, "the tree survived icacls/attrib/rmtree/takeown/rd"
+
+
+def cleanup_sandbox_verb(raw: Path) -> int:
+    """#428 root cause 2, the explicit escape hatch: delete a kept
+    sandbox tree in the journey's own context, where the ACL rescue
+    chain has a chance the plain host shell was denied. Exit 0 = the
+    path is gone, 1 = it survived the full chain, 2 = the request was
+    refused (relative path, drive root)."""
+    target = normalize_posix_drive_form(raw)
+    if target != raw:
+        print(f"cleanup-sandbox: POSIX drive form {raw} normalized to "
+              f"{target} (#428)")
+    if not target.is_absolute():
+        print(f"cleanup-sandbox: refusing a relative path ({raw}); pass "
+              f"an absolute directory")
+        return 2
+    if target.parent == target:  # a drive root (D:\) is never a sandbox
+        print(f"cleanup-sandbox: refusing a drive root ({target})")
+        return 2
+    if not target.exists():
+        print(f"cleanup-sandbox: cannot stat {target} (absent, or the "
+              f"DACL denies enumeration — attempting force cleanup)")
+    print(f"cleanup-sandbox: force-deleting {target}")
+    ok, detail = force_rmtree(target)
+    if ok:
+        print(f"cleanup-sandbox: removed ({detail})")
+        return 0
+    print(f"cleanup-sandbox: STILL PRESENT ({detail}); retry from an "
+          f"elevated shell")
+    return 1
+
+
 def main() -> int:
     # CI runners default to a charmap console; the journey transcript carries
     # CJK/emoji wizard text (the owner's own wording). Force UTF-8 stdio.
@@ -3792,13 +3927,23 @@ def main() -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         description="The Golden User Journey gate (owner directive 2026-10-04)")
-    parser.add_argument("niu", type=Path, help="path to the built niu.exe")
+    parser.add_argument("niu", type=Path, nargs="?", default=None,
+                        help="path to the built niu.exe (required unless "
+                             "--cleanup-sandbox is given)")
     parser.add_argument("--artifacts", type=Path, default=None,
                         help="where verdict + transcripts go "
                              "(default: target/journey-results/<timestamp>)")
     parser.add_argument("--keep-sandbox", type=Path, default=None,
                         help="create the sandbox under this directory "
-                             "(kept on failure for diagnosis)")
+                             "(kept on failure for diagnosis); a POSIX "
+                             "drive form (/d/tmp) is normalized to D:/tmp "
+                             "— issue #428")
+    parser.add_argument("--cleanup-sandbox", type=Path, default=None,
+                        metavar="DIR",
+                        help="delete a kept sandbox directory (#428): "
+                             "restore host-clearable ACLs in the journey's "
+                             "own context, then remove the tree; exit 0 "
+                             "when the path is gone, 1 if it survived")
     # Phase composition (journey-spec.md §7 lane split; the wt86/jmerge
     # unified mechanism): comma-separated entries. The base J1–J7 gate
     # ALWAYS runs first; then the registered phases named here. 'all'
@@ -3819,6 +3964,34 @@ def main() -> int:
     parser.add_argument("--stress-delay-ms", type=int, default=0,
                         help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    # The #428 landing guard applies to every user-typed directory: the
+    # same bare-Python /d/... misread would strand artifacts just as
+    # silently as it stranded the sandbox.
+    if args.keep_sandbox is not None:
+        raw_keep = args.keep_sandbox
+        args.keep_sandbox = normalize_posix_drive_form(raw_keep)
+        if args.keep_sandbox != raw_keep:
+            print(f"keep-sandbox: POSIX drive form {raw_keep} normalized "
+                  f"to {args.keep_sandbox} (#428: a bare /d/... is "
+                  f"drive-relative to Python — it landed at "
+                  f"<cwd-drive>:\\d\\...)")
+    if args.artifacts is not None:
+        raw_artifacts = args.artifacts
+        args.artifacts = normalize_posix_drive_form(raw_artifacts)
+        if args.artifacts != raw_artifacts:
+            print(f"artifacts: POSIX drive form {raw_artifacts} normalized "
+                  f"to {args.artifacts} (same #428 guard)")
+
+    # The cleanup verb stands alone: it runs before anything that needs
+    # the niu binary, so debris from older runs can be cleared without a
+    # build at hand.
+    if args.cleanup_sandbox is not None:
+        return cleanup_sandbox_verb(args.cleanup_sandbox)
+
+    if args.niu is None:
+        parser.error("the niu.exe argument is required (unless "
+                     "--cleanup-sandbox is given)")
 
     global STRESS_DELAY_MS
     STRESS_DELAY_MS = max(0, args.stress_delay_ms)
@@ -3864,16 +4037,22 @@ def main() -> int:
 
     if args.keep_sandbox is not None:
         args.keep_sandbox.mkdir(parents=True, exist_ok=True)
+        print(f"keep-sandbox landing: {args.keep_sandbox}")
     sandbox_parent = (args.keep_sandbox or Path(tempfile.gettempdir())).resolve()
     # ABSOLUTE on purpose: a relative sandbox home doubles inside niu's
     # path joins (observed 2026-10-03: rc written to <home>/<home>/.niubashrc).
     sandbox = Path(tempfile.mkdtemp(prefix="journey-", dir=sandbox_parent)).resolve()
+    # The landing is never silent (#428): a misread /d/... used to strand
+    # the tree a full drive-relative level down with no on-screen trace.
+    print(f"sandbox: {sandbox}")
 
     (artifacts / "run.json").write_text(
         json.dumps({"niu": str(exe), "sandbox": str(sandbox),
                     "started_utc": now_utc(), "pid": os.getpid(),
                     "stress_delay_ms": STRESS_DELAY_MS,
-                    "phases": ["base"] + phases},
+                    "phases": ["base"] + phases,
+                    **({"keep_sandbox": str(args.keep_sandbox)}
+                       if args.keep_sandbox is not None else {})},
                    indent=2) + "\n",
         encoding="utf-8", newline="\n")
 
@@ -3881,13 +4060,19 @@ def main() -> int:
         result = journey(exe, sandbox, verdict, phases=phases)
     finally:
         # Sandbox hygiene: the sources trees are heavy clones; keep them
-        # only when a red gate (or a crash) needs diagnosis.
+        # only when a red gate (or a crash) needs diagnosis. Whatever the
+        # verdict, the tree is made HOST-CLEARABLE first (#428 root cause
+        # 2): a restricted-context run leaves DACLs that deny the plain
+        # host user even enumeration, and the old plain
+        # rmtree(ignore_errors=True) would then strand the debris without
+        # a word.
+        make_host_clearable(sandbox)
         if gate_is_red(artifacts):
             (artifacts / "sandbox-kept.txt").write_text(
                 f"{sandbox}\n", encoding="utf-8", newline="\n")
             print(f"NOTE: sandbox kept for diagnosis: {sandbox}")
         else:
-            shutil.rmtree(sandbox, ignore_errors=True)
+            _rmtree_clearing_readonly(sandbox)
 
     print((artifacts / "verdict.txt").read_text(encoding="utf-8"))
     print(f"artifacts: {artifacts}")
