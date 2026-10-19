@@ -662,11 +662,22 @@ struct PasteChunkEditMode {
     /// Ctrl+R dead key. A CONTROL chord always ends the window: the verb it
     /// invokes (search, cancel, EOF) owns the next Enter.
     menu_possible: bool,
+    /// niubash#420: put probe-consumed events BACK at the head of the input
+    /// stream. The live console cannot unread, so the events are written
+    /// back into the kernel input queue (`WriteConsoleInputW`, the #417
+    /// reinjection face); the scripted test queue pushes front, which
+    /// preserves order exactly.
+    unread: Unread,
 }
 
 /// The lookahead source of [`PasteChunkEditMode`]: yield the next queued
 /// input event within `budget`, or `None` on silence.
 type Lookahead = Box<dyn FnMut(Duration) -> Option<crossterm29::event::Event> + Send>;
+
+/// The requeue source of [`PasteChunkEditMode`] (niubash#420): hand events
+/// the probe consumed but the submit decision did NOT need back to the HEAD
+/// of the input stream, verbatim and in order.
+type Unread = Box<dyn FnMut(&[crossterm29::event::Event]) + Send>;
 
 /// The production lookahead: wait up to `budget` for the next console input
 /// event and read it. A non-console stdin (pipes, tests) makes `poll` fail —
@@ -679,28 +690,106 @@ fn live_lookahead(budget: Duration) -> Option<crossterm29::event::Event> {
     }
 }
 
+/// The production requeue: write the events back into the kernel console
+/// input queue, so the NEXT read (reedline's own, or a host command's) sees
+/// them in order. Only key presses the probe consumed are ever handed here
+/// (a bare Enter — niubash#420), so the record synthesis covers exactly
+/// that shape. A non-console stdin or a failed write drops the events:
+/// the worst case is one lost empty-line submit, never a wedged one.
+fn live_unread(events: &[crossterm29::event::Event]) {
+    #[cfg(windows)]
+    win_unread(events);
+    #[cfg(not(windows))]
+    let _ = events;
+}
+
+#[cfg(windows)]
+fn win_unread(events: &[crossterm29::event::Event]) {
+    use windows_sys::Win32::System::Console::{
+        WriteConsoleInputW, INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD,
+        KEY_EVENT_RECORD_0,
+    };
+
+    fn enter_press_record(ev: &crossterm29::event::Event) -> Option<INPUT_RECORD> {
+        // The probe only ever requeues a bare Enter press (niubash#420);
+        // anything else is inert and dropped.
+        match ev {
+            crossterm29::event::Event::Key(crossterm29::event::KeyEvent {
+                code: crossterm29::event::KeyCode::Enter,
+                modifiers: crossterm29::event::KeyModifiers::NONE,
+                kind: crossterm29::event::KeyEventKind::Press,
+                ..
+            }) => {}
+            _ => return None,
+        }
+        Some(INPUT_RECORD {
+            EventType: KEY_EVENT as u16,
+            Event: INPUT_RECORD_0 {
+                KeyEvent: KEY_EVENT_RECORD {
+                    bKeyDown: 1,
+                    wRepeatCount: 1,
+                    wVirtualKeyCode: 0x0D, // VK_RETURN
+                    wVirtualScanCode: 0x1C,
+                    uChar: KEY_EVENT_RECORD_0 {
+                        UnicodeChar: 0x0D as u16,
+                    },
+                    dwControlKeyState: 0,
+                },
+            },
+        })
+    }
+
+    let records: Vec<INPUT_RECORD> = events.iter().filter_map(enter_press_record).collect();
+    if records.is_empty() {
+        return;
+    }
+    // The console handle only exists while stdin is the interactive console
+    // — the only shape that ever reaches the probe.
+    let Some(handle) = crate::typeahead_guard::stdin_console_handle() else {
+        return;
+    };
+    unsafe {
+        let mut written = 0u32;
+        WriteConsoleInputW(
+            handle.0,
+            records.as_ptr(),
+            records.len() as u32,
+            &mut written,
+        );
+    }
+    drop(handle);
+}
+
 impl PasteChunkEditMode {
     fn new(inner: Box<dyn EditMode>) -> Self {
-        Self::with_lookahead(inner, Box::new(live_lookahead))
+        Self::with_lookahead(inner, Box::new(live_lookahead), Box::new(live_unread))
     }
 
     /// The test constructor: a scripted lookahead queue in place of the
-    /// live console queue.
+    /// live console queue. The requeue pushes FRONT, so order is preserved
+    /// exactly.
     #[cfg(test)]
     fn with_scripted_queue(
         inner: Box<dyn EditMode>,
         queue: std::sync::Arc<std::sync::Mutex<VecDeque<crossterm29::event::Event>>>,
     ) -> Self {
+        let unread_queue = std::sync::Arc::clone(&queue);
         Self::with_lookahead(
             inner,
             Box::new(move |budget| {
                 let _ = budget;
                 queue.lock().expect("test queue").pop_front()
             }),
+            Box::new(move |events| {
+                let mut queue = unread_queue.lock().expect("test queue");
+                for event in events.iter().rev() {
+                    queue.push_front(event.clone());
+                }
+            }),
         )
     }
 
-    fn with_lookahead(inner: Box<dyn EditMode>, lookahead: Lookahead) -> Self {
+    fn with_lookahead(inner: Box<dyn EditMode>, lookahead: Lookahead, unread: Unread) -> Self {
         Self {
             inner,
             pending: None,
@@ -708,6 +797,7 @@ impl PasteChunkEditMode {
             pushback: VecDeque::new(),
             lookahead,
             menu_possible: false,
+            unread,
         }
     }
 
@@ -730,9 +820,23 @@ impl PasteChunkEditMode {
 
     /// Decide a bare Enter that would OPEN a paste chunk: does it carry the
     /// paste signature? Returns `true` when the Enter is paste data (the
-    /// chunk is opened with its line break; a CR's queued partner — an LF
-    /// pair partner, or the CR of a `\r\r` empty line — is consumed with
-    /// it), `false` when it is a typed submit.
+    /// chunk is opened with its line break; an LF pair partner is consumed
+    /// with it), `false` when it is a typed submit.
+    ///
+    /// niubash#420: a bare CR behind a bare CR is NO LONGER paste evidence
+    /// here. The `\r\r` pair is indistinguishable, at the queue level,
+    /// between the WT KEY_EVENT paste's empty line (niubash#341) and TWO
+    /// TYPEAHEAD SUBMITS in one pty write — a driver's `send("cmd\r\r")`,
+    /// an expect script's back-to-back Enters, the Ctrl+R accept-Enter
+    /// followed by the submit-Enter. Folding it swallowed the first submit:
+    /// the line echoed and parked in the continuation buffer forever (the
+    /// shared-driver wedge of PR #418's Ctrl+R E2E). GNU typeahead semantics
+    /// win: the first CR SUBMITS, and the partner CR — already consumed by
+    /// the probe — goes back to the head of the input stream (the #417
+    /// requeue face) to submit the empty line, or to accept+submit the
+    /// Ctrl+R match, on its own dispatch. A chunk only opens on paste
+    /// evidence now: the LF partner (humans never send Ctrl+J), or an
+    /// already-pending chunk (see the mid-chunk fold below).
     fn enter_opens_chunk(&mut self, enter: &crossterm29::event::KeyEvent) -> bool {
         // A bare LF (Enter + CONTROL) with no chunk pending is a paste
         // newline by itself: humans submit with Enter, never Ctrl+J, while
@@ -743,18 +847,18 @@ impl PasteChunkEditMode {
             self.pending = Some(String::from("\n"));
             return true;
         }
-        // A bare CR: paste when its partner is queued right behind it (the
-        // probe consumes the partner, so the pair is complete here).
+        // A bare CR: paste only when an LF partner is queued right behind
+        // it (the probe consumes the partner, so the pair is complete
+        // here). A CR partner is typeahead: requeue it (verbatim, ordered)
+        // and submit.
         match self.cr_paste_partner() {
             PastePartner::LfPartner => {
                 self.pending = Some(String::from("\n"));
                 true
             }
-            // niubash#341: the WT KEY_EVENT empty line — this CR is the
-            // previous line's break, the queued CR the empty line's own.
-            PastePartner::CrPartner => {
-                self.pending = Some(String::from("\n\n"));
-                true
+            PastePartner::CrPartner(partner) => {
+                (self.unread)(&[partner]);
+                false
             }
             PastePartner::None => false,
         }
@@ -807,10 +911,16 @@ impl PasteChunkEditMode {
                     }
                     if is_bare_enter(&key) {
                         // niubash#341: a bare CR behind a bare CR is the
-                        // KEY_EVENT paste's empty line. Consume it as the
-                        // second line break — pushing it back would plant
-                        // the batch-crossing Enter described above.
-                        return PastePartner::CrPartner;
+                        // KEY_EVENT paste's empty line. Consumed here — but
+                        // niubash#420: the SAME bytes are two typeahead
+                        // submits, so the caller decides by paste evidence:
+                        // mid-chunk the pair folds as data, at chunk-open
+                        // the partner is requeued verbatim and this CR is a
+                        // typed submit. (Pushing it into the pushback would
+                        // plant the batch-crossing Enter described above —
+                        // the requeue goes to the input stream's head
+                        // instead, outside reedline's batch.)
+                        return PastePartner::CrPartner(crossterm29::event::Event::Key(key));
                     }
                     self.pushback.push_back(crossterm29::event::Event::Key(key));
                     return PastePartner::None;
@@ -833,10 +943,13 @@ enum PastePartner {
     /// shape — the fed LF surfaces as Ctrl+J). The pair folds ONE line
     /// break.
     LfPartner,
-    /// A bare CR: the Windows Terminal KEY_EVENT paste shape (niubash#341)
-    /// — every line break is a lone CR, an empty line is `\r\r`. The CR
-    /// behind a CR folds a SECOND line break.
-    CrPartner,
+    /// A bare CR: the Windows Terminal KEY_EVENT empty-line shape
+    /// (niubash#341) OR two typeahead submits in one write (niubash#420 —
+    /// indistinguishable at the queue level). The probe consumed the
+    /// partner CR and hands it back here; the caller decides: mid-chunk
+    /// (paste already proven) it folds as a second line break, at
+    /// chunk-open it is requeued verbatim and the CR is a typed submit.
+    CrPartner(crossterm29::event::Event),
     /// Any other queued Press key (typeahead text, a chord) or silence:
     /// typed-submit evidence. The key is pushed back, in order, for the
     /// next dispatch.
@@ -1028,12 +1141,13 @@ impl PasteChunkEditMode {
                         // the `\r\r` empty line's own break and folds a
                         // second one. The probe consumed the partner, so it
                         // can never arrive as its own event — no separate
-                        // pairing state needed.
+                        // pairing state needed. (At chunk-OPEN a CR partner
+                        // is typeahead, not data — niubash#420.)
                         PastePartner::LfPartner => {
                             chunk.push('\n');
                             ReedlineEvent::None
                         }
-                        PastePartner::CrPartner => {
+                        PastePartner::CrPartner(_) => {
                             chunk.push_str("\n\n");
                             ReedlineEvent::None
                         }
@@ -4102,63 +4216,68 @@ mod tests {
         assert!(detector.pushback.is_empty(), "flicker is inert");
     }
 
-    /// A double Enter with nothing else queued — the KEY_EVENT empty-line
-    /// shape of a Windows Terminal paste (`\r\r`, niubash#341): the first
-    /// CR is the previous line's break and the CR queued behind it is the
-    /// empty line's own break, so BOTH fold as paste data. A bare CR must
-    /// never sit in the pushback: reedline would translate it at the head
-    /// of a LATER batch (R2), where the first-Exits drop (R3) shreds the
-    /// batch's queued text after it — the #341 byte loss.
+    /// niubash#420: at chunk-OPEN a CR behind a CR is TWO TYPEAHEAD SUBMITS
+    /// in one pty write — a driver's `send("cmd\r\r")`, an expect script's
+    /// back-to-back Enters, the Ctrl+R accept-Enter followed by the
+    /// submit-Enter. The bytes are IDENTICAL to the WT KEY_EVENT empty-line
+    /// paste (niubash#341), so a CR partner alone is no longer paste
+    /// evidence: the first CR SUBMITS and the probe-consumed partner goes
+    /// back to the head of the input stream (the #417 requeue face — a
+    /// pushback would cross reedline's batch boundary: R2 translates it as
+    /// a batch-leading Enter and R3's first-Exits drop shreds the batch's
+    /// queued text, the #341 byte loss). The requeued CR then submits the
+    /// empty line — or, in the Ctrl+R flow, submits the loaded match — on
+    /// its own dispatch.
     #[test]
-    fn paste_chunk_detector_folds_double_enter_as_wt_empty_line_data_341() {
-        let mut detector = paste_detector_with_queue(vec![cr_key_event()]);
+    fn paste_chunk_detector_open_cr_pair_submits_and_requeues_420() {
+        let (mut detector, queue) = paste_detector_and_queue(vec![cr_key_event()]);
         detector.parse_event(paste_key(
             crossterm29::event::KeyCode::Char('c'),
             crossterm29::event::KeyModifiers::NONE,
         ));
         assert!(
-            matches!(detector.parse_event(cr()), ReedlineEvent::None),
-            "a CR with a bare CR queued behind it is WT-paste empty-line data"
+            matches!(detector.parse_event(cr()), ReedlineEvent::Enter),
+            "a CR with a bare CR queued behind it at chunk-open is a typed submit"
         );
-        assert_eq!(
-            detector.pending.as_deref(),
-            Some("\n\n"),
-            "both CRs fold: the previous line's break and the empty line's"
+        assert!(
+            detector.pending.is_none(),
+            "no chunk opens without paste evidence"
         );
         assert!(
             detector.pushback.is_empty(),
             "a bare CR must never be parked in the pushback"
         );
-        // The burst continues absorbing the next line's text after the
-        // empty line, and the block submits on the trailing silence-CR
-        // (niubash#308 semantics, now over the KEY_EVENT shape too).
-        for ch in "if x; then".chars() {
-            assert!(matches!(
-                detector.parse_event(paste_key(
-                    crossterm29::event::KeyCode::Char(ch),
-                    crossterm29::event::KeyModifiers::NONE
-                )),
-                ReedlineEvent::None
-            ));
-        }
-        let event = detector.parse_event(cr());
-        match event {
-            ReedlineEvent::Multiple(ref events) => {
-                assert_eq!(events.len(), 2, "flush insert then submit: {events:?}");
-                assert!(matches!(
-                    &events[0],
-                    ReedlineEvent::Edit(commands)
-                        if matches!(
-                            commands.as_slice(),
-                            [EditCommand::InsertString(chunk)]
-                                if chunk == "\n\nif x; then"
-                        )
-                ));
-                assert!(matches!(&events[1], ReedlineEvent::Enter));
-            }
-            other => panic!("expected flush + submit, got {other:?}"),
-        }
-        assert!(detector.pending.is_none());
+        // The partner CR went back to the HEAD of the input stream, not
+        // into the void and not into the pushback.
+        let requeued = queue.lock().expect("test queue");
+        assert_eq!(requeued.len(), 1, "the partner CR is requeued verbatim");
+        assert!(matches!(
+            requeued.front(),
+            Some(crossterm29::event::Event::Key(key)) if is_bare_enter(key)
+        ));
+    }
+
+    /// The #341 fold survives where paste evidence exists: a chunk opened
+    /// by an LF partner (the ConPTY CRLF shape), then a bare CR with a CR
+    /// behind it MID-CHUNK — the WT empty line inside a live paste — still
+    /// folds as two line breaks of data.
+    #[test]
+    fn paste_chunk_detector_midchunk_cr_pair_still_folds_341() {
+        let (mut detector, _queue) = paste_detector_and_queue(vec![lf_key_event(), cr_key_event()]);
+        // LF partner opens the chunk.
+        assert!(matches!(detector.parse_event(cr()), ReedlineEvent::None));
+        assert_eq!(detector.pending.as_deref(), Some("\n"));
+        // Mid-chunk: the bare CR's partner CR folds the empty line as data —
+        // the incoming CR's break plus the partner's, after the LF.
+        assert!(
+            matches!(detector.parse_event(cr()), ReedlineEvent::None),
+            "mid-chunk the CR pair is paste data"
+        );
+        assert_eq!(
+            detector.pending.as_deref(),
+            Some("\n\n\n"),
+            "all three breaks fold inside the live paste"
+        );
         assert!(detector.pushback.is_empty());
     }
 
@@ -4180,10 +4299,13 @@ mod tests {
             Some(crossterm29::event::Event::Key(key))
                 if is_bare_enter(key)
         ));
-        // A CR behind the CR: WT empty-line data, consumed by the fold.
-        let mut detector = paste_detector_with_queue(vec![cr_key_event()]);
-        assert!(matches!(detector.parse_event(cr()), ReedlineEvent::None));
+        // A CR behind the CR at chunk-open: typed submit, the partner
+        // requeued to the input stream's head — never the pushback
+        // (niubash#420).
+        let (mut detector, queue) = paste_detector_and_queue(vec![cr_key_event()]);
+        assert!(matches!(detector.parse_event(cr()), ReedlineEvent::Enter));
         assert!(detector.pushback.is_empty());
+        assert_eq!(queue.lock().expect("test queue").len(), 1);
     }
 
     #[test]
