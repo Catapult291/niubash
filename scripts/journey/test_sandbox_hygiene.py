@@ -130,7 +130,10 @@ def main() -> int:
         expect("cleanup verb on an absent path exits 0", rc, 0)
 
     # Main-contract plumbing: --cleanup-sandbox works WITHOUT a niu.exe,
-    # and the niu.exe requirement survives the nargs='?' change.
+    # and the niu.exe requirement survives the nargs='?' change. Every
+    # child spawn carries CREATE_NO_WINDOW (0x08000000): a probe run must
+    # never flash a visible console on the owner's desktop.
+    CREATE_NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}
     probe_parent = Path(tempfile.mkdtemp(prefix="gj428-verb-"))
     try:
         sandbox = probe_parent / "journey-probe-dead"
@@ -138,7 +141,7 @@ def main() -> int:
         done = subprocess.run(
             [sys.executable, str(MODULE_PATH), "--cleanup-sandbox",
              str(sandbox)],
-            capture_output=True, text=True, timeout=300)
+            capture_output=True, text=True, timeout=300, **CREATE_NO_WINDOW)
         expect("bare --cleanup-sandbox (no niu.exe) exits 0",
                done.returncode, 0)
         expect("bare --cleanup-sandbox removed the tree",
@@ -148,7 +151,7 @@ def main() -> int:
 
         done = subprocess.run(
             [sys.executable, str(MODULE_PATH)],
-            capture_output=True, text=True, timeout=300)
+            capture_output=True, text=True, timeout=300, **CREATE_NO_WINDOW)
         expect("no niu.exe and no verb is a usage error (exit 2)",
                done.returncode, 2)
     finally:
