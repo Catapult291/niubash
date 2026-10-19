@@ -60,9 +60,7 @@ fn emit_rubash_revision() {
 /// the uncommitted diff: `<rev>-dirty-<8 hex>`. Same edits, same digest;
 /// anything else changes the banner. rubash#827 recommendation 3.
 fn rubash_revision_from_checkout() -> Option<String> {
-    let Some(dir) = rubash_checkout_dir() else {
-        return None;
-    };
+    let dir = rubash_checkout_dir()?;
     revision_label_for_checkout(&dir)
 }
 

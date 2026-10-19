@@ -62,6 +62,27 @@ Healthy re-release on the pinned release chain (the bundled engine is now locked
   (hardlinks only, `usr\bin` off `PATH`, declared entry set) is now documented
   in `docs/src/installer.md`.
 
+- **The installer's slot contract is pinned by tests, not by a comment**
+  (niubash#398): the ruling that the install tree never claims the
+  `C:\Program Files\Git\bin\bash.exe` convention slot — the installer runs
+  `PrivilegesRequired=lowest`, cannot elevate, and the slot directory is
+  admin-walled — lived only in a GitHub comment until now.
+  `tests/installer_surface.rs` guards the surface statically: no absolute
+  foreign path or `Program Files` reference anywhere in `niubash.iss`, every
+  `[Files]`/`[InstallDelete]`/`[UninstallDelete]`/`[Icons]`/`[Run]` surface
+  confined to `{app}` and Inno-managed shell folders, `HKCU\Environment\Path`
+  the only registry value written, and the delete sweeps matched against the
+  sanctioned retired-shape globs only. `scripts/installer-slot-probe.py` is
+  the runtime leg: a pure user-directory sandbox replays the executable
+  installer steps (`--relink-shells`, app-tree teardown) across a full
+  install/uninstall cycle and asserts the decoy foreign slot — and the real
+  Git Bash slot, read-only — byte-identical at baseline, after install and
+  after uninstall, with no face name left outside the removed tree. The same
+  probe records the niubash#377 quantification: forwarder faces cost one
+  extra process per `-c` call (chain evidence: 2 processes below the probe,
+  min ~36 ms) and collapse to the payload itself as hardlinks (1 process,
+  min ~19 ms, same file as `niu.exe`).
+
 - **The factory prompt's git segment runs the user's own git** instead of the
   in-process libgit2 dependency: one bounded
   `git status --porcelain=v2 --branch` inside a repository, and **no spawn at
