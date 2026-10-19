@@ -2874,6 +2874,94 @@ fn issue399_login_repl_profile_exit_ends_session_before_prompt() {
     );
 }
 
+/// niubash#422: on the `sh -l -i` REPL face (the argv[0] `sh` face flips
+/// posix mode, `-l` flips login), an `exit` in the `$ENV` file ends the
+/// session BEFORE the login startup tail — no prompt, no greeting output,
+/// the ENV's status is the session status. Oracle: WSL GNU Bash 5.3.0
+/// (`sh -l -i` over a scratch HOME, $ENV = "echo ENV-RAN; exit 7") prints
+/// the ENV marker and exits 7 with the first prompt never rendered; the
+/// control run without the exit renders it. The profile and rc exit jumps
+/// already took this early return; the ENV face joined them (the lib-side
+/// greeting-marker pin lives in shell.rs).
+#[test]
+fn issue422_sh_login_repl_env_exit_ends_session_before_startup_tail() {
+    if !require_pty_or_skip("issue422_sh_login_repl_env_exit_ends_session_before_startup_tail") {
+        return;
+    }
+    let root = login_sandbox("sh-env-exit");
+    stage_login_file(&root, ".bash_profile", "echo BP-RAN-$((3+4))\n");
+    // PS1 goes into the ENV file so a wrongly-continued session would
+    // render the sentinel: the no-prompt assertion below stays meaningful
+    // even though the login face never sources the rc.
+    let env_file = stage_login_file(
+        &root,
+        "env422.src",
+        "PS1='P1> '\necho ENV-RAN-$((2+5))\nexit 7\n",
+    );
+    let env = ("ENV".to_string(), env_file.to_string_lossy().into_owned());
+    let mut s = NiuSession::spawn_face_in_root(
+        &root,
+        "sh",
+        &driver::default_rc(),
+        // The REPL dispatch: no -c, no script — the face where the login
+        // tail (completion sync + finish_startup + greeting) used to run.
+        &["-l"],
+        &[env],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("Niubash");
+    s.expect("BP-RAN-7");
+    s.expect("ENV-RAN-7");
+    let code = s.wait_exit();
+    let transcript = s.transcript();
+    assert_eq!(
+        code, 7,
+        "the ENV file's exit status is the session status: {transcript}"
+    );
+    assert_eq!(
+        transcript.matches(driver::PROMPT1).count(),
+        0,
+        "no prompt may render after the ENV exit jump: {transcript}"
+    );
+}
+
+/// Control for the jump above: the same `sh -l -i` face with an ENV file
+/// that does NOT exit reaches the first prompt and accepts the command
+/// line (the guard is the exit jump, not the face).
+#[test]
+fn issue422_sh_login_repl_env_without_exit_reaches_the_prompt() {
+    if !require_pty_or_skip("issue422_sh_login_repl_env_without_exit_reaches_the_prompt") {
+        return;
+    }
+    let root = login_sandbox("sh-env-live");
+    // The login face ignores the rc, so the prompt sentinel comes from the
+    // profile chain.
+    stage_login_file(&root, ".bash_profile", "PS1='P1> '\necho BP-RAN-$((6+1))\n");
+    let env_file = stage_login_file(&root, "env422ctl.src", "echo ENV-RAN-$((4+4))\n");
+    let env = ("ENV".to_string(), env_file.to_string_lossy().into_owned());
+    let mut s = NiuSession::spawn_face_in_root(
+        &root,
+        "sh",
+        &driver::default_rc(),
+        &["-l"],
+        &[env],
+        (120, 30),
+        HEAVY_TIMEOUT,
+    );
+    s.expect("Niubash");
+    s.expect("BP-RAN-7");
+    s.expect("ENV-RAN-8");
+    s.expect_prompt();
+    s.send_line("echo AFTER-$((5*5))");
+    s.expect("AFTER-25");
+    s.expect_prompt();
+    // The REPL fast-path exit matches a bare `exit`/`logout` only (repl.rs);
+    // the command-line work above already proved the face is interactive.
+    s.send_line("exit");
+    assert_eq!(s.wait_exit(), 0);
+}
+
 // ---------------------------------------------------------------------------
 // niubash#400: a shell invoked under the name `rbash` starts restricted.
 // Oracle: WSL GNU Bash 5.3.0 via an `rbash` symlink over stdin — `$-` reads
