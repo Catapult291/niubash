@@ -1638,26 +1638,34 @@ fn describe_theme_pick(pick: &ThemePick, t: Lang) -> String {
     }
 }
 
-/// The theme that is active right now: the assignment in the existing rc
-/// (`OSH_THEME` marks an oh-my-bash pick, `BASH_IT_THEME` a bash-it pick —
-/// the LAST theme-bearing block wins, mirroring rc load order). Used so
-/// "Skip — keep my current theme" is honest and side-effect free.
+/// The theme that is active right now: the assignment in the generated
+/// plugin loader (the #359 activation plane — the wizard-managed pick
+/// lives in `~/.niubash/generated/plugins.niu` since the rc stopped
+/// carrying activation content) overridden by a hand-set theme line in
+/// the existing rc (`OSH_THEME` marks an oh-my-bash pick, `BASH_IT_THEME`
+/// a bash-it pick). The LAST assignment in load order wins, and the host
+/// sources the loader BEFORE the user rc, so the scan runs loader-first
+/// and an rc line lands last: a hand-set rc theme keeps naming the pick
+/// the same way it wins at source time. Used so "Skip — keep my current
+/// theme" is honest and side-effect free.
 fn current_theme_pick(home: &std::path::Path) -> ThemePick {
-    let text = std::fs::read_to_string(home.join(PRIMARY_RC_FILE)).ok();
-    let Some(text) = text else {
-        return ThemePick::Keep;
-    };
+    let loader_text =
+        std::fs::read_to_string(crate::plugins::loader::generated_root().join("plugins.niu")).ok();
+    let rc_text = std::fs::read_to_string(home.join(PRIMARY_RC_FILE)).ok();
     // The native NIU_THEME channel is retired (niubash#145); only the
     // external theme variables identify an active pick — each through its
-    // own framework's managed block.
+    // own framework's section (loader) or hand-set line (rc).
     let mut active: Option<(String, String)> = None;
-    for raw in text.lines() {
-        let line = raw.trim().strip_prefix("export ").unwrap_or(raw).trim();
-        for (var, source_id) in [("OSH_THEME", "oh-my-bash"), ("BASH_IT_THEME", "bash-it")] {
-            if let Some(rest) = line.strip_prefix(var).and_then(|r| r.strip_prefix('=')) {
-                let value = rest.trim().trim_matches('\'').trim_matches('"');
-                if !value.is_empty() {
-                    active = Some((value.to_string(), source_id.to_string()));
+    for text in [loader_text, rc_text] {
+        let Some(text) = text else { continue };
+        for raw in text.lines() {
+            let line = raw.trim().strip_prefix("export ").unwrap_or(raw).trim();
+            for (var, source_id) in [("OSH_THEME", "oh-my-bash"), ("BASH_IT_THEME", "bash-it")] {
+                if let Some(rest) = line.strip_prefix(var).and_then(|r| r.strip_prefix('=')) {
+                    let value = rest.trim().trim_matches('\'').trim_matches('"');
+                    if !value.is_empty() {
+                        active = Some((value.to_string(), source_id.to_string()));
+                    }
                 }
             }
         }
@@ -3917,11 +3925,15 @@ mod tests {
     }
 
     #[test]
-    fn current_theme_pick_reads_only_primary_rc() {
+    fn current_theme_pick_reads_loader_then_rc_in_load_order() {
         let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _theme_env = EnvGuard::unset("NIU_THEME");
         let temp = unique_temp_dir("wizard-current-theme");
         std::fs::create_dir_all(&temp).unwrap();
+        // current_theme_pick reads the generated loader through the HOME
+        // chain (generated_root), so pin the whole probe to the sandbox.
+        let _home = EnvGuard::set("HOME", &host_to_shell_style_path(&temp));
+        let _userprofile = EnvGuard::unset("USERPROFILE");
         assert_eq!(current_theme_pick(&temp), ThemePick::Keep);
         let ignored = "OSH_THEME='ignored'\n";
         for name in [".winuxshrc", ".winshrc", ".bashrc"] {
@@ -3942,6 +3954,39 @@ mod tests {
             "OSH_THEME='robbyrussell'\nNIU_THEME_SOURCE=omb\n",
         )
         .unwrap();
+        assert_eq!(
+            current_theme_pick(&temp),
+            ThemePick::External {
+                name: "robbyrussell".to_string(),
+                source_id: "oh-my-bash".to_string()
+            }
+        );
+
+        // niubash#359: the wizard-managed pick lives in the generated
+        // loader, not the rc — the Skip option must name it.
+        let generated = temp.join(".niubash").join("generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        std::fs::write(
+            generated.join("plugins.niu"),
+            "# --- niu plugin source: oh-my-bash ---\nOSH_THEME='powerline-multiline'\n\
+             # --- end niu plugin source: oh-my-bash ---\n",
+        )
+        .unwrap();
+        // Retire the rc's pick (only the ignored NIU_THEME line stays), so
+        // the loader's pick is the active one.
+        std::fs::write(temp.join(PRIMARY_RC_FILE), "NIU_THEME='classic'\n").unwrap();
+        assert_eq!(
+            current_theme_pick(&temp),
+            ThemePick::External {
+                name: "powerline-multiline".to_string(),
+                source_id: "oh-my-bash".to_string()
+            }
+        );
+
+        // Load order: the host sources the loader BEFORE the user rc, so a
+        // hand-set rc line overrides the loader's pick — the same pick the
+        // next source run would activate.
+        std::fs::write(temp.join(PRIMARY_RC_FILE), "OSH_THEME='robbyrussell'\n").unwrap();
         assert_eq!(
             current_theme_pick(&temp),
             ThemePick::External {

@@ -2684,13 +2684,27 @@ fn run_plugin_add_command(args: &[String]) -> anyhow::Result<()> {
             }
         );
     }
+    // The completion line must name the source THIS add declared. The
+    // post-#359 reconcile reports a row for every declared source (the
+    // unchanged loader-materialization rows included), so a plain
+    // last-eligible-row scan can land on a bystander (`unchanged
+    // bash-completion`) and the add would print a misleading
+    // "Declared source '<other>'" — or nothing at all. Name this entry's
+    // own row first (the same (id, target) match the failed-install
+    // rollback above uses); the last-eligible scan stays as the fallback
+    // for reports that never named the entry.
+    let names_this_add = |row: &niubash_runtime::plugins::sync::SyncRow| {
+        Some(row.id.as_str()) == entry_id.as_deref() || row.id == entry_target
+    };
+    let eligible = |row: &niubash_runtime::plugins::sync::SyncRow| {
+        row.action == "awaiting-trust" || row.action == "activated" || row.action == "unchanged"
+    };
     let new_id = report
         .rows
         .iter()
         .rev()
-        .find(|row| {
-            row.action == "awaiting-trust" || row.action == "activated" || row.action == "unchanged"
-        })
+        .find(|row| eligible(row) && names_this_add(row))
+        .or_else(|| report.rows.iter().rev().find(|row| eligible(row)))
         .map(|row| row.id.clone());
     let adopted_existing = new_id
         .as_ref()
