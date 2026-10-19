@@ -2,6 +2,23 @@
 
 All notable changes to Niubash are documented in this file.
 
+## [1.4.1] - 2026-10-19
+
+Healthy re-release on the pinned release chain (the bundled engine is now locked to an exact verified commit). Details in the linked issues/PRs — entries here are deliberately short.
+
+### Fixed
+
+- Pasted multi-line scripts no longer swallow the typeahead that follows them: the Enter-signature probe re-injects parked keys to the console queue head, so an engine `read` after a paste-submit sees the remaining input (#417, #420, #426, #433).
+- `niu -c` and stdin scripts reject a stray `)` exactly like GNU bash (rc 2, same diagnostics/line numbers) instead of silently running the subshell body (#431).
+- `rbash` startup semantics match GNU: the restricted face activates after startup files in every invocation form (#413); POSIX `$ENV` `exit` now exits silently without the greeting tail (#422).
+- A DSR-silent terminal keeps its shell; TAB completion commits (#418).
+
+### Changed
+
+- Release chain: the bundled rubash engine is pinned to an exact commit (fail-hard on mismatch) and dirty builds self-identify in `niu --version` (#424); the WinuxCmd bundle moves to v1.1.16 (POSIX drive-dialect fixes for mkdir/ln/stat/realpath/readlink) (#427).
+- CI: the VCS prompt timing budget is relative to an interleaved spawn baseline — immune to shared-runner noise, still catches real render regressions (#423/#436).
+- Engine: rubash 1.4.1 — ERR-trap nested-context semantics, patsub replacement-text escaping, subscript ANSI-C double-state law, pushd/popd readonly + message forms, `${var@P}` status-leak fix, and a package guard against build-variant directories.
+
 ## [Unreleased]
 
 ### Changed
