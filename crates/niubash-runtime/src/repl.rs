@@ -834,9 +834,30 @@ fn key_press_records(key: &crossterm29::event::KeyEvent) -> Vec<KeyRecordFields>
             // Control chords: conhost encodes the control code in uChar and
             // the base letter in the VK (Ctrl+R → 0x12 / 'R' /
             // LEFT_CTRL_PRESSED) — crossterm's parser takes the 0x01..=0x1F
-            // uChar arm and re-derives the char from the VK.
-            if key.modifiers.contains(KeyModifiers::CONTROL) && ('\u{1}'..='\u{1a}').contains(&ch) {
-                return vec![record(b'A' as u16 + ch as u16 - 1, ch as u16)];
+            // uChar arm and re-derives the char from the VK. What the probe
+            // parks is that parse's OUTPUT: crossterm 0.29 hands the chord
+            // over as Char(letter) + CONTROL (its `get_char_for_key` runs a
+            // zeroed key state through ToUnicode, so the ctrl state never
+            // taints the letter), which is why an arm keyed on the
+            // control-code char was dead code on Windows (niubash#434): the
+            // chord fell through to the printable arm and the writeback
+            // carried uChar 'r' — a raw-byte reader (the accepted command's
+            // engine console `read`, the #417 submit writeback's consumer)
+            // saw 'r' where the user's keystroke was 0x12. Both delivery
+            // shapes map to the one conhost record: event-level readers
+            // re-derive the chord from VK + state, byte-level readers get
+            // the original 0x01..=0x1A control byte.
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                let control_code = match ch {
+                    'a'..='z' | 'A'..='Z' => {
+                        u16::from(ch.to_ascii_lowercase() as u8) - u16::from(b'a') + 1
+                    }
+                    '\u{1}'..='\u{1a}' => ch as u16,
+                    _ => 0,
+                };
+                if control_code != 0 {
+                    return vec![record(control_code + u16::from(b'A') - 1, control_code)];
+                }
             }
             // Printable characters: the readers decode from uChar; the VK
             // carries the letter/digit identity where one exists (cosmetic
@@ -4643,18 +4664,135 @@ mod tests {
     /// parser produced it with: control code in uChar, base letter in the
     /// VK, LEFT_CTRL_PRESSED in the state — so crossterm's parser re-derives
     /// the same event and the engine's reader decodes the same byte.
+    ///
+    /// niubash#434: the delivery shape crossterm 0.29 hands the probe is
+    /// Char(letter) + CONTROL — its own parse of conhost's control-code
+    /// record — and the mapping must key on it. Keyed on the control-code
+    /// char alone the arm never fired on Windows and the writeback carried
+    /// the letter, so a raw-byte reader saw 'r' instead of 0x12.
     #[test]
     fn key_records_synthesize_control_chords() {
+        let expected = vec![KeyRecordFields {
+            virtual_key_code: b'R' as u16,
+            unicode_char: 0x12,
+            control_key_state: LEFT_CTRL_PRESSED_FLAG,
+        }];
+        // The production shape: Char(letter) + CONTROL.
+        assert_eq!(
+            synth(
+                crossterm29::event::KeyCode::Char('r'),
+                crossterm29::event::KeyModifiers::CONTROL
+            ),
+            expected
+        );
+        // Case of the delivered letter is the keyboard's business, not the
+        // chord's: the record is the base letter + the control code.
+        assert_eq!(
+            synth(
+                crossterm29::event::KeyCode::Char('R'),
+                crossterm29::event::KeyModifiers::CONTROL
+            ),
+            expected
+        );
+        // The parser's own uChar arm shape (a control-code char) maps to the
+        // same record.
         assert_eq!(
             synth(
                 crossterm29::event::KeyCode::Char('\u{12}'),
                 crossterm29::event::KeyModifiers::CONTROL
             ),
+            expected
+        );
+        // A chord letter with SHIFT rides the shift flag next to the ctrl
+        // one — the re-derivation reads the case back from it.
+        assert_eq!(
+            synth(
+                crossterm29::event::KeyCode::Char('R'),
+                crossterm29::event::KeyModifiers::CONTROL | crossterm29::event::KeyModifiers::SHIFT
+            ),
             vec![KeyRecordFields {
                 virtual_key_code: b'R' as u16,
                 unicode_char: 0x12,
-                control_key_state: LEFT_CTRL_PRESSED_FLAG,
+                control_key_state: LEFT_CTRL_PRESSED_FLAG | SHIFT_PRESSED_FLAG,
             }]
+        );
+        // Every letter maps to its control code — the full 0x01..=0x1A span
+        // a raw-byte reader can be handed back.
+        for (letter, code) in ('a'..='z').zip(0x01u16..=0x1A) {
+            let record = &synth(
+                crossterm29::event::KeyCode::Char(letter),
+                crossterm29::event::KeyModifiers::CONTROL,
+            )[0];
+            assert_eq!(record.virtual_key_code, u16::from(b'A') + code - 1);
+            assert_eq!(record.unicode_char, code);
+            assert_eq!(record.control_key_state, LEFT_CTRL_PRESSED_FLAG);
+        }
+    }
+
+    /// The crossterm 0.29 Windows parse (`parse_key_event_record`) of the
+    /// records the mapping emits, for the control-chord shape: the uChar
+    /// lands in the parser's `0x00..=0x1f` arm, which re-derives the
+    /// character from the VK (`get_char_for_key` — a zeroed key state
+    /// through ToUnicode, so the letter never taints; the case comes from
+    /// the record's SHIFT flag alone) and takes the modifiers from the
+    /// state. The parser itself is `pub(crate)` in crossterm, so the
+    /// event-level round trip is asserted through this transcription of its
+    /// decision.
+    #[cfg(test)]
+    fn parse_back_control_chord(record: &KeyRecordFields) -> crossterm29::event::KeyEvent {
+        use crossterm29::event::{KeyCode, KeyEvent, KeyModifiers};
+        assert!(
+            (0x01..=0x1F).contains(&record.unicode_char),
+            "not a control-code uChar: {record:?}"
+        );
+        assert!(
+            (b'A'..=b'Z').contains(&(record.virtual_key_code as u8)),
+            "not a letter VK: {record:?}"
+        );
+        let mut modifiers = KeyModifiers::empty();
+        if record.control_key_state & SHIFT_PRESSED_FLAG != 0 {
+            modifiers |= KeyModifiers::SHIFT;
+        }
+        if record.control_key_state & LEFT_CTRL_PRESSED_FLAG != 0 {
+            modifiers |= KeyModifiers::CONTROL;
+        }
+        if record.control_key_state & LEFT_ALT_PRESSED_FLAG != 0 {
+            modifiers |= KeyModifiers::ALT;
+        }
+        let mut ch = (record.virtual_key_code as u8).to_ascii_lowercase() as char;
+        if record.control_key_state & SHIFT_PRESSED_FLAG != 0 {
+            ch = ch.to_ascii_uppercase();
+        }
+        KeyEvent::new(KeyCode::Char(ch), modifiers)
+    }
+
+    /// Event-level round trip (niubash#434): the synthesized Ctrl+R record
+    /// parses back to exactly the chord the probe consumed — the #417
+    /// writeback can requeue a parked chord without reedline ever seeing a
+    /// different event, while a byte-level reader gets the original
+    /// control byte.
+    #[test]
+    fn control_chord_records_round_trip_through_the_console_parse() {
+        for (letter, _code) in ('a'..='z').zip(0x01u16..=0x1A) {
+            let delivered = crossterm29::event::KeyEvent::new(
+                crossterm29::event::KeyCode::Char(letter),
+                crossterm29::event::KeyModifiers::CONTROL,
+            );
+            let record = &key_press_records(&delivered)[0];
+            assert_eq!(
+                parse_back_control_chord(record),
+                delivered,
+                "Ctrl+{letter} did not round-trip"
+            );
+        }
+        // The chord with SHIFT: the re-derived event keeps it.
+        let shifted = crossterm29::event::KeyEvent::new(
+            crossterm29::event::KeyCode::Char('R'),
+            crossterm29::event::KeyModifiers::CONTROL | crossterm29::event::KeyModifiers::SHIFT,
+        );
+        assert_eq!(
+            parse_back_control_chord(&key_press_records(&shifted)[0]),
+            shifted
         );
     }
 

@@ -1398,6 +1398,73 @@ fn typeahead_burst_read_line_gets_parked_key_417() {
     s.expect_prompt();
 }
 
+/// niubash#434, the discriminating probe: a parked CONTROL chord must ride
+/// the #417 submit writeback as the conhost control-code record — uChar
+/// 0x12 for Ctrl+R — because the accepted command's engine `read` is a
+/// raw-byte reader: it gets the re-injected record's uChar as-is. The
+/// pre-fix synthesis keyed its control arm on the control-code char
+/// (Char('\u{12}')), but crossterm 0.29 delivers the parked chord as
+/// Char(letter) + CONTROL, so on Windows the arm was dead code and the
+/// writeback carried uChar 'r' — `read -n1` saw 'r' where the user's
+/// keystroke was 0x12. Echo-proof (#367, the #417 shape): the marker is
+/// the read variable's value through an rc variable — the echoed input
+/// line carries neither the marker text nor the comparison byte, so only
+/// a read that consumed exactly 0x12 can print it; a read of 'r' prints
+/// the diagnostic leg instead and the marker never appears.
+#[test]
+fn parked_ctrl_r_writeback_reaches_engine_read_as_control_byte_434() {
+    if !require_pty_or_skip("parked_ctrl_r_writeback_reaches_engine_read_as_control_byte_434") {
+        return;
+    }
+    let rc = format!("{}\nW434OK=CTRL12-BYTE\n", driver::default_rc());
+    let mut s = NiuSession::spawn_custom("w434-read", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
+    s.wait_ready();
+    // ONE write: the submit Enter with the Ctrl+R byte (0x12) immediately
+    // behind it. ConPTY synthesizes the control-code record (the channel
+    // that carries CTRL_C/CTRL_D), crossterm hands the probe
+    // Char('r') + CONTROL, the probe parks it, and the accepted `read -n1`
+    // reads whatever the writeback re-injected.
+    s.send(
+        "read -n1 R434; if [ \"$R434\" = $'\\x12' ]; then echo \"R434=$W434OK\"; \
+         else echo \"R434-WRONG[$R434]\"; fi\r\u{12}",
+    );
+    s.expect("R434=CTRL12-BYTE");
+    s.expect_prompt();
+}
+
+/// niubash#434, the event-level round trip through the REAL crossterm
+/// parser: the chord parked behind a submit must come back out of the
+/// writeback as an event reedline still reads as Ctrl+R — reverse history
+/// search opens at the next prompt, exactly like a freshly typed chord.
+/// (The byte-level face of the same writeback is
+/// `parked_ctrl_r_writeback_reaches_engine_read_as_control_byte_434`.)
+/// Echo-proof (#367, the #420 shape): the marker is an rc variable's
+/// value — the search UI's preview paints the history line's unexpanded
+/// `$W434SEED` text, so only execution can produce `REPLAY-OUT`.
+#[test]
+fn parked_ctrl_r_writeback_replays_as_history_search_434() {
+    if !require_pty_or_skip("parked_ctrl_r_writeback_replays_as_history_search_434") {
+        return;
+    }
+    let rc = format!("{}\nW434SEED=REPLAY-OUT\n", driver::default_rc());
+    let mut s = NiuSession::spawn_custom("w434-replay", &rc, &[], (120, 30), DEFAULT_TIMEOUT);
+    s.wait_ready();
+    s.send_line("echo $W434SEED");
+    s.expect("REPLAY-OUT");
+    s.expect_prompt();
+    // ONE write: the submit Enter with the Ctrl+R byte behind it — the
+    // #420 one-burst shape one line further. The probe parks the chord;
+    // the accepted echo's writeback must requeue it at the stream's head.
+    s.send("echo TAIL434\r\u{12}");
+    s.expect("TAIL434");
+    // The next prompt consumes the re-injected chord (kernel-queue head)
+    // as Ctrl+R; the query then narrows the search to the seed line.
+    s.send("SEED");
+    s.send("\r\r");
+    s.expect("REPLAY-OUT");
+    s.expect_prompt();
+}
+
 /// The niubash#341 owner script (issue #341, Windows Terminal,
 /// 2026-10-14): 76 non-empty lines of bash with 16 empty-line boundaries,
 /// including the two `if is_even` blocks whose line starts were shredded.
