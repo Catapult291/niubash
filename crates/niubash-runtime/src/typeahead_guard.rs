@@ -328,6 +328,76 @@ pub(crate) fn stdin_console_handle() -> Option<imp::OwnedHandle> {
     Some(imp::OwnedHandle(imp::duplicate_stdin_console_handle()?))
 }
 
+/// Put input records back at the HEAD of the console input queue
+/// (niubash#417's writeback face, shared with #420's partner-CR requeue).
+///
+/// Same primitive as the guard's own reinjection above — MSDN pins
+/// `WriteConsoleInput` as APPENDING to the end of the pending queue, it
+/// cannot prepend — but a different consumer with a harder constraint:
+/// the probed events sat AHEAD of everything still queued, and a plain
+/// tail append would invert the order of a fast typeahead burst ("echo
+/// one\r" submitted with "echo two\r" behind it: the probe parks the 'e'
+/// of the second line, and a tail append would let `cho two` reach the
+/// editor before the parked 'e', shredding the line). The pending records
+/// are therefore drained first and rewritten after `records`: the queue
+/// then reads [records ++ previously pending] — the exact order the probe
+/// found, with the re-queued events back in front. The guard can settle
+/// for the bare tail append (its queue is empty at reinjection, where
+/// tail and head are the same slot); this face cannot, so it buys the
+/// head slot with the drain-and-rewrite.
+///
+/// Best-effort, like the guard's own reinjection: on a non-console stdin
+/// (the probe can never have consumed anything there) or a failed drain or
+/// write, the records are dropped — the worst case is lost typeahead at a
+/// boundary that does not exist in production, never corrupted order.
+#[cfg(windows)]
+pub(crate) fn requeue_console_input(records: &[windows_sys::Win32::System::Console::INPUT_RECORD]) {
+    use windows_sys::Win32::System::Console::{
+        GetNumberOfConsoleInputEvents, ReadConsoleInputW, WriteConsoleInputW, INPUT_RECORD,
+    };
+
+    if records.is_empty() || !stdin_is_console() {
+        return;
+    }
+    let Some(handle) = stdin_console_handle() else {
+        return;
+    };
+    // Drain whatever is currently pending: the records we are about to
+    // re-queue were consumed from in FRONT of these (the probe reads the
+    // queue's head), so they must be rewritten behind them.
+    let mut pending = Vec::new();
+    loop {
+        let mut count = 0u32;
+        if unsafe { GetNumberOfConsoleInputEvents(handle.0, &mut count) } == 0 || count == 0 {
+            break;
+        }
+        let mut batch: Vec<INPUT_RECORD> = vec![unsafe { std::mem::zeroed() }; count as usize];
+        let mut read = 0u32;
+        let ok = unsafe { ReadConsoleInputW(handle.0, batch.as_mut_ptr(), count, &mut read) };
+        if ok == 0 || read == 0 {
+            break;
+        }
+        batch.truncate(read as usize);
+        pending.extend(batch);
+    }
+    let write = |records: &[INPUT_RECORD]| {
+        if records.is_empty() {
+            return;
+        }
+        unsafe {
+            let mut written = 0u32;
+            WriteConsoleInputW(
+                handle.0,
+                records.as_ptr(),
+                records.len() as u32,
+                &mut written,
+            );
+        }
+    };
+    write(records);
+    write(&pending);
+}
+
 /// Whether the shell's stdin is an interactive console (the only shape
 /// with a shared input buffer worth guarding).
 #[cfg(windows)]
