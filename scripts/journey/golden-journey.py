@@ -3968,10 +3968,13 @@ def normalize_posix_drive_form(raw: Path) -> Path:
 
 def _run_quiet(cmd: list, timeout: int = 600) -> bool:
     """One rescue command, output captured, errors swallowed — the
-    caller decides from the return code whether to escalate."""
+    caller decides from the return code whether to escalate. Spawned
+    with CREATE_NO_WINDOW: a rescue probe must never flash a visible
+    console on the owner's desktop (windowless agent hosts)."""
+    kwargs = ({"creationflags": 0x08000000} if os.name == "nt" else {})
     try:
         done = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout)
+                              timeout=timeout, **kwargs)
     except (OSError, subprocess.SubprocessError):
         return False
     return done.returncode == 0
