@@ -35,6 +35,13 @@ sha2 = "0.10"
 # the niubash#245 piped-stdout pump (CreatePipe/SetStdHandle/GetFileType).
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Networking_WinHttp", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_Security"] }
 
+# rubash#827: build.rs stamps a `-dirty-<8 hex>` digest of the uncommitted
+# rubash diff into the version banner (#488: a bare HEAD hash does not
+# guarantee content). Same sha2 the crate already carries; build scripts
+# cannot use the runtime dependency.
+[build-dependencies]
+sha2 = "0.10"
+
 [dev-dependencies]
 # Interactive-mode regression harness (tests/interactive.rs): pseudo-terminal
 # driver. Originally evaluated expectrl 0.9 (pexpect port), but its Windows

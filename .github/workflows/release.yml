@@ -31,9 +31,9 @@ jobs:
     name: build-windows (${{ matrix.arch }})
     runs-on: windows-2025
     outputs:
-      # Both matrix legs clone the same rubash master, so this resolves to the
-      # same value in both; the pin step fails the build if the checkout is
-      # not a committed revision.
+      # Both matrix legs fetch the same PINNED rubash revision, so this
+      # resolves to the same value in both; the pin steps fail the build if
+      # the checkout is not exactly the pinned revision (rubash#827).
       rubash_revision: ${{ steps.rubash.outputs.revision }}
     strategy:
       fail-fast: false
@@ -51,8 +51,49 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Checkout rubash path dependency
-        run: git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/unixwin/rubash.git ../rubash
+      # rubash#827 (conclusion B): the engine source is PINNED, never
+      # "whatever rubash master HEAD was at clone time" -- that float is how
+      # v1.4.0 (run 38506862578) compiled e785c3c8f610 while the release era
+      # declared rubash v1.4.0 (f69e7900). The pin
+      # (scripts/release/rubash-pin.json, the source twin of winuxcmd-pin.json
+      # from niubash#312) names a full 40-char commit; this step fetches
+      # exactly it and dies unless the checked-out HEAD equals the pin. The
+      # clone lands at ../rubash, where the [patch] path override in
+      # Cargo.toml deterministically takes over -- the tree Cargo compiles IS
+      # the pinned tree. Read from the pre-tag-checkout tree: a tag push uses
+      # the pin committed at the tag, a dispatch of an old tag runs today's
+      # pin (same #312 semantics as the WinuxCmd pin). Bumping the pin is one
+      # commit to that file; see its notes for the flow.
+      - name: Checkout pinned rubash revision
+        id: rubash-pin
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = Get-Content -LiteralPath scripts/release/rubash-pin.json -Raw | ConvertFrom-Json
+          $rev = $pin.rubash_rev
+          if ($rev -notmatch '^[0-9a-f]{40}$') {
+            throw "rubash-pin.json: rubash_rev must be a full 40-char commit sha, got '$rev' (abbreviated forms cannot be fetched -- git resolves the fetch argument server-side as a ref name)"
+          }
+          if (Test-Path -LiteralPath ..\rubash) {
+            throw "a rubash checkout already exists at ..\rubash; refusing to pin over it"
+          }
+          git init ..\rubash
+          if ($LASTEXITCODE -ne 0) { throw "git init ../rubash failed" }
+          git -C ..\rubash remote add origin https://github.com/unixwin/rubash.git
+          git -C ..\rubash fetch --depth 1 origin $rev
+          if ($LASTEXITCODE -ne 0) {
+            throw "could not fetch the pinned rubash revision $rev; if rubash master was rewritten upstream, bump scripts/release/rubash-pin.json (rubash#827)"
+          }
+          git -C ..\rubash checkout --quiet FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "could not check out the pinned rubash revision $rev" }
+          git -C ..\rubash submodule update --init --depth 1
+          if ($LASTEXITCODE -ne 0) { throw "rubash submodules failed to initialize at the pinned revision" }
+          $actual = (git -C ..\rubash rev-parse HEAD).Trim()
+          if ($actual -ne $rev) {
+            throw "rubash checkout resolved to $actual, not the pinned $rev; refusing to build (rubash#827)"
+          }
+          Write-Host "rubash pinned at $($rev.Substring(0,12)) (v$($pin.rubash_version))"
+          "revision=$($rev.Substring(0,12))" >> $env:GITHUB_OUTPUT
 
       - name: Resolve release inputs
         id: release
@@ -84,6 +125,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP "release-policy") | Out-Null
           Copy-Item -LiteralPath scripts/release/preinstall.json -Destination (Join-Path $env:RUNNER_TEMP "release-policy\preinstall.json") -Force
           Copy-Item -LiteralPath scripts/release/winuxcmd-pin.json -Destination (Join-Path $env:RUNNER_TEMP "release-policy\winuxcmd-pin.json") -Force
+          Copy-Item -LiteralPath scripts/release/rubash-pin.json -Destination (Join-Path $env:RUNNER_TEMP "release-policy\rubash-pin.json") -Force
 
       - name: Checkout release tag
         shell: pwsh
@@ -97,6 +139,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path scripts/release | Out-Null
           Copy-Item -LiteralPath (Join-Path $env:RUNNER_TEMP "release-policy\preinstall.json") -Destination scripts/release/preinstall.json -Force
           Copy-Item -LiteralPath (Join-Path $env:RUNNER_TEMP "release-policy\winuxcmd-pin.json") -Destination scripts/release/winuxcmd-pin.json -Force
+          Copy-Item -LiteralPath (Join-Path $env:RUNNER_TEMP "release-policy\rubash-pin.json") -Destination scripts/release/rubash-pin.json -Force
 
       - name: Validate Cargo version matches release tag
         shell: pwsh
@@ -119,8 +162,11 @@ jobs:
 
       # rubash is a path dependency, so `cargo update -p rubash` cannot pin it:
       # there is no registry entry to update, and the step silently did nothing.
-      # The revision the binary actually contains is resolved here and embedded
-      # at build time by build.rs, so `niu --version` reports it.
+      # The pinned-clone step above already fetched exactly the pinned commit;
+      # this step re-derives the revision, refuses a dirty tree, and
+      # cross-checks the pin before anything is compiled (rubash#827). The
+      # revision is embedded at build time by build.rs, so `niu --version`
+      # reports it.
       - name: Pin rubash revision
         id: rubash
         shell: pwsh
@@ -136,7 +182,14 @@ jobs:
           if (-not [string]::IsNullOrWhiteSpace($dirty)) {
             throw "rubash checkout is dirty; a release must pin a committed revision`n$dirty"
           }
-          Write-Host "rubash revision: $revision"
+          $pinned = "${{ steps.rubash-pin.outputs.revision }}"
+          if ([string]::IsNullOrWhiteSpace($pinned)) {
+            throw "the pinned-rubash clone step produced no revision to cross-check"
+          }
+          if ($revision -ne $pinned) {
+            throw "rubash checkout ($revision) drifted from the pinned revision ($pinned); refusing to build (rubash#827)"
+          }
+          Write-Host "rubash revision: $revision (matches the pin)"
           "revision=$revision" >> $env:GITHUB_OUTPUT
 
       - name: Build niubash
@@ -592,9 +645,9 @@ jobs:
     name: build-linux (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     outputs:
-      # Both matrix legs clone the same rubash master, so this resolves to
-      # the same value in both; the pin step fails the build if the checkout
-      # is not a committed revision.
+      # Both matrix legs fetch the same PINNED rubash revision, so this
+      # resolves to the same value in both; the pin steps fail the build if
+      # the checkout is not exactly the pinned revision (rubash#827).
       rubash_revision: ${{ steps.rubash.outputs.revision }}
     strategy:
       fail-fast: false
@@ -624,8 +677,38 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Checkout rubash path dependency
-        run: git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/unixwin/rubash.git ../rubash
+      # Same pinned-rubash contract as build-windows (rubash#827): fetch
+      # exactly scripts/release/rubash-pin.json's commit into ../rubash, where
+      # the [patch] path override takes over, and die on any mismatch.
+      - name: Checkout pinned rubash revision
+        id: rubash-pin
+        run: |
+          set -euo pipefail
+          rev="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rubash_rev"])' scripts/release/rubash-pin.json)"
+          if [[ ! "$rev" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "rubash-pin.json: rubash_rev must be a full 40-char commit sha, got '$rev' (abbreviated forms cannot be fetched -- git resolves the fetch argument server-side as a ref name)" >&2
+            exit 1
+          fi
+          if [ -e ../rubash ]; then
+            echo "a rubash checkout already exists at ../rubash; refusing to pin over it" >&2
+            exit 1
+          fi
+          git init -q ../rubash
+          git -C ../rubash remote add origin https://github.com/unixwin/rubash.git
+          if ! git -C ../rubash fetch --depth 1 origin "$rev"; then
+            echo "could not fetch the pinned rubash revision $rev; if rubash master was rewritten upstream, bump scripts/release/rubash-pin.json (rubash#827)" >&2
+            exit 1
+          fi
+          git -C ../rubash checkout --quiet FETCH_HEAD
+          git -C ../rubash submodule update --init --depth 1
+          actual="$(git -C ../rubash rev-parse HEAD)"
+          if [ "$actual" != "$rev" ]; then
+            echo "rubash checkout resolved to $actual, not the pinned $rev; refusing to build (rubash#827)" >&2
+            exit 1
+          fi
+          pin_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rubash_version"])' scripts/release/rubash-pin.json)"
+          echo "rubash pinned at ${rev:0:12} (v$pin_version)"
+          echo "revision=${rev:0:12}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve release inputs
         id: release
@@ -662,8 +745,11 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
-      # Same contract as build-windows: the revision the binary contains is
-      # resolved here and embedded by build.rs, so `niu --version` reports it.
+      # Same contract as build-windows: the pinned-clone step above already
+      # fetched exactly the pinned commit; this step re-derives the revision,
+      # refuses a dirty tree, and cross-checks the pin before anything is
+      # compiled (rubash#827). The revision is embedded by build.rs, so
+      # `niu --version` reports it.
       - name: Pin rubash revision
         id: rubash
         run: |
@@ -682,7 +768,16 @@ jobs:
             printf '%s\n' "$dirty" >&2
             exit 1
           fi
-          echo "rubash revision: $revision"
+          pinned="${{ steps.rubash-pin.outputs.revision }}"
+          if [ -z "$pinned" ]; then
+            echo "the pinned-rubash clone step produced no revision to cross-check" >&2
+            exit 1
+          fi
+          if [ "$revision" != "$pinned" ]; then
+            echo "rubash checkout ($revision) drifted from the pinned revision ($pinned); refusing to build (rubash#827)" >&2
+            exit 1
+          fi
+          echo "rubash revision: $revision (matches the pin)"
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
       # No RUSTFLAGS here: crt-static is a Windows-leg choice; Linux gnu
@@ -775,9 +870,9 @@ jobs:
     name: build-macos (${{ matrix.arch }})
     runs-on: macos-latest
     outputs:
-      # Both matrix legs clone the same rubash master, so this resolves to
-      # the same value in both; the pin step fails the build if the checkout
-      # is not a committed revision.
+      # Both matrix legs fetch the same PINNED rubash revision, so this
+      # resolves to the same value in both; the pin steps fail the build if
+      # the checkout is not exactly the pinned revision (rubash#827).
       rubash_revision: ${{ steps.rubash.outputs.revision }}
     strategy:
       fail-fast: false
@@ -794,8 +889,38 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Checkout rubash path dependency
-        run: git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/unixwin/rubash.git ../rubash
+      # Same pinned-rubash contract as build-windows (rubash#827): fetch
+      # exactly scripts/release/rubash-pin.json's commit into ../rubash, where
+      # the [patch] path override takes over, and die on any mismatch.
+      - name: Checkout pinned rubash revision
+        id: rubash-pin
+        run: |
+          set -euo pipefail
+          rev="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rubash_rev"])' scripts/release/rubash-pin.json)"
+          if [[ ! "$rev" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "rubash-pin.json: rubash_rev must be a full 40-char commit sha, got '$rev' (abbreviated forms cannot be fetched -- git resolves the fetch argument server-side as a ref name)" >&2
+            exit 1
+          fi
+          if [ -e ../rubash ]; then
+            echo "a rubash checkout already exists at ../rubash; refusing to pin over it" >&2
+            exit 1
+          fi
+          git init -q ../rubash
+          git -C ../rubash remote add origin https://github.com/unixwin/rubash.git
+          if ! git -C ../rubash fetch --depth 1 origin "$rev"; then
+            echo "could not fetch the pinned rubash revision $rev; if rubash master was rewritten upstream, bump scripts/release/rubash-pin.json (rubash#827)" >&2
+            exit 1
+          fi
+          git -C ../rubash checkout --quiet FETCH_HEAD
+          git -C ../rubash submodule update --init --depth 1
+          actual="$(git -C ../rubash rev-parse HEAD)"
+          if [ "$actual" != "$rev" ]; then
+            echo "rubash checkout resolved to $actual, not the pinned $rev; refusing to build (rubash#827)" >&2
+            exit 1
+          fi
+          pin_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rubash_version"])' scripts/release/rubash-pin.json)"
+          echo "rubash pinned at ${rev:0:12} (v$pin_version)"
+          echo "revision=${rev:0:12}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve release inputs
         id: release
@@ -835,8 +960,11 @@ jobs:
       - name: Install Rust target
         run: rustup target add ${{ matrix.rust_target }}
 
-      # Same contract as build-windows: the revision the binary contains is
-      # resolved here and embedded by build.rs, so `niu --version` reports it.
+      # Same contract as build-windows: the pinned-clone step above already
+      # fetched exactly the pinned commit; this step re-derives the revision,
+      # refuses a dirty tree, and cross-checks the pin before anything is
+      # compiled (rubash#827). The revision is embedded by build.rs, so
+      # `niu --version` reports it.
       - name: Pin rubash revision
         id: rubash
         run: |
@@ -855,7 +983,16 @@ jobs:
             printf '%s\n' "$dirty" >&2
             exit 1
           fi
-          echo "rubash revision: $revision"
+          pinned="${{ steps.rubash-pin.outputs.revision }}"
+          if [ -z "$pinned" ]; then
+            echo "the pinned-rubash clone step produced no revision to cross-check" >&2
+            exit 1
+          fi
+          if [ "$revision" != "$pinned" ]; then
+            echo "rubash checkout ($revision) drifted from the pinned revision ($pinned); refusing to build (rubash#827)" >&2
+            exit 1
+          fi
+          echo "rubash revision: $revision (matches the pin)"
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
       - name: Build niubash
@@ -991,8 +1128,40 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Checkout rubash path dependency
-        run: git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/unixwin/rubash.git ../rubash
+      # Same pinned-rubash contract as the build jobs (rubash#827): fetch
+      # exactly scripts/release/rubash-pin.json's commit into ../rubash, where
+      # the [patch] path override takes over, and die on any mismatch. This
+      # leg uploads nothing to the release, but what it compiles must still be
+      # a named revision, not build-minute master HEAD.
+      - name: Checkout pinned rubash revision
+        id: rubash-pin
+        run: |
+          set -euo pipefail
+          rev="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rubash_rev"])' scripts/release/rubash-pin.json)"
+          if [[ ! "$rev" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "rubash-pin.json: rubash_rev must be a full 40-char commit sha, got '$rev'" >&2
+            exit 1
+          fi
+          if [ -e ../rubash ]; then
+            echo "a rubash checkout already exists at ../rubash; refusing to pin over it" >&2
+            exit 1
+          fi
+          git init -q ../rubash
+          git -C ../rubash remote add origin https://github.com/unixwin/rubash.git
+          if ! git -C ../rubash fetch --depth 1 origin "$rev"; then
+            echo "could not fetch the pinned rubash revision $rev; if rubash master was rewritten upstream, bump scripts/release/rubash-pin.json (rubash#827)" >&2
+            exit 1
+          fi
+          git -C ../rubash checkout --quiet FETCH_HEAD
+          git -C ../rubash submodule update --init --depth 1
+          actual="$(git -C ../rubash rev-parse HEAD)"
+          if [ "$actual" != "$rev" ]; then
+            echo "rubash checkout resolved to $actual, not the pinned $rev; refusing to build (rubash#827)" >&2
+            exit 1
+          fi
+          pin_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rubash_version"])' scripts/release/rubash-pin.json)"
+          echo "rubash pinned at ${rev:0:12} (v$pin_version)"
+          echo "revision=${rev:0:12}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve release inputs
         id: release
@@ -1033,6 +1202,22 @@ jobs:
             echo "could not resolve rubash revision" >&2
             exit 1
           fi
+          dirty="$(git -C ../rubash status --porcelain)"
+          if [ -n "$dirty" ]; then
+            echo "rubash checkout is dirty; a release must pin a committed revision" >&2
+            printf '%s\n' "$dirty" >&2
+            exit 1
+          fi
+          pinned="${{ steps.rubash-pin.outputs.revision }}"
+          if [ -z "$pinned" ]; then
+            echo "the pinned-rubash clone step produced no revision to cross-check" >&2
+            exit 1
+          fi
+          if [ "$revision" != "$pinned" ]; then
+            echo "rubash checkout ($revision) drifted from the pinned revision ($pinned); refusing to build (rubash#827)" >&2
+            exit 1
+          fi
+          echo "rubash revision: $revision (matches the pin)"
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
       # Real link, not check-only: the NDK provides the bionic clang driver
@@ -1117,8 +1302,40 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Checkout rubash path dependency
-        run: git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/unixwin/rubash.git ../rubash
+      # Same pinned-rubash contract as the build jobs (rubash#827): fetch
+      # exactly scripts/release/rubash-pin.json's commit into ../rubash, where
+      # the [patch] path override takes over, and die on any mismatch. This
+      # leg uploads nothing to the release, but what it compiles must still be
+      # a named revision, not build-minute master HEAD.
+      - name: Checkout pinned rubash revision
+        id: rubash-pin
+        run: |
+          set -euo pipefail
+          rev="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rubash_rev"])' scripts/release/rubash-pin.json)"
+          if [[ ! "$rev" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "rubash-pin.json: rubash_rev must be a full 40-char commit sha, got '$rev'" >&2
+            exit 1
+          fi
+          if [ -e ../rubash ]; then
+            echo "a rubash checkout already exists at ../rubash; refusing to pin over it" >&2
+            exit 1
+          fi
+          git init -q ../rubash
+          git -C ../rubash remote add origin https://github.com/unixwin/rubash.git
+          if ! git -C ../rubash fetch --depth 1 origin "$rev"; then
+            echo "could not fetch the pinned rubash revision $rev; if rubash master was rewritten upstream, bump scripts/release/rubash-pin.json (rubash#827)" >&2
+            exit 1
+          fi
+          git -C ../rubash checkout --quiet FETCH_HEAD
+          git -C ../rubash submodule update --init --depth 1
+          actual="$(git -C ../rubash rev-parse HEAD)"
+          if [ "$actual" != "$rev" ]; then
+            echo "rubash checkout resolved to $actual, not the pinned $rev; refusing to build (rubash#827)" >&2
+            exit 1
+          fi
+          pin_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rubash_version"])' scripts/release/rubash-pin.json)"
+          echo "rubash pinned at ${rev:0:12} (v$pin_version)"
+          echo "revision=${rev:0:12}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve release inputs
         id: release
@@ -1179,8 +1396,37 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Checkout rubash path dependency
-        run: git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/unixwin/rubash.git ../rubash
+      # Same pinned-rubash contract as the build jobs (rubash#827): the gate
+      # runs against the pinned engine, not build-minute master HEAD.
+      - name: Checkout pinned rubash revision
+        id: rubash-pin
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = Get-Content -LiteralPath scripts/release/rubash-pin.json -Raw | ConvertFrom-Json
+          $rev = $pin.rubash_rev
+          if ($rev -notmatch '^[0-9a-f]{40}$') {
+            throw "rubash-pin.json: rubash_rev must be a full 40-char commit sha, got '$rev'"
+          }
+          if (Test-Path -LiteralPath ..\rubash) {
+            throw "a rubash checkout already exists at ..\rubash; refusing to pin over it"
+          }
+          git init ..\rubash
+          if ($LASTEXITCODE -ne 0) { throw "git init ../rubash failed" }
+          git -C ..\rubash remote add origin https://github.com/unixwin/rubash.git
+          git -C ..\rubash fetch --depth 1 origin $rev
+          if ($LASTEXITCODE -ne 0) {
+            throw "could not fetch the pinned rubash revision $rev; if rubash master was rewritten upstream, bump scripts/release/rubash-pin.json (rubash#827)"
+          }
+          git -C ..\rubash checkout --quiet FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "could not check out the pinned rubash revision $rev" }
+          git -C ..\rubash submodule update --init --depth 1
+          if ($LASTEXITCODE -ne 0) { throw "rubash submodules failed to initialize at the pinned revision" }
+          $actual = (git -C ..\rubash rev-parse HEAD).Trim()
+          if ($actual -ne $rev) {
+            throw "rubash checkout resolved to $actual, not the pinned $rev; refusing to build (rubash#827)"
+          }
+          Write-Host "rubash pinned at $($rev.Substring(0,12)) (v$($pin.rubash_version))"
 
       - name: Resolve release inputs
         id: release
@@ -1296,8 +1542,37 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Checkout rubash path dependency
-        run: git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/unixwin/rubash.git ../rubash
+      # Same pinned-rubash contract as the build jobs (rubash#827): the gate
+      # runs against the pinned engine, not build-minute master HEAD.
+      - name: Checkout pinned rubash revision
+        id: rubash-pin
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = Get-Content -LiteralPath scripts/release/rubash-pin.json -Raw | ConvertFrom-Json
+          $rev = $pin.rubash_rev
+          if ($rev -notmatch '^[0-9a-f]{40}$') {
+            throw "rubash-pin.json: rubash_rev must be a full 40-char commit sha, got '$rev'"
+          }
+          if (Test-Path -LiteralPath ..\rubash) {
+            throw "a rubash checkout already exists at ..\rubash; refusing to pin over it"
+          }
+          git init ..\rubash
+          if ($LASTEXITCODE -ne 0) { throw "git init ../rubash failed" }
+          git -C ..\rubash remote add origin https://github.com/unixwin/rubash.git
+          git -C ..\rubash fetch --depth 1 origin $rev
+          if ($LASTEXITCODE -ne 0) {
+            throw "could not fetch the pinned rubash revision $rev; if rubash master was rewritten upstream, bump scripts/release/rubash-pin.json (rubash#827)"
+          }
+          git -C ..\rubash checkout --quiet FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "could not check out the pinned rubash revision $rev" }
+          git -C ..\rubash submodule update --init --depth 1
+          if ($LASTEXITCODE -ne 0) { throw "rubash submodules failed to initialize at the pinned revision" }
+          $actual = (git -C ..\rubash rev-parse HEAD).Trim()
+          if ($actual -ne $rev) {
+            throw "rubash checkout resolved to $actual, not the pinned $rev; refusing to build (rubash#827)"
+          }
+          Write-Host "rubash pinned at $($rev.Substring(0,12)) (v$($pin.rubash_version))"
 
       - name: Resolve release inputs
         id: release
@@ -1516,10 +1791,10 @@ jobs:
         with:
           path: artifacts
 
-      # All three build jobs clone rubash master at dispatch time, so they
-      # must have compiled the same revision. If they did not (a master
-      # commit landed between two jobs' clones), the release would mix
-      # engines across platforms — refuse instead.
+      # All build jobs fetch the same PINNED rubash revision
+      # (scripts/release/rubash-pin.json), so they must have compiled the same
+      # revision. If they did not (a pin file drift, a partial fetch), the
+      # release would mix engines across platforms — refuse instead.
       - name: Check engine revision agreement across build jobs
         run: |
           set -eu
@@ -1564,7 +1839,7 @@ jobs:
           body: |
             Niubash ${{ steps.release.outputs.tag }} packages for Windows, Linux, and macOS.
 
-            Engine: rubash git ${{ needs.build-windows.outputs.rubash_revision }} — every platform build in this release compiled that same revision.
+            Engine: rubash git ${{ needs.build-windows.outputs.rubash_revision }} — every platform build in this release compiled that same revision, pinned by `scripts/release/rubash-pin.json` and fail-hard verified at fetch time (rubash#827). The release compiles the pinned engine, not "whatever rubash master was when the pipeline ran".
             Verify locally with `niu --version`, which prints the same revision.
 
             Windows (x64, ARM64): Inno Setup installers (`*-setup.exe`) add user PATH and Windows Terminal profile integration; portable zips bundle `niu` with WinuxCmd and bash/sh shims.
@@ -1602,8 +1877,36 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Checkout rubash path dependency
-        run: git clone --depth 1 https://github.com/unixwin/rubash.git ../rubash
+      # Same pinned-rubash contract as the build jobs (rubash#827): publishing
+      # resolves against the named engine revision too. No submodules needed
+      # here (same as before): nothing under third_party is imported.
+      - name: Checkout pinned rubash revision
+        id: rubash-pin
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = Get-Content -LiteralPath scripts/release/rubash-pin.json -Raw | ConvertFrom-Json
+          $rev = $pin.rubash_rev
+          if ($rev -notmatch '^[0-9a-f]{40}$') {
+            throw "rubash-pin.json: rubash_rev must be a full 40-char commit sha, got '$rev'"
+          }
+          if (Test-Path -LiteralPath ..\rubash) {
+            throw "a rubash checkout already exists at ..\rubash; refusing to pin over it"
+          }
+          git init ..\rubash
+          if ($LASTEXITCODE -ne 0) { throw "git init ../rubash failed" }
+          git -C ..\rubash remote add origin https://github.com/unixwin/rubash.git
+          git -C ..\rubash fetch --depth 1 origin $rev
+          if ($LASTEXITCODE -ne 0) {
+            throw "could not fetch the pinned rubash revision $rev; if rubash master was rewritten upstream, bump scripts/release/rubash-pin.json (rubash#827)"
+          }
+          git -C ..\rubash checkout --quiet FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "could not check out the pinned rubash revision $rev" }
+          $actual = (git -C ..\rubash rev-parse HEAD).Trim()
+          if ($actual -ne $rev) {
+            throw "rubash checkout resolved to $actual, not the pinned $rev; refusing to build (rubash#827)"
+          }
+          Write-Host "rubash pinned at $($rev.Substring(0,12)) (v$($pin.rubash_version))"
 
       - name: Resolve release inputs
         id: release

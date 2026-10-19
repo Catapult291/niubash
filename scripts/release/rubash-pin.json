@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "rubash_rev": "992d5c5e6fa679cc5c7fa2bf4297173240e56fd5",
+  "rubash_version": "1.4.0",
+  "description": "Rubash source pin for niubash releases (rubash#827, conclusion B). Every release job fetches exactly this rubash commit into ../rubash -- where the [patch] path override in Cargo.toml deterministically picks it up -- and fails the release unless the checked-out HEAD equals rubash_rev. This is the source-level twin of winuxcmd-pin.json (niubash#312/#327): the bundled WinuxCmd was already pinned, but the compiled engine was 'whatever rubash master HEAD was at build time'.",
+  "notes": [
+    "Why this exists: niubash v1.4.0 (release run 38506862578) cloned rubash master at build time and compiled e785c3c8f610 while the release era declared rubash v1.4.0 (f69e7900) -- the shipped engine was a moving target and carried the pre-#819 stale-HOME behavior of rubash#754 (rubash#827).",
+    "rubash_rev MUST be the full 40-character commit sha: 'git fetch origin <sha>' resolves the argument server-side as a ref name, and abbreviated forms die before fetching (same lesson as perfbudget's Fetch-Pinned pins).",
+    "rubash_version is the Cargo.toml version AT that rev; verify-rubash-pin.py checks it so a rev and its self-declared version can never drift apart silently.",
+    "Bumping the pin is a deliberate release decision (same flow as winuxcmd-pin): rubash lands the commits niubash wants -> update rubash_rev and rubash_version together in one commit -> 'python scripts/release/verify-rubash-pin.py --fetch' must pass -> niubash CI green against the new pin -> cut the niubash tag. One line here repoints every release job; nothing else in the pipeline names a revision.",
+    "The .github/workflows/ci.yml sibling clones deliberately stay floating on rubash master: the dev line should keep testing tomorrow's engine. Only the release pipeline pins.",
+    "Recorded 2026-10-19 from rubash master HEAD 992d5c5e6fa679cc5c7fa2bf4297173240e56fd5 (v1.4.0, Cargo.toml version 1.4.0); niubash master CI (117147a) is green against this engine."
+  ]
+}

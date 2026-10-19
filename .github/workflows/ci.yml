@@ -27,6 +27,13 @@ jobs:
       - name: Checkout rubash path dependency
         run: git clone --depth 1 https://github.com/unixwin/rubash.git ../rubash
 
+      # rubash#827: keep the release-pin verifier honest on every PR (local
+      # fixtures, no network). The verifier audits scripts/release/rubash-pin.json
+      # against a rubash tree; the release workflow enforces that contract
+      # inline, fail-hard, at fetch time.
+      - name: verify-rubash-pin self-test
+        run: python scripts/release/verify-rubash-pin.py --self-test
+
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1.11
         with:

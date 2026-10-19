@@ -33,6 +33,17 @@ jobs:
       - name: Check the checker
         run: python scripts/release/check-pins.py --self-test
 
+      # rubash#827: the engine source pin has its own verifier (rev + version
+      # + clean tree). The self-test keeps the verifier honest; the fetch
+      # dry-run exercises the real contract against GitHub -- a pinned rev
+      # that became unfetchable (e.g. an upstream rewrite) surfaces here,
+      # weekly, instead of as a red release.
+      - name: Check the rubash pin verifier
+        run: python scripts/release/verify-rubash-pin.py --self-test
+
+      - name: Fetch-dry-run the pinned rubash revision
+        run: python scripts/release/verify-rubash-pin.py --fetch-self-test
+
       - name: Compare the pins with the published index
         id: check
         run: |
