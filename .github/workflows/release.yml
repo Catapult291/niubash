@@ -460,7 +460,7 @@ jobs:
           # sat in usr\bin during `wpm install`, package shims would link
           # to it and then depend on a .wpm\shims.map this package
           # deliberately does not ship.
-          $forwarder = Join-Path (Split-Path -LiteralPath $winuxcmdExe -Parent) "winuxcmd-shim.exe"
+          $forwarder = Join-Path (Split-Path -Path $winuxcmdExe -Parent) "winuxcmd-shim.exe"
           if (Test-Path -LiteralPath $forwarder) {
             Copy-Item -LiteralPath $forwarder -Destination (Join-Path $root "usr\bin\winuxcmd-shim.exe") -Force
             Write-Host "staged the package-shim forwarder winuxcmd-shim.exe"
