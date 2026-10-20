@@ -119,7 +119,22 @@ fn run_main() -> ExitCode {
     // use, so the interposition must land first). A reader that closes
     // the pipe must terminate niu — one diagnostic, status 1 — instead
     // of letting an unbounded producer loop on per-write failures.
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    // rubash#873 companion: consume the engine's background-wrapper spawn
+    // handshake (`--internal-bg-wrapper=<nonce>` argv flag + the matching
+    // __RUBASH_BACKGROUND_WRAPPER env nonce) before any launcher dispatch
+    // sees argv. The rubash engine inside niu spawns wrapper respawns for
+    // background jobs addressed to this very binary; its spawn site
+    // attaches the niu-CLI-specific flag only when the host CLI declared
+    // itself a consumer (this call), so skipping it would leak the flag
+    // into our GNU-aligned option parser —
+    // `bash: --internal-bg-wrapper=<nonce>: invalid option` + usage, rc 2 —
+    // and kill every wrapper respawn (niubash master CI,
+    // tests/background_spawn_args.rs). The call also arms the in-process
+    // wrapper role when both channels agree, keeping the #737
+    // dies-with-the-wrapper cascade live for niu the way rubash's own
+    // main() has it. For plain invocations this is just the env scrub.
+    rubash::builtins::kill::consume_background_wrapper_handshake(&mut args);
     piped_stdout::install_for_argv(&args);
 
     // Initialize logging (only error level by default)
