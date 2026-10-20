@@ -45,7 +45,7 @@ honest status of every target, lives in
 
 | Platform | Status | Ships as |
 |---|---|---|
-| Windows x64 / ARM64 | Released; smoke-gated every release | installer `.exe` + `.zip`, Unix commands bundled |
+| Windows x64 / ARM64 | Released; smoke-gated every release | installer `.exe` + portable `.tar.gz`/`.7z`/`.zip`, Unix commands bundled |
 | Linux x86_64 / aarch64 (glibc 2.35+) | Released; smoke-gated every release | portable `.tar.gz`, uses system tools |
 | macOS aarch64 / x86_64 | Released; smoke-gated every release | portable `.tar.gz`, uses system tools |
 | Android aarch64 / armv7 | CI build only, no release | NDK-linked zip on workflow runs, not smoke-tested |
@@ -113,7 +113,10 @@ once the fix currently in flight lands.
 Windows: grab `niubash-v*-win-*-setup.exe` from
 [Releases](https://github.com/unixwin/niubash/releases) and run it — no
 admin rights; PATH and a Windows Terminal profile are set up for you.
-Prefer portable? Take the `.zip`.
+Prefer portable? Take the `.tar.gz` — it ships the bundled git/awk payload
+as real hardlinks, so it downloads and unpacks much smaller than the `.zip`
+(`tar -xf niubash-v*-win-x64.tar.gz`, built into Windows 10+). The `.zip`
+stays for tooling that only speaks zip.
 
 Linux (x86_64, aarch64; glibc 2.35+) and macOS (aarch64, x86_64): take the
 portable tarball, untar, run:
