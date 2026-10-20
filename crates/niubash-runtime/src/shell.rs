@@ -372,6 +372,10 @@ impl Shell {
             let unmarked_name = invoked_name.strip_prefix('-').unwrap_or(&invoked_name);
             if unmarked_name.len() < invoked_name.len() {
                 executor.set_env("__RUBASH_LOGIN_SHELL", "1");
+                // Same pair the engine's mark_login_shell funnels; kept
+                // inline (no new engine API) so this builds against the
+                // pinned rubash rev as well as the local patch.
+                executor.set_shopt_option("login_shell", true);
             }
             if matches!(unmarked_name, "sh" | "ash") {
                 executor.set_env("__RUBASH_POSIX_MODE", "1");
