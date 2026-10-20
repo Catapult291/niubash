@@ -9,7 +9,8 @@
 //! manifest edit cannot silently change what a release ships. These tests
 //! pin the schema and the owner-ordered exclusions so a manifest edit
 //! cannot silently re-admit a forbidden package (compression tools, goawk,
-//! `link`), drop the fail-open disclosure, or drop the pins. The workflow
+//! `link`), drop the per-leg install-policy disclosure (fail-closed on
+//! x64, fail-open on other legs), or drop the pins. The workflow
 //! reads the same file; a schema break fails `cargo test` here before it
 //! can fail a release. `scripts/release/winuxcmd-pin.json` (the bundled
 //! WinuxCmd engine pin, same issue) is schema-checked here too.
@@ -293,17 +294,26 @@ fn excluded_records_owner_policy_and_never_reappears() {
 }
 
 #[test]
-fn fail_open_disclosure_is_part_of_the_manifest() {
-    // The fail-open contract is a property of the manifest, not of the
-    // workflow: the notes must keep telling release editors that a failed
-    // install warns and continues.
+fn fail_closed_x64_contract_is_part_of_the_manifest() {
+    // The per-leg install policy is a property of the manifest, not of the
+    // workflow (niubash#468): x64 is the primary user-facing leg, so a
+    // failed pin check, install, or shim materialization there must stop
+    // the release — the notes must keep telling release editors that. The
+    // non-primary legs keep the fail-open disclosure contract.
     let manifest = load_manifest();
     let notes = string_list(&manifest.get("notes").cloned().unwrap_or(Value::Null));
+    assert!(
+        notes.iter().any(|note| {
+            let note = note.to_ascii_lowercase();
+            note.contains("fail-closed") && note.contains("x64")
+        }),
+        "manifest notes must record the x64 fail-closed contract (niubash#468)"
+    );
     assert!(
         notes
             .iter()
             .any(|note| note.to_ascii_lowercase().contains("fail-open")),
-        "manifest notes must record the fail-open contract"
+        "manifest notes must record the non-x64 fail-open contract"
     );
     assert!(
         manifest

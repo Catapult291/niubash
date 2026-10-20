@@ -12,6 +12,7 @@ Release addressing P0 transient console window pop-ups across WinuxCmd shims, ru
 - `argv[0]`-marked login shells (`-bash`, `-niu`) preserve `shopt login_shell` as `on` across `reset_shell_options` (#465, rubash#911).
 - Unix platform shell discovery resolves the installed shell binary by platform binary name (`niu` on Unix vs `niu.exe` on Windows) (#463).
 - Golden-journey release audit fixes: ConPTY gallery pseudo-console window preservation (#455), sandbox hygiene and deterministic test gates (#442, #447, #449).
+- Release packaging: the product zip now carries `winuxcmd-shim.exe` beside `winuxcmd.exe` so upgrades replace a stale package-shim forwarder (the actual #466 fix payload) instead of leaving the 1.1.x buggy binary in place, and the x64 preinstall leg is fail-closed — a failed pin check, package install, or shim materialization stops the release instead of silently shipping a reduced bundle (#468). The gawk `unixwin2` artifact 404 that silently skipped the 1.4.1 gawk preinstall is fixed at the source (wpm-artifacts asset name).
 
 ### Changed
 

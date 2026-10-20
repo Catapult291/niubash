@@ -174,6 +174,10 @@ try {
     Copy-Item -LiteralPath $activationScript -Destination (Join-Path $stageDir "winuxcmd\usr\bin\activate-winuxcmd.sh") -Force
 
     # niubash#189: pre-installed wpm packages (see -PreinstallRoot above).
+    # The same usr\bin sweep also ships `winuxcmd-shim.exe` (the package-shim
+    # forwarder, staged by the release workflow after the wpm installs) so
+    # upgrades replace a stale forwarder and runtime `wpm install` can link
+    # new package shims to it (niubash#466/#468).
     if ($PreinstallRoot) {
         if (-not (Test-Path -LiteralPath (Join-Path $PreinstallRoot "usr\bin"))) {
             throw "PreinstallRoot has no usr\bin: $PreinstallRoot"

@@ -291,14 +291,21 @@ jobs:
       # mismatched pin is a LOUD fail-open skip (below) — the package ships
       # without pre-install rather than with unverified bytes.
       #
-      # FAIL-OPEN (owner decision): pre-installing is an enhancement, not a
-      # promise. A failed install (e.g. arm64 legs — the wpm index carries
-      # windows-x64 artifacts only for these packages) is a loud ::warning
-      # plus a step-summary line, never a release blocker; the verify step
-      # below hard-asserts only what this step reports as installed, and the
-      # release body discloses the caveat. Transport retries follow the repo
-      # convention (perfbudget's Fetch-Pinned): 3 attempts with backoff, the
-      # local proxy as the final-attempt fallback via wpm's --proxy flag.
+      # FAIL-CLOSED on x64, FAIL-OPEN on other legs (owner decision,
+      # niubash#468): pre-installing is an enhancement, not a promise — on
+      # the non-primary legs. A failed install (e.g. arm64 legs — the wpm
+      # index carries windows-x64 artifacts only for these packages) is a
+      # loud ::warning
+      # plus a step-summary line, never a release blocker on the non-primary
+      # legs; the verify step below hard-asserts only what this step reports
+      # as installed, and the release body discloses the caveat. On x64 —
+      # the primary user-facing leg — the same failure is FAIL-CLOSED and
+      # stops the release outright (niubash#468): a silently skipped gawk
+      # preinstall once shipped a 1.4.1 without opt\gawk and left
+      # usr\bin\awk.exe/gawk.exe as 1.4.0-era copies. Transport retries
+      # follow the repo convention (perfbudget's Fetch-Pinned): 3 attempts
+      # with backoff, the local proxy as the final-attempt fallback via
+      # wpm's --proxy flag.
       - name: Pre-install release packages (wpm, manifest-driven)
         id: preinstall
         shell: pwsh
@@ -439,6 +446,44 @@ jobs:
             }
             else {
               Write-Host "::warning::shim '$($shim.name)' could not be materialized (fail-open)"
+            }
+          }
+
+          # The package-shim forwarder ships beside winuxcmd.exe in the
+          # WinuxCmd release zip and belongs in usr\bin of the product
+          # package (niubash#466/#468). Preinstalled layout:shim commands
+          # keep forwarding through winuxcmd.exe — it resolves
+          # opt\<pkg>\<cmd>.exe itself and needs no shipped .wpm state —
+          # but runtime `wpm install` and `wpm links rebuild` need the
+          # forwarder present to link package shims and to heal stale
+          # hardlink shims on upgrade. Stage it AFTER the installs: if it
+          # sat in usr\bin during `wpm install`, package shims would link
+          # to it and then depend on a .wpm\shims.map this package
+          # deliberately does not ship.
+          $forwarder = Join-Path (Split-Path -LiteralPath $winuxcmdExe -Parent) "winuxcmd-shim.exe"
+          if (Test-Path -LiteralPath $forwarder) {
+            Copy-Item -LiteralPath $forwarder -Destination (Join-Path $root "usr\bin\winuxcmd-shim.exe") -Force
+            Write-Host "staged the package-shim forwarder winuxcmd-shim.exe"
+          }
+          else {
+            Write-Host "::warning::winuxcmd-shim.exe not found beside $winuxcmdExe (the WinuxCmd zip should carry it since v1.1.15); layout:shim installs fall back to winuxcmd.exe forwarding"
+            $failed += "winuxcmd-shim"
+          }
+
+          # niubash#468 — FAIL-CLOSED on the primary leg: a silently skipped
+          # preinstall once shipped a gawk-less 1.4.1 and left
+          # usr\bin\awk.exe/gawk.exe as 1.4.0-era copies of an older
+          # winuxcmd.exe. x64 is the user-facing leg, so any failure here
+          # must stop the release; other legs keep the loud-warning
+          # fail-open contract (arm64 has no gawk/niugit artifacts by
+          # design).
+          if ("${{ matrix.arch }}" -eq "x64") {
+            if ($failed.Count -gt 0) {
+              throw "x64 pre-install is fail-closed (niubash#468): failed packages: $($failed -join ', ')"
+            }
+            $missingShims = @($manifest.shims | Where-Object { $shimsMade -notcontains $_.name } | ForEach-Object { $_.name })
+            if ($missingShims.Count -gt 0) {
+              throw "x64 pre-install is fail-closed (niubash#468): manifest shims not materialized: $($missingShims -join ', ')"
             }
           }
 
