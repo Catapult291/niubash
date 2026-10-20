@@ -880,3 +880,53 @@ fn plugin_sync_timeout_flag_parses_and_validates() {
 
     let _ = fs::remove_dir_all(sandbox.home.parent().unwrap());
 }
+
+/// The add's completion line must name the source the add declared, even
+/// when the post-#359 reconcile report carries bystander rows after it
+/// (trusted sources' `unchanged` materialization rows publish after the
+/// fresh entry's `awaiting-trust` row). Release run 39249382423's P8-S4
+/// red: the re-add's report ended on a bystander `unchanged` row, the
+/// verb printed a misleading `Declared source 'bash-completion'` and no
+/// `Installed source` line at all.
+#[test]
+fn add_completion_line_names_the_added_source_not_a_bystander() {
+    let sandbox = Sandbox::new("add-completion-line");
+    let omb_s = fixture("oh-my-bash").to_string_lossy().into_owned();
+    let wild_s = fixture("bash-preexec").to_string_lossy().into_owned();
+
+    // A trusted bystander: installed, trusted, its loader section
+    // materialized — the shape that publishes an `unchanged` row late.
+    let wild = run_niu_with_env(&["plugin", "add", &wild_s], &sandbox.envs);
+    assert_success(&wild, "add the wild bystander");
+    let trust_wild = run_niu_with_env(&["plugin", "trust", "bash-preexec"], &sandbox.envs);
+    assert_success(&trust_wild, "trust the wild bystander");
+
+    // The source under test: installed + trusted, then removed entirely
+    // (the P8-S4 remove), so the re-add is a fresh install.
+    let omb = run_niu_with_env(
+        &["plugin", "add", "oh-my-bash", "--path", &omb_s],
+        &sandbox.envs,
+    );
+    assert_success(&omb, "add the framework source");
+    let trust_omb = run_niu_with_env(&["plugin", "trust", "oh-my-bash"], &sandbox.envs);
+    assert_success(&trust_omb, "trust the framework source");
+    let remove = run_niu_with_env(&["plugin", "source", "remove", "oh-my-bash"], &sandbox.envs);
+    assert_success(&remove, "remove the framework source");
+
+    let readd = run_niu_with_env(
+        &["plugin", "add", "oh-my-bash", "--path", &omb_s],
+        &sandbox.envs,
+    );
+    assert_success(&readd, "re-add the framework source");
+    let out = stdout_text(&readd);
+    assert!(
+        out.contains("Installed source 'oh-my-bash'"),
+        "the add must name the source it installed: {out}"
+    );
+    assert!(
+        !out.contains("Declared source 'bash-preexec'"),
+        "a bystander row must not steal the completion line: {out}"
+    );
+
+    let _ = fs::remove_dir_all(sandbox.home.parent().unwrap());
+}

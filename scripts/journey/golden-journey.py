@@ -363,6 +363,31 @@ def stress_pause():
         time.sleep(random.uniform(0, STRESS_DELAY_MS) / 1000.0)
 
 
+# ── Raw-stream plain mirror ─────────────────────────────────────────────────
+# `wait_for`'s raw fallback must see the line a USER saw, not the bytes. The
+# product colorizes single words (jt444 run9: `niu plugin source remove`
+# printed `\x1b[32mRemoved\x1b[0m source 'oh-my-bash'` — the needle
+# "Removed source 'oh-my-bash'" is split by the SGR reset in the raw bytes
+# and can never substring-match there). The pump therefore maintains an
+# escape-stripped mirror of every chunk; a CSI sequence split ACROSS chunk
+# boundaries is held as a tail so stripping is exact.
+_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+_CSI_TAIL_RE = re.compile(r"\x1b(?:\[[0-9;?]*)?$")
+
+
+def _strip_csi(text: str):
+    """Remove complete CSI sequences from `text`; return (clean, tail)
+    where `tail` is a trailing possibly-incomplete escape sequence held
+    for the next chunk (none when the text ends in plain content)."""
+    clean = _CSI_RE.sub("", text)
+    tail = ""
+    m = _CSI_TAIL_RE.search(clean)
+    if m:
+        tail = m.group(0)
+        clean = clean[:m.start()]
+    return clean, tail
+
+
 def render_history_line(line, columns: int) -> str:
     """One pyte history row to text. Newer pyte stores rows as
     char-maps (`StaticDefaultDict[int, Char]`), older as mappings too —
@@ -407,25 +432,73 @@ class Session:
         self.screen = make_history_screen(cols, rows)
         self.stream = pyte.Stream(self.screen)
         self.raw_chunks = []
+        # Escape-stripped mirror of raw_chunks for needle waits (see
+        # _strip_csi): the product's own SGR coloring splits needles in
+        # the raw bytes, so a raw-only fallback can never see lines the
+        # terminal demonstrably printed.
+        self._raw_plain_chunks = []
+        self._esc_tail = ""
+        # pyte parse crash -> raw-only mode: the raw stream stays the
+        # truth surface; the screen model freezes but waits still match
+        # the stripped mirror and the event lands in the verdict ledger.
+        self._feed_dead = False
         self._lock = threading.Lock()
         self._raw_file = open(raw_log, "wb") if raw_log else None
         self._reader = threading.Thread(target=self._pump, daemon=True)
         self._reader.start()
 
     def _pump(self):
-        while self.proc.isalive():
-            try:
-                data = self.proc.read()
-            except Exception:
-                break
-            if data:
-                with self._lock:
-                    self.raw_chunks.append(data)
-                    if self._raw_file:
-                        self._raw_file.write(data.encode("utf-8",
-                                                         errors="replace"))
-                self.stream.feed(data)
-        self.dead = True
+        try:
+            while self.proc.isalive():
+                try:
+                    data = self.proc.read()
+                except Exception:
+                    break
+                if data:
+                    with self._lock:
+                        self.raw_chunks.append(data)
+                        plain, self._esc_tail = _strip_csi(
+                            self._esc_tail + data)
+                        self._raw_plain_chunks.append(plain)
+                        if self._raw_file:
+                            self._raw_file.write(
+                                data.encode("utf-8", errors="replace"))
+                        # Feed under the same lock the readers take: pyte's
+                        # history deque and display mutate in place, and an
+                        # unsynchronized capture crashed the gate with
+                        # "deque mutated during iteration" (run4,
+                        # 2026-10-19).
+                        #
+                        # A feed EXCEPTION must not kill the reader either
+                        # (jt444 run9: the pump died inside feed on the
+                        # `niu plugin source remove` output chunk — raw
+                        # append/file-write had already run, so the needle
+                        # sat in the artifacts while the screen froze and
+                        # `dead` never set, leaving every later wait to a
+                        # silent timeout). Degrade to raw-only: keep
+                        # capturing, ledger the real exception once.
+                        if not self._feed_dead:
+                            try:
+                                self.stream.feed(data)
+                            except Exception as err:
+                                self._feed_dead = True
+                                self._delivery_event(
+                                    "pump-feed", "", 1,
+                                    f"pyte feed raised {err!r} — screen "
+                                    f"model frozen from here; raw capture "
+                                    f"continues",
+                                    "raw-only")
+        except Exception as err:
+            # An escaping bug in the pump body itself: ledger the real
+            # exception instead of a silent thread death.
+            self._delivery_event(
+                "pump", "", 1, f"reader thread died: {err!r}", "pump-dead")
+        finally:
+            # Whatever ended the reader — pty EOF, a read exception, or an
+            # escaping bug — the session must never look alive with a dead
+            # pump: an unset `dead` turns the truth into a silent 90s
+            # timeout (the jt444 run9 shape).
+            self.dead = True
 
     def _write(self, data) -> bool:
         """One guarded ConPTY write. A child that dies mid-journey closes
@@ -448,7 +521,8 @@ class Session:
 
     def text(self) -> str:
         """The current viewport (what a user sees right now)."""
-        return "\n".join(self.screen.display)
+        with self._lock:
+            return "\n".join(self.screen.display)
 
     def raw_text(self) -> str:
         with self._lock:
@@ -456,33 +530,43 @@ class Session:
 
     def transcript(self) -> str:
         """Scrollback plus viewport — the full story of the session."""
-        history = [render_history_line(line, self.screen.columns)
-                   for line in self.screen.history.top]
-        return "\n".join(history + self.screen.display)
+        with self._lock:
+            history = [render_history_line(line, self.screen.columns)
+                       for line in self.screen.history.top]
+            return "\n".join(history + self.screen.display)
 
     def raw_stripped(self) -> str:
         """The raw byte stream with ANSI escape sequences removed — every
         line the terminal ever received, even ones a later screen clear
-        erased from pyte's model."""
-        raw = self.raw_text()
-        raw = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", raw)
-        raw = raw.replace("\r\n", "\n").replace("\r", "")
-        return raw
+        erased from pyte's model. Served from the pump's incremental
+        mirror (_raw_plain_chunks), so a CSI split across chunk reads is
+        still stripped exactly."""
+        with self._lock:
+            raw = "".join(self._raw_plain_chunks)
+        return raw.replace("\r\n", "\n").replace("\r", "")
 
     def wait_for(self, *needles, timeout=60, abort_on=()):
         """Wait until a needle shows on the viewport or in the raw stream
-        (screen clears hide text from pyte, never from the bytes).
+        (screen clears hide text from pyte, never from the bytes). The
+        raw fallback checks the STRIPPED mirror: the product's own SGR
+        coloring splits needles in the unstripped bytes (jt444 run9:
+        `\x1b[32mRemoved\x1b[0m source 'oh-my-bash'` — the stripped line
+        a user read was a substring-matchable line, the raw bytes were
+        not, and the wait ran out its 90s on a printed line).
         `abort_on` needles (viewport only) fail fast: they mean the flow
         moved past what we were waiting for."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.dead:
                 raise TimeoutError(
-                    f"pty closed (child exited) while waiting for {needles};"
+                    f"pty reader ended (child exit, or a pump-dead "
+                    f"delivery event) while waiting for {needles};"
                     f" screen:\n{self.text()}")
             body = self.text()
+            plain = self.raw_stripped()
             for needle in needles:
-                if needle in body or needle in self.raw_text():
+                if (needle in body or needle in self.raw_text()
+                        or needle in plain):
                     return needle
             for gone in abort_on:
                 if gone in body:
@@ -751,6 +835,11 @@ class Session:
             self.proc.terminate(force=True)
         except Exception:
             pass
+        # Reap the reader before closing the raw file: the pump writes to
+        # it under the lock on every chunk, and closing first raced it
+        # into 'write to closed file' (jt452 run1, J7 — ledgered as a
+        # pump-dead event by the guarded reader).
+        self._reader.join(timeout=5)
         if self._raw_file:
             try:
                 self._raw_file.close()
@@ -777,12 +866,16 @@ class Verdict:
 
     def seal(self) -> str:
         """Aggregate step statuses into the run verdict: "pass" | "known-
-        fail" | "fail" (worst wins). The caller maps the verdict to the
-        exit code via gate_exit_code: known-fail is labeled, owned by its
-        ticket, and does not block the release gate."""
+        fail" | "fail" (worst wins). A blocked step — a crashed phase or
+        a blocked walk — is never green: gate_exit_code's contract maps
+        anything but pass/known-fail to exit 1, so blocked seals as fail
+        (the BLOCKED lines below stay honest about the shape). The caller
+        maps the verdict to the exit code via gate_exit_code: known-fail
+        is labeled, owned by its ticket, and does not block the release
+        gate."""
         worst = "pass"
         for step in self.steps:
-            if step["status"] == "fail":
+            if step["status"] in ("fail", "blocked"):
                 worst = "fail"
                 break
             if step["status"] == "known-fail":
@@ -1099,9 +1192,12 @@ def themed_prompt_signature(session: Session, samples: int = 8):
     rendered). So the newest input row anchors the block, PUA/
     powerline structure rows above it join, letterless filler rows
     skip (bounded), plain output still stops the walk — and the best
-    (longest) of a few samples wins. The question the callers ask is
-    whether the theme rendered, not whether one pyte instant caught
-    it.
+    (longest) of a few samples wins. A structure row glued onto the
+    banner's physical row (the powerbash10k right segment's cursor-up
+    draw, release 39249382423) joins the block too: the PUA glyphs make
+    it themed structure, and the walk stops there. The question the
+    callers ask is whether the theme rendered, not whether one pyte
+    instant caught it.
 
     Theme-independent by construction: compare a session against a
     reference captured from the SAME theme in the SAME run, never
@@ -1119,13 +1215,25 @@ def themed_prompt_signature(session: Session, samples: int = 8):
         block = []
         skips = 0
         for row in reversed(rows[:input_idx]):
-            if NOTICE_MARK in row or re.match(r"Niubash \d+\.\d+\.\d+",
-                                              row.strip()):
+            if NOTICE_MARK in row:
                 break
+            banner = bool(re.match(r"Niubash \d+\.\d+\.\d+", row.strip()))
             if _prompt_structure_row(row):
+                # A themed structure row joins the block EVEN when it
+                # shares the banner's physical row: powerbash10k's right
+                # segment is drawn by a cursor-up dance that can land it
+                # on the banner row (release 39249382423 — the glued row
+                # emptied an honest signature). The PUA glyphs make the
+                # row themed structure; join it, then stop (nothing above
+                # a banner row belongs to the block).
                 block.append(_canonical_prompt_row(row))
                 skips = 0
-            elif skips < 4 and not any(ch.isalnum() for ch in row):
+                if banner:
+                    break
+                continue
+            if banner:
+                break
+            if skips < 4 and not any(ch.isalnum() for ch in row):
                 skips += 1  # a partial-repaint filler fragment: skip, not stop
             else:
                 break
@@ -1778,11 +1886,20 @@ def p3_s4_aged_state(exe, home, env, verdict, seed, state):
                 line.strip()[:60] for line in body.splitlines()
                 if "tree missing" in line}
             nags = sync_row_keys(body, "awaiting-trust")
+            # The documented bound is "at most" the one-line deferred memo
+            # (journey-steps.json P3-S4). Post-#359 the boot runs NO startup
+            # sync at all — the rc bootstrap line is a compatibility no-op
+            # (src/main.rs run_plugin_sync_command) and the generated loader
+            # is the boot plane — so the silent boot is the new steady state
+            # and 0 deferred rows is legal; failed/degraded rows remain
+            # forbidden (the wedge/retry-storm class must never print).
             first = next(iter(sorted(deferred | failed | degraded)),
                          "(none)")
-            step.check("at most the documented one-line notices (the "
-                       "deferred memo line; no failed/degraded rows)",
-                       len(deferred) == 1 and not failed and not degraded,
+            step.check("at most the documented one-line notices (post-#359 "
+                       "the boot runs no startup sync, so zero deferred "
+                       "rows is the silent-boot steady state; never "
+                       "failed/degraded rows)",
+                       len(deferred) <= 1 and not failed and not degraded,
                        f"deferred={sorted(deferred)} failed={sorted(failed)} "
                        f"degraded={sorted(degraded)}; first: "
                        f"{first.strip()[:140]}")
@@ -2336,6 +2453,11 @@ def journey(exe: Path, root: Path, verdict: Verdict,
 
         try:
             session.wait_for("Plugin collection?", timeout=60)
+            # Let the menu finish drawing before the keys go in: an Enter
+            # that lands during the menu's own draw/init can be swallowed
+            # (the local stall of 2026-10-19 — the completion menu waited
+            # forever). Same shape as wizard_rerun's gallery quiesce.
+            session.wait_quiescent()
             session.answer("4\r")  # 4 = full (both frameworks + hooks)
             step.check("collection menu answered with 'full'", True)
         except TimeoutError as err:
@@ -2348,6 +2470,7 @@ def journey(exe: Path, root: Path, verdict: Verdict,
         # when the pick equals the effective style.
         try:
             session.wait_for("TAB completion style?", timeout=60)
+            session.wait_quiescent()
             session.answer(ENTER)
             step.check("completion-style question answered with the "
                        "pre-highlighted default", True)
@@ -2362,6 +2485,7 @@ def journey(exe: Path, root: Path, verdict: Verdict,
         # takes its highlighted Skip default.
         try:
             session.wait_for("niu-git", timeout=10)
+            session.wait_quiescent()
             session.answer(ENTER)  # default Skip
             step.check("niu-git question answered with Skip", True)
         except TimeoutError:
@@ -2374,6 +2498,7 @@ def journey(exe: Path, root: Path, verdict: Verdict,
         # opts in.
         try:
             session.wait_for("External completion providers", timeout=60)
+            session.wait_quiescent()
             session.answer(ENTER)
             step.check("providers question answered with Skip", True)
         except TimeoutError as err:
@@ -2383,6 +2508,7 @@ def journey(exe: Path, root: Path, verdict: Verdict,
 
         try:
             session.wait_for("Apply this configuration?", timeout=60)
+            session.wait_quiescent()
             session.answer(ENTER)  # Apply is the highlighted default
             step.check("Apply gate confirmed", True)
         except TimeoutError as err:
@@ -3216,13 +3342,28 @@ def wizard_rerun(session: Session, verdict: Verdict, step, capture: str,
     session.wait_for("TAB completion style?", timeout=60)
     # Q2.6 runs on every re-run too; the current effective style is
     # pre-highlighted, so Enter is a no-op pick (niubash#322's missing
-    # step, same as the J2 and d3 fixes).
+    # step, same as the J2 and d3 fixes). Quiesce before every menu
+    # answer: an Enter landing inside the menu's own draw can be
+    # swallowed (the local stall of 2026-10-19).
+    session.wait_quiescent()
     session.answer(ENTER)
-    session.wait_for("niu-git", timeout=60)
-    session.answer(ENTER)  # Skip — the default; never auto-installs
+    # Q3 is conditional (niubash#230): a bundle that already carries
+    # niu-git (opt/niugit) skips the question silently — nothing to
+    # answer, the flow moves straight to Q4. Wait briefly; the J2 walk
+    # runs the same shape. On a bare install the menu appears and takes
+    # its highlighted Skip default.
+    try:
+        session.wait_for("niu-git", timeout=10)
+        session.wait_quiescent()
+        session.answer(ENTER)  # Skip — the default; never auto-installs
+    except TimeoutError:
+        step.note("niu-git question skipped: the bundle already carries "
+                  "niu-git (niubash#230) — nothing to answer")
     session.wait_for("External completion providers", timeout=60)
+    session.wait_quiescent()
     session.answer(ENTER)  # Skip — the default; no carapace rc snippet
     session.wait_for("Apply this configuration?", timeout=60)
+    session.wait_quiescent()
     session.answer(ENTER)  # Apply — the highlighted default
     session.wait_for("Shell rc written", timeout=120)
     try:
@@ -3729,11 +3870,19 @@ def phase_p7(exe, home, env, verdict, seed=None, state=None):
         if block is None:
             raise AssertionError("no oh-my-bash managed block to hand-edit "
                                  "in the generated loader")
-        marker_line = RC_BEGIN_MARK.format(sid="oh-my-bash")
+        # The hand edit anchors on the LOADER's own marker spelling
+        # (`# --- niu plugin source: <id> ---`, loader.rs section_begin) —
+        # not the retired rc spelling; the release-39249382423 red was the
+        # rc anchor no-oping inside the loader file.
+        marker_line = LOADER_BEGIN_MARK.format(sid="oh-my-bash")
         loader_hand = loader_before.replace(
             block,
             block.replace(marker_line + "\n",
                           marker_line + "\nplugins=('git')\n", 1), 1)
+        if loader_hand == loader_before:
+            raise AssertionError("the hand edit did not land: the loader "
+                                 "block carries no "
+                                 f"{marker_line!r} anchor")
         loader_file.write_bytes(loader_hand.encode("utf-8"))
         session.send_line("niu plugin sync", anchor_timeout=120)
         try:
@@ -3743,10 +3892,19 @@ def phase_p7(exe, home, env, verdict, seed=None, state=None):
         loader_after = read_text(loader_file)
         loader_after_bytes = read_bytes(loader_file)
         block_after = loader_managed_block(loader_after, "oh-my-bash") or ""
+        # The merge re-renders the selection canonically (one plugins=(
+        # ...) line, `next(spec) ∪ hand_added` in array order), so the
+        # hand line itself does not survive verbatim — its ITEM must:
+        # 'git' stays a member of the materialized selection without ever
+        # entering the spec's own set (§14.6 merge semantics, loader era).
+        selection = []
+        for items in re.findall(r"^plugins=\(([^)]*)\)", block_after, re.M):
+            selection.extend(re.findall(r"'([^']*)'", items))
         step.check("the hand-added selection survives the materialization",
-                   "plugins=('git')" in block_after,
-                   "\n".join(line for line in block_after.splitlines()
-                             if "plugins" in line)[:160])
+                   "git" in selection,
+                   f"materialized plugins selection: {selection}; block: "
+                   + "\n".join(line for line in block_after.splitlines()
+                               if "plugins" in line)[:160])
         step.check("the merge touched nothing outside the edited block",
                    loader_without_block(loader_after, "oh-my-bash")
                    == loader_without_block(loader_hand, "oh-my-bash"))
@@ -3847,10 +4005,23 @@ def phase_p7(exe, home, env, verdict, seed=None, state=None):
                       "box but 10-15s under concurrent lane builds (load, "
                       "not product; the wedge class never renders at all)")
             boot_raw = terminal.raw_stripped()
-            step.check("the boot printed the soft error (never a silent "
-                       "wrong shell)", "niu:" in boot_raw
-                       or "TOML" in boot_raw or "toml" in boot_raw)
-            step.check("no panic in the boot", "panicked" not in boot_raw)
+            # Post-#359 the boot NEVER reads the spec — the generated
+            # loader is the boot plane (shell.rs load_generated_plugin_
+            # loader sources it; the rc bootstrap sync is a compatibility
+            # no-op) — so the corrupt-spec boot is QUIET by design: the
+            # shell that boots is the last-known-good one, never a
+            # silently wrong one, and the readable error belongs to the
+            # explicit sync (asserted above). What must never happen is
+            # the wedge-class fallout: a panic or a failed/degraded storm.
+            storm = [line for line in boot_raw.splitlines()
+                     if re.search(r"niu plugin sync: (failed|degraded)\b",
+                                  line)]
+            step.check("the corrupt-spec boot stays quiet and clean (the "
+                       "loader is the boot plane; no panic, no failed/"
+                       "degraded storm)",
+                       "panicked" not in boot_raw and not storm,
+                       f"{len(storm)} storm line(s), first: "
+                       f"{storm[0].strip()[:140] if storm else ''}")
             verdict.capture("P7-S3-corrupt-boot", terminal)
         finally:
             terminal.close()
