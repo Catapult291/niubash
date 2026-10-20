@@ -559,7 +559,10 @@ impl ExternalCompletionPlugin {
             }
 
             // Run `cmd -h` (some tools write help to stderr)
-            let output = match std::process::Command::new(&cmd_name).arg("-h").output() {
+            let output = match crate::console_guard::suppressed_command(&cmd_name)
+                .arg("-h")
+                .output()
+            {
                 Ok(o) => o,
                 Err(_) => continue,
             };
@@ -838,7 +841,7 @@ impl ExternalCompletionPlugin {
             spec.cmd,
             spec.args
         );
-        let output = std::process::Command::new(&spec.cmd)
+        let output = crate::console_guard::suppressed_command(&spec.cmd)
             .args(&spec.args)
             .output()
             .ok()?;

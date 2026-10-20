@@ -2,6 +2,21 @@
 
 All notable changes to Niubash are documented in this file.
 
+## [1.4.2] - 2026-10-20
+
+Release addressing P0 transient console window pop-ups across WinuxCmd shims, rubash child spawns, and niubash runtime helpers, plus the v1.4.1 golden-journey release audit fixes.
+
+### Fixed
+
+- No more transient console windows when spawning external commands from a windowless or ConPTY host: the bundled WinuxCmd v1.1.18 `winuxcmd-shim` launcher suppresses orphan console creation when the parent has no visible console (#466, WinuxCmd#1282), rubash suppresses console windows on child process spawns from windowless parents (rubash#909), and niubash allocates at most one hidden console per session while adopting/suppressing orphan consoles across `fd::spawn_whitelisted`, `git_prompt`, completion helpers, plugin source git clones, and setup wizard probes (#462, #455).
+- `argv[0]`-marked login shells (`-bash`, `-niu`) preserve `shopt login_shell` as `on` across `reset_shell_options` (#465, rubash#911).
+- Unix platform shell discovery resolves the installed shell binary by platform binary name (`niu` on Unix vs `niu.exe` on Windows) (#463).
+- Golden-journey release audit fixes: ConPTY gallery pseudo-console window preservation (#455), sandbox hygiene and deterministic test gates (#442, #447, #449).
+
+### Changed
+
+- Release chain: the bundled rubash engine pin moves to `a83a09d32b4a4f953d29af0acc0e781b542206b8` (`1.4.1`) and the bundled WinuxCmd pin moves to `v1.1.18` (#466).
+
 ## [1.4.1] - 2026-10-19
 
 Healthy re-release on the pinned release chain (the bundled engine is now locked to an exact verified commit). Details in the linked issues/PRs — entries here are deliberately short.

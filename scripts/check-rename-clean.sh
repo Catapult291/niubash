@@ -11,6 +11,8 @@
 #   - winuxshrc                  : legacy rc fallback chain and migration docs
 #   - min_winuxsh / migrate_legacy_winuxsh_rc / kept-as-niu :
 #                                  intentional compat shims for the rename
+#   - docs/audit, scripts/audit, scripts/harvest/snapshots :
+#                                  historical pre-rename audit and harvest logs
 #   - Cargo.lock                 : regenerated; verified separately below
 #
 # The allowlist is applied with a POSIX case glob (lowercased line) instead of
@@ -47,7 +49,7 @@ if [ -n "$hits" ]; then
         total=$((total + 1))
         lower=$(printf '%s' "$line" | tr 'A-Z' 'a-z')
         case "$lower" in
-            *oh-my-winuxsh*|*winuxsh_unsupported_device*|*winuxsh_shell*|*winuxsh_root*|*winuxshrc*|*min_winuxsh*|*migrate_legacy_winuxsh_rc*|*replace\(*|*check-rename-clean.sh*|*kept-as-niu*|*migrated.contains*)
+            *oh-my-winuxsh*|*winuxsh_unsupported_device*|*winuxsh_shell*|*winuxsh_root*|*winuxshrc*|*min_winuxsh*|*migrate_legacy_winuxsh_rc*|*replace\(*|*check-rename-clean.sh*|*kept-as-niu*|*migrated.contains*|*docs/audit/*|*docs\\audit\\*|*scripts/audit/*|*scripts\\audit\\*|*scripts/harvest/snapshots/*|*scripts\\harvest\\snapshots\\*)
                 allowed_count=$((allowed_count + 1))
                 ;;
             *)
@@ -124,7 +126,7 @@ check "Cargo.lock pins niubash $root_version" lock_pins niubash "$root_version"
 check "Cargo.lock pins niubash-runtime $runtime_version" lock_pins niubash-runtime "$runtime_version"
 
 rubash_pinned=no
-for version in 0.1.0 1.0.0 1.0.1 1.0.2 1.1.0 1.2.0 1.2.1 1.2.2 1.2.3 1.2.4 1.2.5 1.3.0 1.3.1 1.3.2 1.3.3 2.0.0; do
+for version in 0.1.0 1.0.0 1.0.1 1.0.2 1.1.0 1.2.0 1.2.1 1.2.2 1.2.3 1.2.4 1.2.5 1.3.0 1.3.1 1.3.2 1.3.3 1.3.4 1.4.0 1.4.1 1.4.2 1.4.3 1.5.0 2.0.0; do
     if lock_pins rubash "$version"; then
         rubash_pinned=$version
         break

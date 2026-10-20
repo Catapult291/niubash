@@ -38,9 +38,61 @@ fn script_lines() -> Vec<(usize, String)> {
 fn lines_matching(lines: &[(usize, String)], needle: &str) -> Vec<(usize, String)> {
     lines
         .iter()
-        .filter(|(_, line)| line.contains(needle))
+        .filter(|(_, line)| !line.trim_start().starts_with(';') && line.contains(needle))
         .cloned()
         .collect()
+}
+
+/// Non-comment `[Section]` headers present in `lines`, lowercased without brackets.
+fn section_headers(lines: &[(usize, String)]) -> Vec<(usize, String)> {
+    lines
+        .iter()
+        .filter_map(|(number, line)| {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                Some((*number, trimmed[1..trimmed.len() - 1].trim().to_lowercase()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Expand Inno Setup's program-files / system-drive constants into their
+/// canonical absolute paths so constant-folded spellings like `{autopf}\Git`
+/// cannot sneak past the literal drive-path and `Program Files` scanners
+/// (niubash#442).
+fn expand_foreign_inno_constants(line: &str) -> String {
+    let mut out = line.to_string();
+    for (constant, expansion) in [
+        ("{autopf}", "C:\\Program Files"),
+        ("{autopf32}", "C:\\Program Files (x86)"),
+        ("{autopf64}", "C:\\Program Files"),
+        ("{pf}", "C:\\Program Files"),
+        ("{pf32}", "C:\\Program Files (x86)"),
+        ("{pf64}", "C:\\Program Files"),
+        ("{commonpf}", "C:\\Program Files\\Common Files"),
+        ("{commonpf32}", "C:\\Program Files (x86)\\Common Files"),
+        ("{commonpf64}", "C:\\Program Files\\Common Files"),
+        ("{sd}", "C:"),
+        ("{win}", "C:\\Windows"),
+        ("{cmd}", "C:\\Windows\\System32\\cmd.exe"),
+    ] {
+        // Case-insensitive replacement for Inno constants.
+        let lower = out.to_lowercase();
+        if lower.contains(constant) {
+            let mut rebuilt = String::with_capacity(out.len() + 16);
+            let mut rest = out.as_str();
+            while let Some(pos) = rest.to_lowercase().find(constant) {
+                rebuilt.push_str(&rest[..pos]);
+                rebuilt.push_str(expansion);
+                rest = &rest[pos + constant.len()..];
+            }
+            rebuilt.push_str(rest);
+            out = rebuilt;
+        }
+    }
+    out
 }
 
 /// Extract `Key: value` entries from a named section. Inno directive lines
@@ -83,36 +135,87 @@ fn section_entries(
 #[test]
 fn installer_requires_lowest_privileges() {
     let lines = script_lines();
-    let declared = lines_matching(&lines, "PrivilegesRequired");
-    assert_eq!(
-        declared.len(),
-        1,
-        "exactly one PrivilegesRequired line expected: {declared:?}"
-    );
     assert!(
-        declared[0]
-            .1
-            .replace(" ", "")
-            .to_lowercase()
-            .contains("privilegesrequired=lowest"),
-        "PrivilegesRequired must stay `lowest` — elevation is the only way this \
-         installer could ever touch a foreign slot like C:\\Program Files\\Git\\bin, \
-         and niubash#398's ruling is that it never does: {declared:?}"
+        check_lowest_privileges(&lines).is_ok(),
+        "{}",
+        check_lowest_privileges(&lines).unwrap_err()
     );
+}
+
+fn check_lowest_privileges(lines: &[(usize, String)]) -> Result<(), String> {
+    let declared = lines_matching(lines, "PrivilegesRequired");
+    if declared.len() != 1 {
+        return Err(format!(
+            "exactly one non-comment PrivilegesRequired line expected: {declared:?}"
+        ));
+    }
+    let normalized = declared[0].1.replace(' ', "").to_lowercase();
+    if normalized != "privilegesrequired=lowest" {
+        return Err(format!(
+            "PrivilegesRequired must stay `lowest` — elevation is the only way this \
+             installer could ever touch a foreign slot like C:\\Program Files\\Git\\bin, \
+             and niubash#398's ruling is that it never does: {declared:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// niubash#442: `[Registry]`, `[INI]`, and `[UninstallRun]` sections are
+/// forbidden (fail-closed). The one sanctioned HKCU PATH update lives in
+/// `[Code]` (`registry_writes_confine_to_the_user_environment_path_value`);
+/// opening any of these declarative sections would create an unguarded write
+/// or execution surface.
+#[test]
+fn installer_forbids_unguarded_sections() {
+    let lines = script_lines();
+    assert!(
+        check_forbidden_sections(&lines).is_ok(),
+        "{}",
+        check_forbidden_sections(&lines).unwrap_err()
+    );
+}
+
+fn check_forbidden_sections(lines: &[(usize, String)]) -> Result<(), String> {
+    const FORBIDDEN_SECTIONS: [&str; 3] = ["registry", "ini", "uninstallrun"];
+    let mut offenders = Vec::new();
+    for (number, name) in section_headers(lines) {
+        if FORBIDDEN_SECTIONS.contains(&name.as_str()) {
+            offenders.push(format!("line {number}: forbidden section [{name}]"));
+        }
+    }
+    if offenders.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "installer/niubash.iss must not declare [Registry], [INI], or [UninstallRun] \
+             sections (niubash#442 fail-closed guard):\n{}",
+            offenders.join("\n")
+        ))
+    }
 }
 
 /// niubash#398 ruling, fact 2: the script's world is Inno constants and
 /// relative names. No absolute drive path and no `Program Files` reference
-/// may appear anywhere — including comments — so the Git Bash slot cannot be
-/// named, let alone written, from this surface.
+/// may appear anywhere — including comments and constant-folded `{autopf}` /
+/// `{pf}` spellings (niubash#442) — so the Git Bash slot cannot be named, let
+/// alone written, from this surface.
 #[test]
 fn installer_never_names_an_absolute_foreign_location() {
     let lines = script_lines();
+    assert!(
+        check_no_foreign_locations(&lines).is_ok(),
+        "{}",
+        check_no_foreign_locations(&lines).unwrap_err()
+    );
+}
+
+fn check_no_foreign_locations(lines: &[(usize, String)]) -> Result<(), String> {
     let mut offenders = Vec::new();
-    for (number, line) in &lines {
+    for (number, raw_line) in lines {
+        let expanded = expand_foreign_inno_constants(raw_line);
         // A drive-letter absolute path: `X:` followed by `\` or `/`, where
         // the letter starts a word (this excludes URL schemes like `https:`).
-        let bytes = line.as_bytes();
+        let bytes = expanded.as_bytes();
         let mut index = 0;
         while index + 2 < bytes.len() {
             let starts_word = index == 0 || !bytes[index - 1].is_ascii_alphabetic();
@@ -121,24 +224,27 @@ fn installer_never_names_an_absolute_foreign_location() {
                 && bytes[index + 1] == b':'
                 && (bytes[index + 2] == b'\\' || bytes[index + 2] == b'/')
             {
-                offenders.push(format!("line {number}: absolute path — {line:?}"));
+                offenders.push(format!("line {number}: absolute path — {raw_line:?}"));
                 break;
             }
             index += 1;
         }
-        if line.to_lowercase().contains("program files") {
+        if expanded.to_lowercase().contains("program files") {
             offenders.push(format!(
-                "line {number}: 'Program Files' reference — {line:?}"
+                "line {number}: 'Program Files' reference — {raw_line:?}"
             ));
         }
     }
-    assert!(
-        offenders.is_empty(),
-        "installer/niubash.iss must not reference any absolute foreign location \
-         (niubash#398: the Git Bash slot stays unclaimed; the app tree is reached \
-         through Inno constants like {{app}}/{{localappdata}}):\n{}",
-        offenders.join("\n")
-    );
+    if offenders.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "installer/niubash.iss must not reference any absolute foreign location \
+             (niubash#398/#442: the Git Bash slot stays unclaimed; the app tree is reached \
+             through Inno constants like {{app}}/{{localappdata}}):\n{}",
+            offenders.join("\n")
+        ))
+    }
 }
 
 /// Every file the installer writes or deletes lives under `{app}` (or is an
@@ -234,18 +340,46 @@ fn delete_entries_match_only_retired_shapes() {
 /// Every external process the installer launches comes from the app tree, so
 /// the [Run] steps execute the payload niu.exe (the #397 relink) and the
 /// bundled winuxcmd dispatcher — never a downloaded or foreign binary.
+/// Across the entire script, `{sys}\taskkill.exe` is the ONLY sanctioned
+/// `{sys}` binary (niubash#442).
 #[test]
 fn run_steps_execute_only_app_tree_binaries() {
     let lines = script_lines();
-    for (number, value) in section_entries(&lines, "Run", "Filename") {
+    assert!(
+        check_run_and_sys_binaries(&lines).is_ok(),
+        "{}",
+        check_run_and_sys_binaries(&lines).unwrap_err()
+    );
+}
+
+fn check_run_and_sys_binaries(lines: &[(usize, String)]) -> Result<(), String> {
+    for (number, value) in section_entries(lines, "Run", "Filename") {
         let bare = value.trim_start_matches('"').trim_end_matches('"');
-        assert!(
-            bare.starts_with("{app}\\") || bare.starts_with("{sys}\\"),
-            "[Run] line {number} launches a binary from outside the app tree: {value:?} — \
-             only {{app}} payloads (and {{sys}} taskkill for the silent-update \
-             close) may run (niubash#398: nothing reaches for a foreign slot)"
-        );
+        if !bare.starts_with("{app}\\") && !bare.eq_ignore_ascii_case("{sys}\\taskkill.exe") {
+            return Err(format!(
+                "[Run] line {number} launches a binary from outside the app tree: {value:?} — \
+                 only {{app}} payloads (and {{sys}}\\taskkill.exe for the silent-update \
+                 close) may run (niubash#398/#442: nothing reaches for a foreign slot)"
+            ));
+        }
     }
+    for (number, line) in lines {
+        if line.trim_start().starts_with(';') {
+            continue;
+        }
+        let lower = line.to_lowercase();
+        let mut rest = lower.as_str();
+        while let Some(pos) = rest.find("{sys}") {
+            let tail = &rest[pos..];
+            if !tail.starts_with("{sys}\\taskkill.exe") {
+                return Err(format!(
+                    "line {number}: unsanctioned {{sys}} binary reference (only {{sys}}\\taskkill.exe is allowed): {line:?}"
+                ));
+            }
+            rest = &tail["{sys}\\taskkill.exe".len()..];
+        }
+    }
+    Ok(())
 }
 
 /// The only registry surface is the user `Environment\Path` value: add on
@@ -308,4 +442,79 @@ fn shortcuts_point_into_the_app_tree() {
              folders {SHELL_FOLDER_PREFIXES:?}: {value:?}"
         );
     }
+}
+
+/// niubash#442 adversarial mutation suite: verify that all 7 CR mutation
+/// vectors against `installer/niubash.iss` are caught by the guards above.
+#[test]
+fn cr_adversarial_mutations_are_rejected() {
+    let base = script_lines();
+
+    // 1. [Registry] section writing HKLM
+    let mut m1 = base.clone();
+    m1.push((999, "[Registry]".to_string()));
+    m1.push((
+        1000,
+        r#"Root: HKLM; Subkey: "Software\Git"; ValueType: string; ValueData: "{app}""#.to_string(),
+    ));
+    assert!(check_forbidden_sections(&m1).is_err());
+
+    // 2. [INI] section writing {autopf}
+    let mut m2 = base.clone();
+    m2.push((999, "[INI]".to_string()));
+    m2.push((
+        1000,
+        r#"Filename: "{autopf}\Git\etc\gitconfig""#.to_string(),
+    ));
+    assert!(check_forbidden_sections(&m2).is_err());
+    assert!(check_no_foreign_locations(&m2).is_err());
+
+    // 3. [UninstallRun] + {autopf}
+    let mut m3 = base.clone();
+    m3.push((999, "[UninstallRun]".to_string()));
+    m3.push((1000, r#"Filename: "{autopf}\Git\unins000.exe""#.to_string()));
+    assert!(check_forbidden_sections(&m3).is_err());
+    assert!(check_no_foreign_locations(&m3).is_err());
+
+    // 4. {autopf} constant folding bypassing literal drive / Program Files scan
+    let mut m4 = base.clone();
+    m4.push((
+        999,
+        r#"Source: "x"; DestDir: "{autopf}\Git\bin""#.to_string(),
+    ));
+    assert!(check_no_foreign_locations(&m4).is_err());
+
+    // 5. Commented-out `;PrivilegesRequired=lowest` (with or without admin override)
+    let m5: Vec<(usize, String)> = base
+        .iter()
+        .map(|(n, l)| {
+            if l.contains("PrivilegesRequired=lowest") {
+                (*n, "; PrivilegesRequired=lowest".to_string())
+            } else {
+                (*n, l.clone())
+            }
+        })
+        .collect();
+    assert!(check_lowest_privileges(&m5).is_err());
+
+    // 6. `{sys}\cmd.exe /c rd /s /q {autopf}\Git` in [Run]
+    let mut m6 = base.clone();
+    let run_idx = m6
+        .iter()
+        .position(|(_, l)| l.trim() == "[Run]")
+        .expect("[Run] section exists");
+    m6.insert(
+        run_idx + 1,
+        (
+            999,
+            r#"Filename: "{sys}\cmd.exe"; Parameters: "/c rd /s /q {autopf}\Git""#.to_string(),
+        ),
+    );
+    assert!(check_run_and_sys_binaries(&m6).is_err());
+    assert!(check_no_foreign_locations(&m6).is_err());
+
+    // 7. Unsanctioned `{sys}\powershell.exe` in [Code]
+    let mut m7 = base;
+    m7.push((999, r#"  Exec(ExpandConstant('{sys}\powershell.exe'), '', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);"#.to_string()));
+    assert!(check_run_and_sys_binaries(&m7).is_err());
 }

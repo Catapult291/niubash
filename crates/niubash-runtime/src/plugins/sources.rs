@@ -1136,6 +1136,7 @@ fn run_git_bounded(
     let mut child = command
         .spawn()
         .with_context(|| "failed to run git; is git.exe on PATH?")?;
+    crate::console_guard::adopt_orphan_console(child.id());
     job.assign(&child);
     // Poll instead of `status()`: std has no wait-with-timeout, and 20ms
     // granularity is far below any real clone's duration.

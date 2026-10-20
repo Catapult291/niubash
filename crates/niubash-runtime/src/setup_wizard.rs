@@ -2266,10 +2266,10 @@ pub(crate) fn session_apply_failed_notice() -> &'static str {
 #[cfg(windows)]
 fn wpm_command() -> Option<Command> {
     if on_path("wpm") {
-        return Some(Command::new("wpm"));
+        return Some(crate::console_guard::suppressed_command("wpm"));
     }
     crate::winuxcmd::find_winuxcmd().map(|exe| {
-        let mut cmd = Command::new(exe);
+        let mut cmd = crate::console_guard::suppressed_command(exe);
         cmd.arg("wpm");
         cmd
     })

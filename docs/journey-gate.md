@@ -416,25 +416,54 @@ the DEFAULT, the gate exercises everything; `base` = the bare release
 gate; legacy `--phase` words accepted: `full`, `gate`, `persist`),
 `--cleanup-sandbox DIR` (standalone verb, no `niu.exe` needed: delete a
 kept sandbox directory in the journey's own context — DACLs and the
-read-only attribute are restored to host-clearable first — and exit 0
-when the path is gone).
+read-only attribute are restored to host-clearable first — and exit `0`
+when the path is gone or already absent, `1` if the tree survived the
+full rescue chain, `2` if the request is refused as unsafe or not a
+sandbox tree).
 
-### Sandbox landing + host-clearable teardown (niubash#428)
+### Sandbox landing + host-clearable teardown (niubash#428 / #449)
 
 A bare Python script has no git-bash-style path translation, so the
 repo's conventional `/d/tmp/x` is read as DRIVE-RELATIVE: with the cwd
 on D: the sandbox used to land at `D:\d\tmp\x` — the literal `/d`
 became a junk first directory (the `D:\d` junk tree). The `--keep-sandbox`,
 `--artifacts` and `--cleanup-sandbox` landing points therefore rewrite
-the single-letter-drive form (`/d/...` → `D:/...`, with a printed
+the single-letter-drive form (`/d/...` → `D:\...`, with a printed
 normalization note) and print the actual sandbox landing on every run;
-an explicit `D:/...` form never regresses. Teardown makes the whole
-sandbox tree host-clearable BEFORE it is deleted or kept (icacls
-`/reset` back to parent inheritance + read-only attribute cleared), so
-a kept-for-diagnosis tree deletes with one host command
-(`Remove-Item -Recurse`), and debris from older runs is removed by the
-`--cleanup-sandbox` verb (icacls → attrib → rmtree, escalating through
-takeown and `rd /s /q` while the tree survives).
+an explicit `D:/...` form never regresses. Because `WindowsPath`
+canonicalizes `/` and `\` into the same `.parts` tuple
+(`('\\', 'd', 'tmp', 'x')`), the backslash root-relative form `\d\tmp\x`
+(and `\d`) is also folded to `D:\tmp\x` (`D:\`) even when the cwd is on
+another drive (#449 item 1; the printed normalization notice always
+makes the rewrite visible). Multi-letter rooted paths (`/tmp/x`,
+`\tmp\x`) and plain relative paths (`tmp/x`) are left untouched.
+
+Teardown makes the whole sandbox tree host-clearable BEFORE it is
+deleted or kept (icacls `/reset` back to parent inheritance + read-only
+attribute cleared), so a kept-for-diagnosis tree deletes with one host
+command (`Remove-Item -Recurse`), and debris from older runs is removed
+by the `--cleanup-sandbox` verb (icacls → attrib → rmtree, escalating
+through takeown and `rd /s /q` while the tree survives).
+
+`--cleanup-sandbox DIR` contract (#428 + #449 items 2–4):
+
+- **Exit `2` (refused):** refuses relative paths, drive roots (`D:\`),
+  the current user home / cwd or any of their ancestors, non-directory
+  files, and any existing readable directory that does not match a
+  journey sandbox shape (`journey-*` directory name, `home/.niubash`
+  tree, or a `--keep-sandbox` parent directory whose children are all
+  `journey-*` directories; a directory whose DACL denies enumeration is
+  allowed through as the #428 restricted-token signature).
+- **Exit `0` (gone / idempotent):** exits `0` when the tree is removed
+  or when the target path is already absent. Keeping `exit 0` on an
+  absent path matches `rm -rf` / cleanup-verb idempotency (re-running a
+  cleanup command from history or after a green run succeeds because the
+  postcondition "sandbox is gone" holds) while printing the `cannot stat`
+  notice and still running the rescue chain in case a restricted-token
+  DACL made `Path.exists()` return `False` on a live tree.
+- **Exit `1` (survived):** exits `1` only when the target still exists
+  after the full `icacls` / `attrib` / `rmtree` / `takeown` / `rd /s /q`
+  chain.
 
 ### Phase composition (--phases)
 

@@ -157,9 +157,12 @@ leaves — so a lane's local run is `--phases base,P4,P7` and the full
 walk is the default (or `--phases all`).
 
 Exit codes: 0 every assertion holds or every red is a labeled
-known-fail, 1 an unlabeled fail (or an unrecognized verdict), 2 skip
-(missing python deps / not Windows / no niu.exe / no git / unknown phase
-id).
+known-fail (for --cleanup-sandbox: the path is gone, including when it
+was already absent), 1 an unlabeled fail (or an unrecognized verdict,
+or --cleanup-sandbox tree survived the full rescue chain), 2 skip or
+refused request (missing python deps / not Windows / no niu.exe / no
+git / unknown phase id / --cleanup-sandbox refused an unsafe or
+non-sandbox path).
 
 Usage: python scripts/journey/golden-journey.py <niu.exe> [--artifacts DIR]
         [--keep-sandbox DIR] [--cleanup-sandbox DIR]
@@ -4118,7 +4121,7 @@ def phase_p8(exe, home, env, verdict, seed, state):
     p8_s4_remove_active_theme_source(exe, home, env, verdict, seed, state)
 
 
-# ── Sandbox path + hygiene guards (issue #428, both root causes) ────────────
+# ── Sandbox path + hygiene guards (issue #428 + #449 follow-ups) ────────────
 # Root cause 1: the repo convention writes Windows paths git-bash style
 # (`/d/tmp/x`), and git/niu translate that — but a bare Python script has
 # no translation layer: pathlib reads `/d/...` as a DRIVE-RELATIVE path
@@ -4127,10 +4130,20 @@ def phase_p8(exe, home, env, verdict, seed, state):
 # directory. The single-letter first segment is rewritten to the drive
 # form it spells; anything else passes through untouched (an explicit
 # `D:/...` never regresses).
+# Note (#449 item 1): WindowsPath canonicalizes `/` and `\` into the
+# same `.parts` tuple (`('\\', 'd', 'tmp', 'x')`), so the backslash
+# root-relative form `\d\tmp\x` (and `\d`) is folded to `D:\tmp\x`
+# (`D:\`) identically to `/d/tmp/x` even when the cwd is on another
+# drive; every caller prints the normalization notice so the rewrite is
+# never silent.
 def normalize_posix_drive_form(raw: Path) -> Path:
+    """Rewrite a single-letter rooted path (`/d/tmp/x` or `\\d\\tmp\\x`,
+    `/d` or `\\d`) on Windows to the explicit drive path `D:\\tmp\\x`
+    (`D:\\`), leaving explicit drive paths, multi-letter rooted paths
+    (`/tmp/x`, `\\tmp\\x`), and relative paths untouched."""
     if os.name != "nt":
         return raw
-    parts = raw.parts  # ('\\', 'd', 'tmp', 'x') for '/d/tmp/x'
+    parts = raw.parts  # ('\\', 'd', 'tmp', 'x') for '/d/tmp/x' or '\\d\\tmp\\x'
     if (len(parts) >= 2 and parts[0] == "\\"
             and len(parts[1]) == 1 and parts[1].isalpha()):
         return Path(parts[1].upper() + ":\\", *parts[2:])
@@ -4195,8 +4208,8 @@ def _tree_present(root: Path) -> bool:
     of the node itself) return False while the entry is still there —
     ask the parent directory's enumeration first."""
     try:
-        return any(entry.name == root.name
-                   for entry in os.scandir(root.parent))
+        with os.scandir(root.parent) as it:
+            return any(entry.name == root.name for entry in it)
     except OSError:
         return root.exists()
 
@@ -4223,12 +4236,61 @@ def force_rmtree(root: Path) -> tuple[bool, str]:
     return False, "the tree survived icacls/attrib/rmtree/takeown/rd"
 
 
+def _looks_like_sandbox(target: Path) -> tuple[bool, str]:
+    """#449 item 3 shape guard: verify an existing target looks like a
+    journey sandbox (or a DACL-denied #428 tree) before force_rmtree
+    touches ACLs or deletes anything. Absent paths pass through (nothing
+    on disk to destroy, or a stat-denied node that needs the rescue
+    chain). Never accepts the real user home, cwd, or their ancestors."""
+    try:
+        resolved = target.resolve()
+        for protected in (Path.home().resolve(), Path.cwd().resolve()):
+            if resolved == protected or resolved in protected.parents:
+                return False, f"refusing protected host directory ({protected})"
+    except OSError:
+        pass
+    try:
+        stat_exists = target.exists()
+    except OSError:
+        stat_exists = False
+    if stat_exists and not target.is_dir():
+        return False, "not a directory"
+    present = stat_exists or _tree_present(target)
+    if not present:
+        return True, "absent"
+    if target.name.lower().startswith("journey-"):
+        return True, "journey-* directory name"
+    try:
+        if (target / "home" / ".niubash").is_dir():
+            return True, "contains home/.niubash"
+    except OSError:
+        return True, "DACL denies enumeration (#428 signature)"
+    try:
+        with os.scandir(target) as it:
+            entries = list(it)
+    except OSError:
+        return True, "DACL denies enumeration (#428 signature)"
+    if entries and all(
+        e.is_dir(follow_symlinks=False)
+        and e.name.lower().startswith("journey-")
+        for e in entries
+    ):
+        return True, "keep-sandbox parent of journey-* directories"
+    return (False,
+            "does not look like a journey sandbox (expected a 'journey-*' "
+            "directory name, a 'home/.niubash' tree, or 'journey-*' child "
+            "directories)")
+
+
 def cleanup_sandbox_verb(raw: Path) -> int:
-    """#428 root cause 2, the explicit escape hatch: delete a kept
-    sandbox tree in the journey's own context, where the ACL rescue
-    chain has a chance the plain host shell was denied. Exit 0 = the
-    path is gone, 1 = it survived the full chain, 2 = the request was
-    refused (relative path, drive root)."""
+    """#428 root cause 2 + #449 follow-ups, the explicit escape hatch:
+    delete a kept sandbox tree in the journey's own context, where the
+    ACL rescue chain has a chance the plain host shell was denied.
+    Exit 0 = the path is gone (idempotent when already absent — #449
+    item 4, matching `rm -rf` / cleanup-verb convention), 1 = it
+    survived the full chain, 2 = the request was refused (relative path,
+    drive root, or an existing path that fails the #449 item 3 sandbox
+    shape guard)."""
     target = normalize_posix_drive_form(raw)
     if target != raw:
         print(f"cleanup-sandbox: POSIX drive form {raw} normalized to "
@@ -4239,6 +4301,10 @@ def cleanup_sandbox_verb(raw: Path) -> int:
         return 2
     if target.parent == target:  # a drive root (D:\) is never a sandbox
         print(f"cleanup-sandbox: refusing a drive root ({target})")
+        return 2
+    ok_shape, shape_reason = _looks_like_sandbox(target)
+    if not ok_shape:
+        print(f"cleanup-sandbox: refusing {target} ({shape_reason})")
         return 2
     if not target.exists():
         print(f"cleanup-sandbox: cannot stat {target} (absent, or the "
@@ -4270,14 +4336,16 @@ def main() -> int:
     parser.add_argument("--keep-sandbox", type=Path, default=None,
                         help="create the sandbox under this directory "
                              "(kept on failure for diagnosis); a POSIX "
-                             "drive form (/d/tmp) is normalized to D:/tmp "
-                             "— issue #428")
+                             "drive form (/d/tmp or \\d\\tmp) is normalized "
+                             "to D:/tmp — issue #428/#449")
     parser.add_argument("--cleanup-sandbox", type=Path, default=None,
                         metavar="DIR",
-                        help="delete a kept sandbox directory (#428): "
+                        help="delete a kept sandbox directory (#428/#449): "
                              "restore host-clearable ACLs in the journey's "
                              "own context, then remove the tree; exit 0 "
-                             "when the path is gone, 1 if it survived")
+                             "when the path is gone (including when already "
+                             "absent), 1 if it survived, 2 if refused "
+                             "(relative, drive root, or not a sandbox tree)")
     # Phase composition (journey-spec.md §7 lane split; the wt86/jmerge
     # unified mechanism): comma-separated entries. The base J1–J7 gate
     # ALWAYS runs first; then the registered phases named here. 'all'

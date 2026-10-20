@@ -33,7 +33,7 @@ belongs in rubash or in the Niubash host layer.
 | Redirection | `bash_smoke` section `[14] redirect` | Passing | rubash redirection with Niubash/winuxcmd filesystem behavior. |
 | Heredocs | `heredoc` | Passing | rubash whole-script parsing; host stdin/script path must avoid line-by-line splitting. |
 | Backslash continuations | `continuation` | Passing | rubash whole-script parsing. |
-| Echo flags | `echo_flags` | Passing | shell builtin behavior as exposed through rubash/winuxsh. |
+| Echo flags | `echo_flags` | Passing | shell builtin behavior as exposed through rubash/niubash. |
 | Export to Windows child process | `bash_smoke` section `[19] export` | Passing | rubash environment plus Niubash process environment synchronization. |
 | File tests | `bash_smoke` section `[18] file tests` | Passing | rubash test builtin plus host filesystem paths. |
 
@@ -43,7 +43,7 @@ belongs in rubash or in the Niubash host layer.
 | --- | --- | --- |
 | cwd authority | `cwd_cd_pwd_and_windows_child_process_agree`, `drive_only_cd_and_bare_drive_commands_switch_to_drive_root` | Niubash normalizes/synchronizes shell `PWD` with Windows child process cwd. |
 | startup isolation | `winshrc_does_not_run_for_non_interactive_modes` | Non-interactive `-c`, script file, and stdin script paths do not source REPL startup rc. |
-| temporary assignments | `temporary_assignment_reaches_nested_winuxsh_child` | Assignment semantics are observable by nested Niubash child processes. |
+| temporary assignments | `temporary_assignment_reaches_nested_niubash_child` | Assignment semantics are observable by nested Niubash child processes. |
 | stdin scripts | `piped_stdin_without_args_runs_plain_script_surface`, `piped_stdin_without_args_runs_multiline_compound_block`, `piped_stdin_without_args_runs_heredoc_as_one_chunk` | Host feeds complete stdin scripts to rubash for multiline/heredoc semantics. |
 | script positional parameters | `script_file_args_populate_positional_parameters` | Host script path preserves `$0`/positional parameter behavior. |
 | Windows child env | `exported_env_reaches_windows_child_processes`, `sourced_rc_keeps_winuxcmd_visible_to_windows_children` | Niubash bridges rubash env changes into Windows child process launches. |

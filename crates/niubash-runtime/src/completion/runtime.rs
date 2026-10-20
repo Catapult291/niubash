@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -122,7 +122,7 @@ fn run_runtime_completion(
     let command_path =
         resolve_command_path(&source.command).unwrap_or_else(|| PathBuf::from(&source.command));
 
-    let mut child = Command::new(command_path)
+    let mut child = crate::console_guard::suppressed_command(command_path)
         .args(args)
         .env("COMP_LINE", context.input.clone())
         .env("COMP_POINT", context.cursor_pos.to_string())
@@ -132,6 +132,7 @@ fn run_runtime_completion(
         .stderr(Stdio::from(stderr))
         .spawn()
         .map_err(|err| format!("failed to run runtime completion command: {}", err))?;
+    crate::console_guard::adopt_orphan_console(child.id());
 
     let started = Instant::now();
     let status = loop {

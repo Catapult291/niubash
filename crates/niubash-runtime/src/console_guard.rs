@@ -114,18 +114,27 @@ pub fn suppressed_command(program: impl AsRef<std::ffi::OsStr>) -> std::process:
     command
 }
 
+/// niubash#462: claim the first child's hidden `CREATE_NO_WINDOW` console for
+/// the host session so subsequent external spawns inherit it for free instead
+/// of paying ~22 ms per child spawn.
+pub fn adopt_orphan_console(child_pid: u32) {
+    platform::adopt_orphan_console(child_pid);
+}
+
 #[cfg(windows)]
 mod platform {
     use std::io::IsTerminal;
 
     use super::ConsoleBaseline;
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::GetFileType;
     use windows_sys::Win32::System::Console::{
-        FreeConsole, GetConsoleCP, GetConsoleMode, GetConsoleProcessList, GetConsoleWindow,
-        GetStdHandle, SetConsoleCP, SetConsoleMode, SetConsoleOutputCP, ENABLE_PROCESSED_OUTPUT,
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WRAP_AT_EOL_OUTPUT, STD_ERROR_HANDLE,
-        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        AttachConsole, FreeConsole, GetConsoleCP, GetConsoleMode, GetConsoleProcessList,
+        GetConsoleWindow, GetStdHandle, SetConsoleCP, SetConsoleMode, SetConsoleOutputCP,
+        SetStdHandle, ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        ENABLE_WRAP_AT_EOL_OUTPUT, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
+    use windows_sys::Win32::System::Threading::SwitchToThread;
     use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 
     const UTF8_CODE_PAGE: u32 = 65001;
@@ -184,8 +193,118 @@ mod platform {
         // not the gate: under ConPTY it reports a NON-NULL handle (the
         // headless host's invisible PseudoConsoleWindow) while a console
         // is very much attached — GetConsoleCP()==0 means truly detached.
-        if unsafe { GetConsoleCP() } == 0 {
+        if unsafe { GetConsoleCP() } == 0 && !try_alloc_hidden_console() {
             command.creation_flags(0x0800_0000);
+        }
+    }
+
+    unsafe fn preserve_std_handles<F: FnOnce() -> bool>(f: F) -> bool {
+        unsafe fn live_std_handle(id: u32) -> Option<*mut core::ffi::c_void> {
+            let h = unsafe { GetStdHandle(id) };
+            if h.is_null() || h == INVALID_HANDLE_VALUE {
+                return None;
+            }
+            unsafe {
+                SetLastError(0);
+                if GetFileType(h) == 0 && GetLastError() != 0 {
+                    return None;
+                }
+            }
+            Some(h)
+        }
+
+        let stdin = live_std_handle(STD_INPUT_HANDLE);
+        let stdout = live_std_handle(STD_OUTPUT_HANDLE);
+        let stderr = live_std_handle(STD_ERROR_HANDLE);
+        let ok = f();
+        if ok {
+            if let Some(h) = stdin {
+                let _ = SetStdHandle(STD_INPUT_HANDLE, h);
+            }
+            if let Some(h) = stdout {
+                let _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
+            }
+            if let Some(h) = stderr {
+                let _ = SetStdHandle(STD_ERROR_HANDLE, h);
+            }
+        }
+        ok
+    }
+
+    fn try_alloc_hidden_console() -> bool {
+        #[repr(C)]
+        struct AllocConsoleOptions {
+            mode: i32,
+            use_show_window: i32,
+            show_window: u16,
+        }
+        type AllocConsoleWithOptionsFn =
+            unsafe extern "system" fn(*const AllocConsoleOptions, *mut i32) -> i32;
+        const ALLOC_CONSOLE_MODE_NO_WINDOW: i32 = 2;
+
+        extern "system" {
+            fn GetModuleHandleA(module_name: *const u8) -> *mut core::ffi::c_void;
+            fn GetProcAddress(
+                module: *mut core::ffi::c_void,
+                proc_name: *const u8,
+            ) -> *mut core::ffi::c_void;
+        }
+
+        unsafe {
+            let module = GetModuleHandleA(b"kernelbase.dll\0".as_ptr());
+            if module.is_null() {
+                return false;
+            }
+            let proc = GetProcAddress(module, b"AllocConsoleWithOptions\0".as_ptr());
+            if proc.is_null() {
+                return false;
+            }
+            let func: AllocConsoleWithOptionsFn = core::mem::transmute(proc);
+            preserve_std_handles(|| {
+                let options = AllocConsoleOptions {
+                    mode: ALLOC_CONSOLE_MODE_NO_WINDOW,
+                    use_show_window: 0,
+                    show_window: 0,
+                };
+                let mut result = 0i32;
+                func(&options, &mut result) >= 0 && GetConsoleCP() != 0
+            })
+        }
+    }
+
+    pub fn adopt_orphan_console(child_pid: u32) {
+        unsafe {
+            if GetConsoleCP() != 0 {
+                return;
+            }
+            const ERROR_INVALID_HANDLE: u32 = 6;
+            const ERROR_GEN_FAILURE: u32 = 31;
+            preserve_std_handles(|| {
+                let start = std::time::Instant::now();
+                let spin_limit = std::time::Duration::from_millis(30);
+                let gen_failure_limit = std::time::Duration::from_millis(250);
+                let invalid_handle_limit = std::time::Duration::from_millis(500);
+                loop {
+                    if AttachConsole(child_pid) != 0 {
+                        return true;
+                    }
+                    let err = GetLastError();
+                    let elapsed = start.elapsed();
+                    let keep_waiting = (err == ERROR_INVALID_HANDLE
+                        && elapsed < invalid_handle_limit)
+                        || (err == ERROR_GEN_FAILURE && elapsed < gen_failure_limit);
+                    if !keep_waiting {
+                        return false;
+                    }
+                    if elapsed < spin_limit {
+                        if SwitchToThread() == 0 {
+                            std::thread::yield_now();
+                        }
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            });
         }
     }
 
@@ -286,6 +405,8 @@ mod platform {
     pub fn release_orphan_console() {}
 
     pub fn suppress_orphan_console(_command: &mut std::process::Command) {}
+
+    pub fn adopt_orphan_console(_child_pid: u32) {}
 
     pub fn restore(_baseline: &ConsoleBaseline) {}
 }

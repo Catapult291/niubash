@@ -5,6 +5,7 @@
 # so any Windows checkout behaves like the store; the per-path pins below
 # stay as documentation of the sensitive spots.
 *.sh text eol=lf
+*.py text eol=lf
 
 scripts/git-hooks/* text eol=lf
 # Smoke/verification shell scripts parse their own subprocess output; a

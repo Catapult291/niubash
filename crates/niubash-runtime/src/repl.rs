@@ -183,6 +183,7 @@ pub fn spawn_self_update(args: &[String]) -> Option<i32> {
     let mut command = std::process::Command::new(exe);
     command.arg("--self-update").args(args);
     let mut child = command.spawn().ok()?;
+    crate::console_guard::adopt_orphan_console(child.id());
     let status = child.wait().ok()?;
     Some(status.code().unwrap_or(0))
 }

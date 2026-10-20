@@ -37,7 +37,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -143,7 +143,7 @@ pub fn render_theme(request: &ThemePreviewRequest) -> PreviewOutcome {
     };
 
     let sandbox = sandbox_home();
-    let mut command = Command::new(&exe);
+    let mut command = crate::console_guard::suppressed_command(&exe);
     command.arg("-c").arg(&block);
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
@@ -187,7 +187,10 @@ pub fn render_theme(request: &ThemePreviewRequest) -> PreviewOutcome {
 
     let spawned = command.spawn();
     let mut child = match spawned {
-        Ok(child) => child,
+        Ok(child) => {
+            crate::console_guard::adopt_orphan_console(child.id());
+            child
+        }
         Err(err) => {
             cleanup_sandbox(&sandbox);
             return PreviewOutcome::Unavailable(format!("could not start niu: {err}"));

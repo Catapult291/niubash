@@ -207,8 +207,12 @@ fn read_status(worktree: &Path) -> Option<(String, bool)> {
         Err(_) => return None,
     };
     command.stdout(Stdio::from(sink));
+    crate::console_guard::suppress_orphan_console(&mut command);
     let mut child = match command.spawn() {
-        Ok(child) => child,
+        Ok(child) => {
+            crate::console_guard::adopt_orphan_console(child.id());
+            child
+        }
         Err(_) => {
             let _ = std::fs::remove_file(&scratch);
             return None;

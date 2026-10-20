@@ -370,7 +370,11 @@ mod tests {
         assert_eq!(first.created.len(), 6, "{first:?}");
         assert!(first.failed.is_empty(), "{first:?}");
         for link in planned_shell_links(&root, &niu) {
-            assert!(same_file(&link, &niu), "{} is not the shell", link.display());
+            assert!(
+                same_file(&link, &niu),
+                "{} is not the shell",
+                link.display()
+            );
         }
 
         // A second run has nothing to do.
