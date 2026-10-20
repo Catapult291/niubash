@@ -67,10 +67,20 @@ pub fn restore(baseline: &ConsoleBaseline) {
 /// Safety rails, all required: `GetConsoleProcessList` must report this
 /// process as the console's sole attachment (an inherited console — a real
 /// terminal — has other processes on it and is never ours to free), and
-/// `GetConsoleWindow()` must report an actual window — a *hidden* console
+/// `GetConsoleWindow()` must report a VISIBLE window — a *hidden* console
 /// (CREATE_NO_WINDOW from the `bash.exe` forwarder, or ConPTY) is kept
 /// alive so grandchildren inherit it for free instead of paying ~22 ms
-/// per child spawn. The CALLER decides whether the invocation might be
+/// per child spawn. ConPTY is the subtle rail: on current Windows a
+/// pseudoconsole DOES own a window handle — it belongs to the headless
+/// console host and is never shown — so a non-NULL window alone does not
+/// discriminate; a lone ConPTY client (the journey/asset-timing gates'
+/// `niu setup`, `niu --rcfile <rc> -i` PtyProcess spawns) is process-list
+/// 1 with a non-NULL *invisible* window, and freeing it kills the pty's
+/// only client and ends the session outputless (niubash#455, release run
+/// 39363549422 J7 + every per-asset fp/rr phase). `IsWindowVisible` is the
+/// discriminator that matches the harm: only a console that can paint a
+/// window on the user's desktop is ours to release.
+/// The CALLER decides whether the invocation might be
 /// interactive before releasing: Windows binds the auto-allocated
 /// console's handles onto the standard streams, so an is_terminal() check
 /// cannot tell an agent's auto console from a user's freshly opened one.
@@ -116,6 +126,7 @@ mod platform {
         ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WRAP_AT_EOL_OUTPUT, STD_ERROR_HANDLE,
         STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 
     const UTF8_CODE_PAGE: u32 = 65001;
 
@@ -143,10 +154,17 @@ mod platform {
     }
 
     pub fn release_orphan_console() {
-        // GetConsoleCP()!=0 says a console is attached; GetConsoleWindow()
-        // non-NULL says it owns a real (visible-capable) window — a
-        // CREATE_NO_WINDOW or ConPTY console reports NULL and is kept.
-        if unsafe { GetConsoleCP() } == 0 || unsafe { GetConsoleWindow() }.is_null() {
+        // GetConsoleCP()!=0 says a console is attached. The window rail is
+        // VISIBILITY, not presence: a ConPTY pseudoconsole owns a NON-NULL
+        // but invisible window (its headless host's), so non-NULL alone
+        // would free the pty's only client and kill the session
+        // (niubash#455). CREATE_NO_WINDOW consoles report no/hidden window
+        // and stay kept either way.
+        if unsafe { GetConsoleCP() } == 0 {
+            return;
+        }
+        let window = unsafe { GetConsoleWindow() };
+        if window.is_null() || unsafe { IsWindowVisible(window) } == 0 {
             return;
         }
         let mut pids = [0u32; 64];
@@ -163,8 +181,9 @@ mod platform {
     pub fn suppress_orphan_console(command: &mut std::process::Command) {
         use std::os::windows::process::CommandExt;
         // CREATE_NO_WINDOW = 0x08000000 (WinBase.h). GetConsoleWindow() is
-        // not the gate: under ConPTY it reports NULL while a console is
-        // very much attached — GetConsoleCP()==0 means truly detached.
+        // not the gate: under ConPTY it reports a NON-NULL handle (the
+        // headless host's invisible PseudoConsoleWindow) while a console
+        // is very much attached — GetConsoleCP()==0 means truly detached.
         if unsafe { GetConsoleCP() } == 0 {
             command.creation_flags(0x0800_0000);
         }
