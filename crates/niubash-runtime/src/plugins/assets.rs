@@ -3164,7 +3164,7 @@ mod tests {
         let _ = loader_text();
 
         // Seed the write-era block, then duplicate the whole rc onto itself.
-        seed_legacy_block("oh-my-bash", &OMB_BLOCK);
+        seed_legacy_block("oh-my-bash", OMB_BLOCK);
         let one = rc_text();
         fs::write(rc_file(), format!("{one}{one}")).unwrap();
         let count = |needle: &str| rc_text().matches(needle).count();
@@ -3560,7 +3560,7 @@ mod tests {
 
         // The corrupt fixture: write-era block + 5 fi-less fragments + the
         // final complete copy (issue #324's exact shape).
-        seed_legacy_block("oh-my-bash", &OMB_BLOCK);
+        seed_legacy_block("oh-my-bash", OMB_BLOCK);
         let base = rc_text().trim_end().to_string();
         let mut corrupt = base.clone();
         for with_fi in [false, false, false, false, false, true] {
@@ -3645,7 +3645,7 @@ mod tests {
         install(&origin);
         trust("oh-my-bash");
         enable("git").expect("loader generation first");
-        seed_legacy_block("oh-my-bash", &OMB_BLOCK);
+        seed_legacy_block("oh-my-bash", OMB_BLOCK);
         let base = rc_text().trim_end().to_string();
         let healthy = format!(
             "{base}\n{}\n{}",

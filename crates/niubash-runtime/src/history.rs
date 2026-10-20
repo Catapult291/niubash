@@ -523,14 +523,14 @@ impl LiveFileBackedHistory {
     /// replace path.
     pub(crate) fn reload_from_file(&mut self) -> Result<()> {
         let capacity = self.capacity;
-        let mut state = self.lock_mut()?;
+        let state = self.lock_mut()?;
         let Some(path) = state.path.clone() else {
             return Err(ReedlineError::from(history_lock_error()));
         };
         match FileBackedHistory::with_file(capacity, path.clone()) {
             Ok(history) => {
                 state.history = history;
-                state.signature = file_signature_lossy(&path, &mut state);
+                state.signature = file_signature_lossy(&path, state);
                 Ok(())
             }
             Err(error) => Err(ReedlineError::from(io::Error::other(error.to_string()))),
@@ -549,8 +549,8 @@ impl LiveFileBackedHistory {
     pub(crate) fn clear_memory(&mut self) -> Result<()> {
         let capacity = self.capacity;
         let mode = self.mode;
-        let mut state = self.lock_mut()?;
-        Self::refresh_if_stale(capacity, &mut state, mode);
+        let state = self.lock_mut()?;
+        Self::refresh_if_stale(capacity, state, mode);
         let snapshot = state
             .path
             .as_deref()
@@ -559,17 +559,17 @@ impl LiveFileBackedHistory {
         match (state.path.clone(), snapshot) {
             (Some(path), Some(bytes)) => {
                 if std::fs::write(&path, &bytes).is_ok() {
-                    state.signature = file_signature_lossy(&path, &mut state);
+                    state.signature = file_signature_lossy(&path, state);
                     return Ok(());
                 }
                 // Could not restore: degrade the signature so the next
                 // query reloads whatever is on disk.
-                state.signature = file_signature_lossy(&path, &mut state);
+                state.signature = file_signature_lossy(&path, state);
                 Ok(())
             }
             (path, _) => {
                 state.signature = match path.as_deref() {
-                    Some(path) => file_signature_lossy(path, &mut state),
+                    Some(path) => file_signature_lossy(path, state),
                     None => FileSignature::default(),
                 };
                 Ok(())
@@ -667,10 +667,10 @@ impl History for LiveFileBackedHistory {
     fn save(&mut self, item: HistoryItem) -> Result<HistoryItem> {
         let capacity = self.capacity;
         let mode = self.mode;
-        let mut state = self.lock_mut()?;
-        Self::refresh_if_stale(capacity, &mut state, mode);
+        let state = self.lock_mut()?;
+        Self::refresh_if_stale(capacity, state, mode);
         let saved = state.history.save(item)?;
-        Self::sync_state(&mut state)?;
+        Self::sync_state(state)?;
         Ok(saved)
     }
 
@@ -705,20 +705,20 @@ impl History for LiveFileBackedHistory {
     ) -> Result<()> {
         let capacity = self.capacity;
         let mode = self.mode;
-        let mut state = self.lock_mut()?;
-        Self::refresh_if_stale(capacity, &mut state, mode);
+        let state = self.lock_mut()?;
+        Self::refresh_if_stale(capacity, state, mode);
         state.history.update(id, updater)
     }
 
     fn clear(&mut self) -> Result<()> {
         let capacity = self.capacity;
         let mode = self.mode;
-        let mut state = self.lock_mut()?;
-        Self::refresh_if_stale(capacity, &mut state, mode);
+        let state = self.lock_mut()?;
+        Self::refresh_if_stale(capacity, state, mode);
         state.history.clear()?;
         let path = state.path.clone();
         state.signature = match path.as_deref() {
-            Some(path) => file_signature_lossy(path, &mut state),
+            Some(path) => file_signature_lossy(path, state),
             None => FileSignature::default(),
         };
         Ok(())
@@ -727,8 +727,8 @@ impl History for LiveFileBackedHistory {
     fn delete(&mut self, id: HistoryItemId) -> Result<()> {
         let capacity = self.capacity;
         let mode = self.mode;
-        let mut state = self.lock_mut()?;
-        Self::refresh_if_stale(capacity, &mut state, mode);
+        let state = self.lock_mut()?;
+        Self::refresh_if_stale(capacity, state, mode);
         state.history.delete(id)
     }
 
