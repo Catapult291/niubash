@@ -5000,7 +5000,7 @@ fn relink_shell_faces(rest: &[String]) -> anyhow::Result<()> {
     }
 
     let niu = std::env::current_exe()
-        .map_err(|error| anyhow::anyhow!("cannot determine the running niu.exe: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("cannot determine the running shell binary: {error}"))?;
     let root = niubash_runtime::shell_links::find_installation_root(&niu);
     let report = niubash_runtime::shell_links::link_shell_faces(&root, &niu, force);
 

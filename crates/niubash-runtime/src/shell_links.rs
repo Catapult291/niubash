@@ -1,4 +1,5 @@
-//! Keep the `bash.exe` / `sh.exe` faces of the shell as hardlinks to `niu.exe`.
+//! Keep the `bash` / `sh` shell faces as hardlinks to the shell binary
+//! (`niu.exe` on Windows, `niu` on Unix).
 //!
 //! The shell has been reached through a 243 KB forwarding shim that set
 //! `NIU_INVOKED_AS` and re-executed `niu.exe`, which costs one extra process on
@@ -24,7 +25,10 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 /// The faces of the shell that ship today, in the order they are reported.
+#[cfg(windows)]
 const SHELL_FACES: [&str; 2] = ["bash.exe", "sh.exe"];
+#[cfg(not(windows))]
+const SHELL_FACES: [&str; 2] = ["bash", "sh"];
 
 /// Directories that end up on a user's or an editor's PATH, relative to the
 /// installation root.
@@ -55,8 +59,18 @@ impl ShellLinkReport {
 /// rather than assumed.
 const MAX_ROOT_ANCESTORS: usize = 4;
 
+/// The installed shell binary's file name on this platform. Installation
+/// discovery must look for what the platform actually ships: `niu.exe` in a
+/// Windows layout, `niu` on Unix (where the kernel resolves a `bash`/`sh`
+/// symlink or hardlink face back to this file anyway, but a copied face still
+/// has to find its way home).
+#[cfg(windows)]
+const SHELL_BIN_NAME: &str = "niu.exe";
+#[cfg(not(windows))]
+const SHELL_BIN_NAME: &str = "niu";
+
 /// The installation root of a running shell: the directory that holds
-/// `niu.exe` next to the bundled `winuxcmd` tree. Falls back to the
+/// the shell binary next to the bundled `winuxcmd` tree. Falls back to the
 /// executable's own directory when nothing matches, so a portable layout
 /// simply reports the directories it does not have.
 pub fn find_installation_root(exe: &Path) -> PathBuf {
@@ -64,7 +78,7 @@ pub fn find_installation_root(exe: &Path) -> PathBuf {
     let mut current = Some(start.clone());
     let mut level = 0;
     while let Some(directory) = current {
-        if directory.join("niu.exe").is_file() && directory.join("winuxcmd").is_dir() {
+        if directory.join(SHELL_BIN_NAME).is_file() && directory.join("winuxcmd").is_dir() {
             return directory;
         }
         if level >= MAX_ROOT_ANCESTORS {
@@ -79,14 +93,14 @@ pub fn find_installation_root(exe: &Path) -> PathBuf {
     start
 }
 
-/// The real `niu.exe` of the installation the running executable belongs to.
-/// Reached as `bash.exe`/`sh.exe` - a hardlink, or the forwarding shim's
+/// The real shell binary of the installation the running executable belongs
+/// to. Reached as a `bash`/`sh` face - a hardlink, or the forwarding shim's
 /// re-exec - the running path is the face, not the shell, which is why the
 /// contract variables (`NIU_SHELL`, `WINUXSH_SHELL`) and the shim's own target
 /// search must resolve this way. Without an installation to point at, the
 /// invoked path is the best answer available.
 pub fn resolved_shell_path(invoked: &Path) -> PathBuf {
-    let candidate = find_installation_root(invoked).join("niu.exe");
+    let candidate = find_installation_root(invoked).join(SHELL_BIN_NAME);
     if candidate.is_file() {
         candidate
     } else {
@@ -108,10 +122,10 @@ pub fn planned_shell_links(root: &Path, niu: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Create (or refresh) the shell faces as hardlinks to `niu`.
+/// Create (or refresh) the shell faces as hardlinks to the shell binary.
 ///
-/// Without `force`, an existing name that is *not* this `niu.exe` is left
-/// alone - that is the shipped shim, or a user's own `bash.exe`, and silently
+/// Without `force`, an existing name that is *not* this shell binary is left
+/// alone - that is the shipped shim, or a user's own `bash`, and silently
 /// replacing it would be a surprise. With `force`, such a name is parked the
 /// way `wpm` parks a held payload file: renamed aside, replaced by the link,
 /// and only then dropped, so a shell that is running right now keeps its bytes.
@@ -137,7 +151,9 @@ pub fn link_shell_faces(root: &Path, niu: &Path, force: bool) -> ShellLinkReport
                 if !force {
                     report.skipped.push((
                         link,
-                        "exists and is not this niu.exe; pass --force to replace it".to_string(),
+                        format!(
+                            "exists and is not this {SHELL_BIN_NAME}; pass --force to replace it"
+                        ),
                     ));
                     continue;
                 }
@@ -260,7 +276,7 @@ mod tests {
 
     fn fake_install(tag: &str) -> (PathBuf, PathBuf) {
         let root = unique_temp_dir(tag);
-        let niu = root.join("niu.exe");
+        let niu = root.join(SHELL_BIN_NAME);
         std::fs::write(&niu, b"niu payload").unwrap();
         for dir in PATH_DIRECTORIES {
             std::fs::create_dir_all(root.join(dir)).unwrap();
@@ -273,22 +289,22 @@ mod tests {
         let root = unique_temp_dir("root-from-link");
         std::fs::create_dir_all(root.join("winuxcmd").join("usr").join("bin")).unwrap();
         std::fs::create_dir_all(root.join("bin")).unwrap();
-        std::fs::write(root.join("niu.exe"), b"niu payload").unwrap();
+        std::fs::write(root.join(SHELL_BIN_NAME), b"niu payload").unwrap();
         std::fs::write(root.join("winuxcmd/usr/bin/winuxcmd.exe"), b"dispatcher").unwrap();
 
         // Reached as the real binary, from the PATH entry directory, and from
         // inside the winuxcmd tree: all three report the installation root.
         for exe in [
-            root.join("niu.exe"),
-            root.join("bin/bash.exe"),
-            root.join("winuxcmd/bin/sh.exe"),
+            root.join(SHELL_BIN_NAME),
+            root.join("bin").join(SHELL_FACES[0]),
+            root.join("winuxcmd/bin").join(SHELL_FACES[1]),
         ] {
             assert_eq!(find_installation_root(&exe), root, "{}", exe.display());
         }
 
         // A tree without a bundled winuxcmd reports the executable's directory.
         let portable = unique_temp_dir("root-portable");
-        let portable_niu = portable.join("niu.exe");
+        let portable_niu = portable.join(SHELL_BIN_NAME);
         std::fs::write(&portable_niu, b"niu payload").unwrap();
         assert_eq!(find_installation_root(&portable_niu), portable);
 
@@ -301,23 +317,23 @@ mod tests {
         let root = unique_temp_dir("resolved-shell-path");
         std::fs::create_dir_all(root.join("winuxcmd").join("usr").join("bin")).unwrap();
         std::fs::create_dir_all(root.join("bin")).unwrap();
-        std::fs::write(root.join("niu.exe"), b"niu payload").unwrap();
+        std::fs::write(root.join(SHELL_BIN_NAME), b"niu payload").unwrap();
         std::fs::write(root.join("winuxcmd/usr/bin/winuxcmd.exe"), b"dispatcher").unwrap();
-        std::fs::write(root.join("bin/bash.exe"), b"niu payload").unwrap();
+        std::fs::write(root.join("bin").join(SHELL_FACES[0]), b"niu payload").unwrap();
 
         // Invoked through the face, the contract still names the shell.
         assert_eq!(
-            resolved_shell_path(&root.join("bin/bash.exe")),
-            root.join("niu.exe")
+            resolved_shell_path(&root.join("bin").join(SHELL_FACES[0])),
+            root.join(SHELL_BIN_NAME)
         );
         assert_eq!(
-            resolved_shell_path(&root.join("niu.exe")),
-            root.join("niu.exe")
+            resolved_shell_path(&root.join(SHELL_BIN_NAME)),
+            root.join(SHELL_BIN_NAME)
         );
 
         // No installation: the invoked path is what we have.
         let bare = unique_temp_dir("resolved-shell-path-bare");
-        let bare_exe = bare.join("bash.exe");
+        let bare_exe = bare.join(SHELL_FACES[0]);
         std::fs::write(&bare_exe, b"standalone").unwrap();
         assert_eq!(resolved_shell_path(&bare_exe), bare_exe);
 
@@ -330,13 +346,13 @@ mod tests {
         // Built with `join` so the expectations hold whatever the platform
         // separator is; the cross-target jobs compile these on unix hosts too.
         let root = PathBuf::from("apps").join("Niubash");
-        let links = planned_shell_links(&root, &root.join("niu.exe"));
+        let links = planned_shell_links(&root, &root.join(SHELL_BIN_NAME));
         assert_eq!(links.len(), 6);
         let cases: &[&[&str]] = &[
-            &["bin", "bash.exe"],
-            &["bin", "sh.exe"],
-            &["winuxcmd", "bin", "bash.exe"],
-            &["winuxcmd", "usr", "bin", "sh.exe"],
+            &["bin", SHELL_FACES[0]],
+            &["bin", SHELL_FACES[1]],
+            &["winuxcmd", "bin", SHELL_FACES[0]],
+            &["winuxcmd", "usr", "bin", SHELL_FACES[1]],
         ];
         for relative in cases {
             let expected = relative
@@ -354,7 +370,7 @@ mod tests {
         assert_eq!(first.created.len(), 6, "{first:?}");
         assert!(first.failed.is_empty(), "{first:?}");
         for link in planned_shell_links(&root, &niu) {
-            assert!(same_file(&link, &niu), "{} is not niu.exe", link.display());
+            assert!(same_file(&link, &niu), "{} is not the shell", link.display());
         }
 
         // A second run has nothing to do.
@@ -363,8 +379,8 @@ mod tests {
         assert_eq!(second.already_current.len(), 6, "{second:?}");
 
         // A stale name (the shipped shim, or a link left on the previous inode
-        // after an update replaced niu.exe) is kept without --force ...
-        let stale = root.join("bin").join("bash.exe");
+        // after an update replaced the shell) is kept without --force ...
+        let stale = root.join("bin").join(SHELL_FACES[0]);
         std::fs::remove_file(&stale).unwrap();
         std::fs::write(&stale, b"stale shim").unwrap();
         let kept = link_shell_faces(&root, &niu, false);
@@ -394,7 +410,7 @@ mod tests {
     #[test]
     fn directories_that_do_not_exist_are_skipped() {
         let root = unique_temp_dir("portable");
-        let niu = root.join("niu.exe");
+        let niu = root.join(SHELL_BIN_NAME);
         std::fs::write(&niu, b"niu payload").unwrap();
         std::fs::create_dir_all(root.join("bin")).unwrap();
 
