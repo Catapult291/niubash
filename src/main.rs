@@ -120,27 +120,41 @@ fn main() -> ExitCode {
 /// - bare `niu` on a terminal stdin: the desktop/shortcut face — the user
 ///   opened this window on purpose (an agent's bare `niu` over pipes reads
 ///   stdin instead, non-terminal);
-/// - `-i`/`--interactive`/`-l`/`--login` in the leading option group: an
+/// - `-i`/`--interactive`/`-l`/`--login` in the leading option run: an
 ///   explicit request for an interactive session.
+///
+/// The option run is walked with the SAME `classify_leading_option_word`
+/// rules `launcher_dispatch_index` uses (GNU `parse_shell_options`): a
+/// value-taking option consumes its next argv word, so in
+/// `niu --rcfile <rc> -i` / `niu -o vi -i` the trailing `-i` is an option
+/// (interactive), not an operand — while in `niu --rcfile -i` the `-i` IS
+/// the rcfile value and never counts. A `-c`/`-s` word, an operand, or
+/// `--` ends the run: words after that are positional, never flags
+/// (`niu script.sh -i` stays non-interactive).
 fn interactive_launch_wanted(args: &[String]) -> bool {
     use std::io::IsTerminal;
     let rest = if args.is_empty() { &[][..] } else { &args[1..] };
     if rest.is_empty() {
         return std::io::stdin().is_terminal();
     }
-    for arg in rest {
-        if !arg.starts_with('-') || arg == "-" || arg == "--" {
+    let mut index = 1usize;
+    while let Some(arg) = args.get(index) {
+        if arg == "-" || arg == "--" {
             break;
         }
         if let Some(long) = arg.strip_prefix("--") {
             if matches!(long, "interactive" | "login") {
                 return true;
             }
-            continue;
+        } else if arg.starts_with('-') {
+            let flags = &arg[1..];
+            if flags.bytes().all(|b| b.is_ascii_alphabetic()) && flags.contains(['i', 'l']) {
+                return true;
+            }
         }
-        let flags = &arg[1..];
-        if flags.bytes().all(|b| b.is_ascii_alphabetic()) && flags.contains(['i', 'l']) {
-            return true;
+        match classify_leading_option_word(arg) {
+            LeadingOptionWord::EngineRoute => break,
+            LeadingOptionWord::Consumes(consumed) => index += 1 + consumed,
         }
     }
     false
@@ -4800,6 +4814,52 @@ mod launcher_dispatch_tests {
         // The engine route reports the invalid option; the launcher word is
         // still found so the handler can surface the same usage error.
         assert_eq!(index_of(&["-Z", "--encoded-command"]), Some(2));
+    }
+
+    fn wants_interactive(words: &[&str]) -> bool {
+        interactive_launch_wanted(&argv(words))
+    }
+
+    #[test]
+    fn interactive_flags_in_the_leading_option_run_keep_the_console() {
+        assert!(wants_interactive(&["-i"]));
+        assert!(wants_interactive(&["-l"]));
+        assert!(wants_interactive(&["--interactive"]));
+        assert!(wants_interactive(&["--login"]));
+        assert!(wants_interactive(&["-lc", "echo hi"]));
+    }
+
+    #[test]
+    fn interactive_flag_after_a_value_taking_option_still_counts() {
+        // niubash#455's second rail: `--rcfile <rc> -i` is the per-asset
+        // gate's own spawn shape — the -i is an option, not part of the
+        // rcfile value, so the run is interactive and keeps its console.
+        assert!(wants_interactive(&["--rcfile", "probe.rc", "-i"]));
+        assert!(wants_interactive(&["--init-file", "probe.rc", "-i"]));
+        assert!(wants_interactive(&["-o", "vi", "-i"]));
+        assert!(wants_interactive(&["-eo", "pipefail", "-i"]));
+        // ...but the value word itself is never scanned: `-i` AS the
+        // rcfile operand is GNU's meaning too (a file literally named -i).
+        assert!(!wants_interactive(&["--rcfile", "-i"]));
+        assert!(!wants_interactive(&["-o", "-i"]));
+    }
+
+    #[test]
+    fn option_run_ends_before_positional_words() {
+        // Words after a `-c`/`-s` route or the first operand are the
+        // engine's positional parameters, never option flags — a stray
+        // `-i` there must not read as interactive.
+        assert!(!wants_interactive(&["-c", "echo hi", "-i"]));
+        assert!(!wants_interactive(&["script.sh", "-i"]));
+        assert!(!wants_interactive(&["--", "-i"]));
+    }
+
+    #[test]
+    fn plainly_non_interactive_invocations_release() {
+        assert!(!wants_interactive(&["-c", "echo hi"]));
+        assert!(!wants_interactive(&["script.sh"]));
+        assert!(!wants_interactive(&["setup"]));
+        assert!(!wants_interactive(&["-e", "-u", "script.sh"]));
     }
 }
 
