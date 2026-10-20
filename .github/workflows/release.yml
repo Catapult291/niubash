@@ -505,6 +505,114 @@ jobs:
             -Target "${{ matrix.rust_target }}" `
             -Arch "${{ matrix.arch }}"
 
+      # niubash#470: the staged tree carries real NTFS hardlinks (wpm's own
+      # layout, restored after the Copy-Item staging sweep), and the two
+      # hardlink-native companions must transport that faithfully. Measured
+      # on the v1.4.2 x64 tree: .tar.gz (bsdtar) round-trips the hardlinks
+      # exactly (git.exe family 6-way, awk 3-way, every file byte-identical);
+      # 7-Zip 26.04 archives the CONTENT once (solid compression) but does
+      # not restore hardlinks on extraction, so the .7z gate asserts
+      # content-identity only. A failure here fails the release: an archive
+      # that unpacks to anything other than the staged bytes never ships.
+      - name: Verify hardlink-native archives
+        shell: pwsh
+        env:
+          # fsutil hardlink list needs an elevated shell; GitHub Windows
+          # runners provide one.
+          HS_ARCHIVE_VERSION: ${{ steps.release.outputs.version }}
+          HS_ARCHIVE_ARCH: ${{ matrix.arch }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:HS_ARCHIVE_VERSION
+          $arch = $env:HS_ARCHIVE_ARCH
+          $name = "niubash-v$version-win-$arch"
+          # Absolute on purpose: the fingerprint function strips this prefix
+          # from absolute FullName paths, so a relative root would cut
+          # mid-path and every comparison would spuriously differ.
+          $stage = (Resolve-Path "dist/$name").Path
+          $tarGz = "dist/$name.tar.gz"
+          $sevenZipArchive = "dist/$name.7z"
+          foreach ($artifact in @($tarGz, $sevenZipArchive)) {
+            if (-not (Test-Path -LiteralPath $artifact)) {
+              throw "expected hardlink-native archive missing: $artifact"
+            }
+          }
+
+          $extractTar = Join-Path $env:RUNNER_TEMP "archive-verify-tar"
+          $extract7z = Join-Path $env:RUNNER_TEMP "archive-verify-7z"
+          New-Item -ItemType Directory -Force -Path $extractTar, $extract7z | Out-Null
+          tar -xf $tarGz -C $extractTar
+          if ($LASTEXITCODE -ne 0) { throw "tar -xf failed on $tarGz" }
+
+          $sevenZipCandidates = @()
+          if ($env:ProgramFiles) { $sevenZipCandidates += Join-Path $env:ProgramFiles "7-Zip\7z.exe" }
+          if (${env:ProgramFiles(x86)}) { $sevenZipCandidates += Join-Path ${env:ProgramFiles(x86)} "7-Zip\7z.exe" }
+          $sevenZip = $sevenZipCandidates |
+            Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $sevenZip) { $sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source }
+          if (-not $sevenZip) { throw "7z.exe not found on the runner; cannot verify $sevenZipArchive" }
+          & $sevenZip x $sevenZipArchive ("-o" + $extract7z) -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z x failed on $sevenZipArchive" }
+
+          # Byte-identity: every path in the staged tree must unpack to the
+          # same length and SHA-256 from BOTH archives.
+          function Get-TreeFingerprint([string]$root) {
+            Get-ChildItem -LiteralPath $root -Recurse -File | ForEach-Object {
+              "{0}|{1}|{2}" -f $_.FullName.Substring($root.Length + 1).ToLowerInvariant(), $_.Length,
+                (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+            } | Sort-Object
+          }
+          $expected = Get-TreeFingerprint $stage
+          $fromTar = Get-TreeFingerprint (Join-Path $extractTar $name)
+          $from7z = Get-TreeFingerprint (Join-Path $extract7z $name)
+          $diffTar = Compare-Object -ReferenceObject $expected -DifferenceObject $fromTar
+          if ($diffTar) {
+            $diffTar | Select-Object -First 5 | ForEach-Object { Write-Host $_.InputObject }
+            throw ".tar.gz round-trip is not byte-identical to the staged tree ($($diffTar.Count) differing entries)"
+          }
+          $diff7z = Compare-Object -ReferenceObject $expected -DifferenceObject $from7z
+          if ($diff7z) {
+            $diff7z | Select-Object -First 5 | ForEach-Object { Write-Host $_.InputObject }
+            throw ".7z round-trip is not byte-identical to the staged tree ($($diff7z.Count) differing entries)"
+          }
+          Write-Host "content identity: .tar.gz OK, .7z OK ($($expected.Count) files)"
+
+          # Hardlink restoration, .tar.gz only (7-Zip's limitation is
+          # documented, not gated): the bash/sh shim family is shipped on
+          # every leg, so its >=2 links are the universal probe; niugit's
+          # git.exe family (6-way on a leg where it pre-installed) is the
+          # payload probe this dedup exists for.
+          function Get-HardLinkCount([string]$path) {
+            $listing = fsutil hardlink list $path 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "fsutil hardlink list failed for $path`: $listing" }
+            return ($listing | Measure-Object -Line).Lines
+          }
+          $tarRoot = Join-Path $extractTar $name
+          $bashProbe = Join-Path $tarRoot "winuxcmd\usr\bin\bash.exe"
+          if (-not (Test-Path -LiteralPath $bashProbe)) { throw "winuxcmd\usr\bin\bash.exe missing from the .tar.gz extraction" }
+          $bashLinks = Get-HardLinkCount $bashProbe
+          if ($bashLinks -lt 2) {
+            throw ".tar.gz did not restore hardlinks: winuxcmd\usr\bin\bash.exe has $bashLinks link(s), expected >= 2"
+          }
+          Write-Host "bash.exe shim family links in .tar.gz extraction: $bashLinks"
+          $gitProbe = Join-Path $tarRoot "winuxcmd\usr\bin\git.exe"
+          if (Test-Path -LiteralPath $gitProbe) {
+            $gitLinks = Get-HardLinkCount $gitProbe
+            if ($gitLinks -lt 2) {
+              throw ".tar.gz did not restore hardlinks: winuxcmd\usr\bin\git.exe has $gitLinks link(s), expected >= 2"
+            }
+            Write-Host "git.exe family links in .tar.gz extraction: $gitLinks"
+          }
+          else {
+            Write-Host "::warning::niugit not pre-installed on this leg; git.exe link probe skipped"
+          }
+
+          $zipBytes = (Get-Item "dist/$name.zip").Length
+          $tarBytes = (Get-Item $tarGz).Length
+          $sevenBytes = (Get-Item $sevenZipArchive).Length
+          $table = "### Archive sizes ($arch)`n| asset | MB |`n|---|---|`n| zip | $([Math]::Round($zipBytes / 1MB, 2)) |`n| tar.gz (hardlink-native) | $([Math]::Round($tarBytes / 1MB, 2)) |`n| 7z | $([Math]::Round($sevenBytes / 1MB, 2)) |"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $table
+
       # niubash#189 acceptance, enforced per-artifact: whatever the pre-install
       # step INSTALLED must work inside the staged package — `--version` on
       # every shim, and a bash-it plugin-shaped awk pipeline through the
@@ -700,8 +808,14 @@ jobs:
         run: |
           $versionedZip = "dist/niubash-v${{ steps.release.outputs.version }}-win-${{ matrix.arch }}.zip"
           $versionedSetup = "dist/niubash-v${{ steps.release.outputs.version }}-win-${{ matrix.arch }}-setup.exe"
+          $versionedTarGz = "dist/niubash-v${{ steps.release.outputs.version }}-win-${{ matrix.arch }}.tar.gz"
+          $versionedSevenZip = "dist/niubash-v${{ steps.release.outputs.version }}-win-${{ matrix.arch }}.7z"
           Copy-Item -LiteralPath $versionedZip -Destination "dist/niubash-win-${{ matrix.arch }}.zip" -Force
           Copy-Item -LiteralPath $versionedSetup -Destination "dist/niubash-win-${{ matrix.arch }}-setup.exe" -Force
+          # niubash#470: the hardlink-native archives get the same
+          # latest-compatible aliases as the formats that already had them.
+          Copy-Item -LiteralPath $versionedTarGz -Destination "dist/niubash-win-${{ matrix.arch }}.tar.gz" -Force
+          Copy-Item -LiteralPath $versionedSevenZip -Destination "dist/niubash-win-${{ matrix.arch }}.7z" -Force
 
       # niubash#311: every setup.exe ships a `.sha256` sidecar next to it, in
       # the coreutils "<hex>  <filename>" form. `niu --self-update` fetches
@@ -730,9 +844,13 @@ jobs:
           name: niubash-v${{ steps.release.outputs.version }}-win-${{ matrix.arch }}
           path: |
             dist/niubash-v${{ steps.release.outputs.version }}-win-${{ matrix.arch }}.zip
+            dist/niubash-v${{ steps.release.outputs.version }}-win-${{ matrix.arch }}.tar.gz
+            dist/niubash-v${{ steps.release.outputs.version }}-win-${{ matrix.arch }}.7z
             dist/niubash-v${{ steps.release.outputs.version }}-win-${{ matrix.arch }}-setup.exe
             dist/niubash-v${{ steps.release.outputs.version }}-win-${{ matrix.arch }}-setup.exe.sha256
             dist/niubash-win-${{ matrix.arch }}.zip
+            dist/niubash-win-${{ matrix.arch }}.tar.gz
+            dist/niubash-win-${{ matrix.arch }}.7z
             dist/niubash-win-${{ matrix.arch }}-setup.exe
             dist/niubash-win-${{ matrix.arch }}-setup.exe.sha256
           if-no-files-found: error
@@ -1930,7 +2048,7 @@ jobs:
             hash="$(sha256sum "$file" | awk '{print $1}')"
             printf '%s  %s\n' "$hash" "$(basename "$file")" >> SHA256SUMS
             count=$((count + 1))
-          done < <(find artifacts -type f \( -name '*.zip' -o -name '*.exe' -o -name '*.tar.gz' \) | sort)
+          done < <(find artifacts -type f \( -name '*.zip' -o -name '*.exe' -o -name '*.tar.gz' -o -name '*.7z' \) | sort)
           if [ "$count" -eq 0 ]; then
             echo "no payload artifacts found to hash" >&2
             exit 1
@@ -1949,9 +2067,11 @@ jobs:
             Engine: rubash git ${{ needs.build-windows.outputs.rubash_revision }} — every platform build in this release compiled that same revision, pinned by `scripts/release/rubash-pin.json` and fail-hard verified at fetch time (rubash#827). The release compiles the pinned engine, not "whatever rubash master was when the pipeline ran".
             Verify locally with `niu --version`, which prints the same revision.
 
-            Windows (x64, ARM64): Inno Setup installers (`*-setup.exe`) add user PATH and Windows Terminal profile integration; portable zips bundle `niu` with WinuxCmd and bash/sh shims.
+            Windows (x64, ARM64): Inno Setup installers (`*-setup.exe`) add user PATH and Windows Terminal profile integration; portable archives bundle `niu` with WinuxCmd and bash/sh shims.
 
-            Windows packages come with the must-install bundle pre-installed (niubash#189, niubash#209): niugit (native Windows git — the full plugin distro's five entries install through git, so a fresh machine without git.exe no longer fails `niu setup`), gawk 5.4.1 with plain `awk` working too, plus ripgrep (`rg`) and fd — all landing in the bundled WinuxCmd root as wpm JSON-package payloads, assembled at CI time with no runtime downloads, no archive formats beyond the release zip itself, and no symlinks. Pre-install is best-effort, not a promise: on legs where the package index has no matching artifact (currently niugit and gawk on the ARM64 builds; ripgrep and fd have ARM64 artifacts) the package ships WITHOUT that entry — run `winuxcmd wpm install <name>` once after installing to add it. The pre-install list and its recorded exclusions live in `scripts/release/preinstall.json`.
+            Portable download guide (niubash#470): prefer `*.tar.gz` — it is hardlink-native. The bundled payload ships real NTFS hardlinks (the whole `git.exe` family is one shared binary, `awk`/`gawk` likewise, exactly what `wpm install` lays down), so the tarball is roughly half the zip's download size and unpacks to a much smaller on-disk tree; `tar -xf <file>.tar.gz` works out of the box on Windows 10 1803+ and any modern Linux/macOS, and on a filesystem without hardlink support (FAT32/exFAT) extraction degrades gracefully to independent byte-identical copies with no loss of function. `*.7z` is the smallest download (solid LZMA already collapses the shared payloads) but current 7-Zip releases restore the shared families as independent copies — every file is byte-identical, only disk usage grows. The classic `*.zip` is unchanged, stores every payload in full, and remains for tooling that only speaks zip.
+
+            Windows packages come with the must-install bundle pre-installed (niubash#189, niubash#209): niugit (native Windows git — the full plugin distro's five entries install through git, so a fresh machine without git.exe no longer fails `niu setup`), gawk 5.4.1 with plain `awk` working too, plus ripgrep (`rg`) and fd — all landing in the bundled WinuxCmd root as wpm JSON-package payloads, assembled at CI time with no runtime downloads, no runtime archive formats, and no symlinks. Pre-install is best-effort, not a promise: on legs where the package index has no matching artifact (currently niugit and gawk on the ARM64 builds; ripgrep and fd have ARM64 artifacts) the package ships WITHOUT that entry — run `winuxcmd wpm install <name>` once after installing to add it. The pre-install list and its recorded exclusions live in `scripts/release/preinstall.json`.
 
             `niubash-skill-v<version>.zip` is the AI agent skill bundle (SKILL.md + references, WinuxCmd-skill layout): unpack it into an agent skills directory, or let the shell do it — `niu skill install` embeds the same content.
 
@@ -1966,6 +2086,7 @@ jobs:
             artifacts/**/*.zip
             artifacts/**/*.exe
             artifacts/**/*.tar.gz
+            artifacts/**/*.7z
             artifacts/**/*.sha256
             SHA256SUMS
           fail_on_unmatched_files: true

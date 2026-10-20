@@ -14,7 +14,11 @@ param(
     # so the shim dispatch (<root>\usr\bin\<cmd>.exe -> <root>\opt\<pkg>\)
     # resolves inside the shipped layout. Never ships the .wpm state dir.
     [string]$PreinstallRoot,
-    [switch]$AllowPathWinuxCmd
+    [switch]$AllowPathWinuxCmd,
+    # niubash#470: skip the staged-tree hardlink alignment and the
+    # hardlink-native archives (.tar.gz / .7z), producing only the classic
+    # zip. Escape hatch for callers that want the legacy output shape.
+    [switch]$SkipHardlinkArchives
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,6 +26,60 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Push-Location $RepoRoot
 try {
+    # niubash#470: re-link byte-identical staged files as NTFS hardlinks so
+    # the staged tree matches what `wpm install` produces on a real disk.
+    # Deterministic: the lexicographically first path of each content group
+    # becomes the link target, so re-running the packager yields the same
+    # layout. Content-neutral by construction (only SHA256-equal files are
+    # linked), and degrading gracefully: on a filesystem without hardlink
+    # support the copies simply stay copies, with a loud warning — every
+    # downstream consumer (zip, setup.exe, smoke gates) is unaffected.
+    function Complete-StagedHardlinks {
+        param([string]$StageDir)
+
+        $groups = @{}
+        foreach ($file in (Get-ChildItem -LiteralPath $StageDir -Recurse -File)) {
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+            if (-not $groups.ContainsKey($hash)) {
+                $groups[$hash] = [System.Collections.Generic.List[string]]::new()
+            }
+            $groups[$hash].Add($file.FullName)
+        }
+
+        $families = 0
+        $links = 0
+        $saved = [long]0
+        foreach ($group in $groups.Values) {
+            if ($group.Count -lt 2) { continue }
+            $sorted = $group | Sort-Object { $_ }
+            $primary = $sorted[0]
+            $primaryLength = (Get-Item -LiteralPath $primary).Length
+            $families++
+            foreach ($duplicate in ($sorted | Select-Object -Skip 1)) {
+                try {
+                    New-Item -ItemType HardLink -Path $duplicate -Target $primary -Force -ErrorAction Stop | Out-Null
+                    $links++
+                    $saved += $primaryLength
+                }
+                catch {
+                    # No hardlink support on the staging volume (FAT32, some
+                    # network shares): ship the independent copies rather
+                    # than fail the release. The archives stay correct — the
+                    # tar.gz just stores full entries and keeps its unlinked
+                    # size.
+                    Write-Warning "hardlink for '$duplicate' failed ($($_.Exception.Message)); keeping an independent copy"
+                }
+            }
+        }
+        if ($families -gt 0) {
+            Write-Host ("Staged hardlinks: {0} duplicate-content families re-linked ({1} links, {2} MB of duplicate payload bytes now shared)" -f `
+                $families, $links, [Math]::Round($saved / 1MB, 2))
+        }
+        else {
+            Write-Host "Staged hardlinks: no duplicate-content families found"
+        }
+    }
+
     if (-not $Version) {
         $cargoToml = Get-Content -LiteralPath "Cargo.toml" -Raw
         if ($cargoToml -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
@@ -202,6 +260,25 @@ try {
         Copy-Item -LiteralPath $iconFile -Destination (Join-Path $stageDir "assets") -Force
     }
 
+    # niubash#470: restore the real install layout before any archive is
+    # written. wpm installs hardlink their payloads, but the Copy-Item sweep
+    # above flattens every link into an independent full copy (PowerShell
+    # Copy-Item never preserves hardlinks), and Compress-Archive would ship
+    # each copy in full — the v1.4.2 x64 zip carried 6 independent copies of
+    # git.exe (34.7 MB of the 57.1 MB archive was duplicated payload bytes).
+    # Re-linking byte-identical files is content-neutral: every path keeps
+    # the same bytes it already had, so the zip, the Inno setup.exe, the
+    # staged-package smoke gates, and any later `wpm` reinstall behave
+    # exactly as before. What changes: the hardlink-native archives below
+    # (.tar.gz via bsdtar) can then store each shared family once, and the
+    # extracted tree keeps the small on-disk footprint a `wpm install` would
+    # have produced. Every staged path stays a complete real file — hardlinks
+    # only share storage — so an unpacked tree is complete by construction:
+    # no stand-in files, no manifests, no relink step for users.
+    if (-not $SkipHardlinkArchives) {
+        Complete-StagedHardlinks -StageDir $stageDir
+    }
+
     Compress-Archive -LiteralPath $stageDir -DestinationPath $zipPath -Force
 
     $files = Get-ChildItem -LiteralPath $stageDir -Recurse -File
@@ -209,6 +286,50 @@ try {
     Write-Host "Created $zipPath"
     Write-Host "Files: $($files.Count)"
     Write-Host "Zip size: $([Math]::Round($size / 1MB, 2)) MB"
+
+    # niubash#470: hardlink-native companions to the zip. The staged tree
+    # above now carries real NTFS hardlinks, and bsdtar (the Windows built-in
+    # tar.exe) records them as tar hardlink entries and restores them on
+    # extraction — measured on the v1.4.2 tree: 54.47 MB zip -> 29.63 MB
+    # tar.gz with the git/awk families re-linked after unpack. 7-Zip gets the
+    # size win from solid compression alone (13.09 MB measured); -snh is kept
+    # for intent but 7-Zip 26.04 neither stores nor restores NTFS hardlinks
+    # with it, so the .7z archives content, not links — documented in the
+    # release body, verified as content-identity in the workflow.
+    if (-not $SkipHardlinkArchives) {
+        $tarGzPath = Join-Path $distDir "$packageName.tar.gz"
+        Remove-Item -LiteralPath $tarGzPath -Force -ErrorAction SilentlyContinue
+        tar -czf $tarGzPath -C $distDir $packageName
+        if ($LASTEXITCODE -ne 0) {
+            throw "tar.exe failed to create $tarGzPath (exit $LASTEXITCODE)"
+        }
+        Write-Host "Tar.gz size: $([Math]::Round((Get-Item -LiteralPath $tarGzPath).Length / 1MB, 2)) MB"
+
+        $sevenZipCandidates = @()
+        if ($env:ProgramFiles) { $sevenZipCandidates += Join-Path $env:ProgramFiles "7-Zip\7z.exe" }
+        if (${env:ProgramFiles(x86)}) { $sevenZipCandidates += Join-Path ${env:ProgramFiles(x86)} "7-Zip\7z.exe" }
+        $sevenZip = $sevenZipCandidates |
+            Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if (-not $sevenZip) {
+            $sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+        }
+        if ($sevenZip) {
+            $sevenZipPath = Join-Path $distDir "$packageName.7z"
+            Remove-Item -LiteralPath $sevenZipPath -Force -ErrorAction SilentlyContinue
+            & $sevenZip a -snh -mx=9 $sevenZipPath (Join-Path $distDir $packageName) | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "7z failed to create $sevenZipPath (exit $LASTEXITCODE)"
+            }
+            Write-Host "7z size: $([Math]::Round((Get-Item -LiteralPath $sevenZipPath).Length / 1MB, 2)) MB"
+        }
+        else {
+            # Local convenience builds may lack 7-Zip; the release workflow
+            # hard-asserts the .7z exists, so a CI leg can never silently
+            # lose the asset.
+            Write-Warning "7-Zip not found; skipping the .7z archive (the .zip and .tar.gz are complete)"
+        }
+    }
+
     Write-Host "Contents:"
     $files | ForEach-Object {
         Write-Host "  $($_.FullName.Substring($stageDir.Length + 1))"

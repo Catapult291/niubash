@@ -23,7 +23,7 @@ first.**
 
 | Job | Runner | Rust target | Artifacts | Contents |
 | --- | --- | --- | --- | --- |
-| `build-windows` (x64) | `windows-2025` | `x86_64-pc-windows-msvc` (crt-static) | `niubash-v{ver}-win-x64.zip`, `-setup.exe`, `niubash-win-x64.*` aliases | `niu.exe`, WinuxCmd, bash/sh shims, icons |
+| `build-windows` (x64) | `windows-2025` | `x86_64-pc-windows-msvc` (crt-static) | `niubash-v{ver}-win-x64.zip`, `.tar.gz`, `.7z`, `-setup.exe`, `niubash-win-x64.*` aliases | `niu.exe`, WinuxCmd, bash/sh shims, icons |
 | `build-windows` (arm64) | `windows-2025` | `aarch64-pc-windows-msvc` (crt-static) | same, `-arm64` | same |
 | `build-linux` (x86_64) | `ubuntu-22.04` | `x86_64-unknown-linux-gnu` | `niubash-v{ver}-linux-x86_64.tar.gz` | `niu`, `README.md`, `LICENSE` |
 | `build-linux` (aarch64) | `ubuntu-22.04-arm` | `aarch64-unknown-linux-gnu` | `niubash-v{ver}-linux-aarch64.tar.gz` | same |
@@ -32,7 +32,43 @@ first.**
 
 Each tarball unpacks to a single `niubash-v{ver}-{os}-{arch}/` directory;
 `./niu` runs from anywhere. The `release` job attaches every artifact
-(`*.zip`, `*.exe`, `*.tar.gz`) with `fail_on_unmatched_files: true`.
+(`*.zip`, `*.exe`, `*.tar.gz`, `*.7z`) with `fail_on_unmatched_files: true`.
+
+## Windows portable archives: hardlink-native by design (niubash#470)
+
+The Windows portable tree ships the wpm install layout, whose payload
+families are NTFS hardlinks (the whole `git.exe` family is one shared
+binary; `awk`/`gawk` likewise). `Copy-Item` staging flattens those links,
+which is why the v1.4.2 x64 zip weighed 57.1 MB with ~61% duplicated
+payload bytes. `package-release.ps1` now re-links byte-identical staged
+files (SHA-256 grouped, content-neutral — every path keeps the same bytes,
+so the zip, the setup.exe, and the staged smoke gates are unchanged) and
+produces two companions next to the unchanged zip:
+
+- **`*.tar.gz` — recommended.** Windows' built-in bsdtar records the
+  hardlinks as tar hardlink entries and restores them on extraction
+  (measured on the v1.4.2 tree: 54.47 MB zip -> 29.63 MB tar.gz; unpacked,
+  the git/awk families share one physical copy again). `tar -xf` works on
+  Windows 10 1803+ out of the box. On a filesystem without hardlink support
+  (FAT32/exFAT) extraction degrades harmlessly to independent byte-identical
+  copies.
+- **`*.7z` — smallest download.** Solid LZMA collapses the duplicated
+  content on its own (13.09 MB measured); `-snh` is passed for intent, but
+  measured 7-Zip 26.04 neither stores nor restores NTFS hardlinks, so a
+  7z-extracted tree holds independent copies — byte-identical files, larger
+  disk footprint.
+- **`*.zip` — unchanged**, stores every payload in full, kept for tooling
+  that only speaks zip.
+
+The workflow's "Verify hardlink-native archives" step round-trips both
+companions before upload: byte-identity of every file against the staged
+tree (both formats), plus `fsutil` link-count probes on the `.tar.gz`
+extraction (the bash/sh shim family on every leg; the `git.exe` family when
+niugit pre-installed). The rejected alternative — zero-byte placeholders
+plus a relink manifest/script — is recorded as such in #470: it breaks
+manual unzip, fights wpm's upgrade path, trips antivirus on zero-byte
+executables, and its symlink fallback fails on FAT32/non-admin; hardlink
+sharing inside a tree of complete files has none of those failure modes.
 
 ## Unix decisions (recorded)
 
