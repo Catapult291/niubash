@@ -298,6 +298,12 @@ fn run_and_observe_exe(
     let mut command = Command::new(exe);
     command
         .args(args)
+        // Keep the console gates hermetic: on a host where winuxcmd's
+        // command links are missing (CI runner), startup auto-activation
+        // would spawn `winuxcmd.exe wpm links rebuild` and legitimately
+        // allocate the session's one hidden console, breaking the
+        // builtin-only 0-conhost assertion for environment reasons.
+        .env("NIU_SKIP_WINUXCMD_ACTIVATION", "1")
         .creation_flags(flags | CREATE_NEW_PROCESS_GROUP)
         .stdin(if stdin_bytes.is_some() {
             Stdio::piped()
