@@ -76,6 +76,19 @@ journey（`scripts/journey/golden-journey.py`）：
 
 次要嫌疑：本机 ConPTY 在长会话后偶发 read 假死（J3-P8 同会话存活约 20 分钟）。release runner 上五步全过、本机 9 轮仅此一次，低概率单发也可能。**不要为此改产品**——remove 的磁盘契约在 run9 里全绿。
 
+### 4.5 接力结论（2026-10-20，fix/452-journey-p-face 落地）
+
+读 `D:/tmp/jt444-run9/transcripts/P8-S4-remove.raw.ansi` 原始字节定案——**两个 harness 缺陷叠加，均非产品问题**：
+
+1. **needle 被 SGR 劈开（主因）**：raw 流里是 `\x1b[32mRemoved\x1b[0m source 'oh-my-bash'`（产品对 `Removed` 上色），wait_for 的 raw fallback 查的是**未 strip** 的字节，needle `"Removed source 'oh-my-bash'"` 永远不可能 substring 命中；strip 视图里那行是完整的。已验证：`needle in raw → False`，`needle in stripped → True`（512B 分块回放 run9 文件）。
+2. **feed 异常裸奔（并发缺陷）**：屏幕快照冻结在 23:35:39 而文件收到了 23:35:40 的 remove 输出——`stream.feed` 在该 chunk 上抛异常直接杀死泵线程，且 `self.dead = True` 在 while 循环后、无 finally，异常路径根本走不到 → dead 永远 False，wait_for 干转 90s。
+
+处置（scripts/journey/golden-journey.py）：
+- `_pump`：feed 包 try/except → 首个异常 ledger `pump-feed`/`raw-only` 事件并降级 raw-only 继续抽（raw 是 docstring 钦定的 truth surface）；外层 except ledger `pump`/`pump-dead` 事件；`finally: self.dead = True` 无条件落地。
+- `_pump` 维护 `_raw_plain_chunks` 增量 strip 镜像（`_strip_csi`，CSI 跨 chunk 以 tail 续接）；`raw_stripped()` 改从镜像取；`wait_for` 的 raw fallback 加查 strip 后文本。
+- `close()`：terminate 后先 `reader.join(5)` 再关 `_raw_file`——run1 的 J7 ledger 实锤了「write to closed file」拆除竞态（以前静默杀线程，现在会 ledger 成 pump-dead 噪音）。
+- 验证：jt452-run1 `--phases all` 全绿（含 P8-S4 remove needle 正常命中）；run2 复核非 flake。
+
 ### 4.4 完成判据（接力后）
 
 `--phases all` 全绿 + `--phases all` 第二轮确认非 flake → 开 PR 到 master（标题注明 #444 + 发版阻塞 run 39249382423），正文用本文件 §1 表格逐条回报处置。

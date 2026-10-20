@@ -363,6 +363,31 @@ def stress_pause():
         time.sleep(random.uniform(0, STRESS_DELAY_MS) / 1000.0)
 
 
+# ── Raw-stream plain mirror ─────────────────────────────────────────────────
+# `wait_for`'s raw fallback must see the line a USER saw, not the bytes. The
+# product colorizes single words (jt444 run9: `niu plugin source remove`
+# printed `\x1b[32mRemoved\x1b[0m source 'oh-my-bash'` — the needle
+# "Removed source 'oh-my-bash'" is split by the SGR reset in the raw bytes
+# and can never substring-match there). The pump therefore maintains an
+# escape-stripped mirror of every chunk; a CSI sequence split ACROSS chunk
+# boundaries is held as a tail so stripping is exact.
+_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+_CSI_TAIL_RE = re.compile(r"\x1b(?:\[[0-9;?]*)?$")
+
+
+def _strip_csi(text: str):
+    """Remove complete CSI sequences from `text`; return (clean, tail)
+    where `tail` is a trailing possibly-incomplete escape sequence held
+    for the next chunk (none when the text ends in plain content)."""
+    clean = _CSI_RE.sub("", text)
+    tail = ""
+    m = _CSI_TAIL_RE.search(clean)
+    if m:
+        tail = m.group(0)
+        clean = clean[:m.start()]
+    return clean, tail
+
+
 def render_history_line(line, columns: int) -> str:
     """One pyte history row to text. Newer pyte stores rows as
     char-maps (`StaticDefaultDict[int, Char]`), older as mappings too —
@@ -407,29 +432,73 @@ class Session:
         self.screen = make_history_screen(cols, rows)
         self.stream = pyte.Stream(self.screen)
         self.raw_chunks = []
+        # Escape-stripped mirror of raw_chunks for needle waits (see
+        # _strip_csi): the product's own SGR coloring splits needles in
+        # the raw bytes, so a raw-only fallback can never see lines the
+        # terminal demonstrably printed.
+        self._raw_plain_chunks = []
+        self._esc_tail = ""
+        # pyte parse crash -> raw-only mode: the raw stream stays the
+        # truth surface; the screen model freezes but waits still match
+        # the stripped mirror and the event lands in the verdict ledger.
+        self._feed_dead = False
         self._lock = threading.Lock()
         self._raw_file = open(raw_log, "wb") if raw_log else None
         self._reader = threading.Thread(target=self._pump, daemon=True)
         self._reader.start()
 
     def _pump(self):
-        while self.proc.isalive():
-            try:
-                data = self.proc.read()
-            except Exception:
-                break
-            if data:
-                with self._lock:
-                    self.raw_chunks.append(data)
-                    if self._raw_file:
-                        self._raw_file.write(data.encode("utf-8",
-                                                         errors="replace"))
-                    # Feed under the same lock the readers take: pyte's
-                    # history deque and display mutate in place, and an
-                    # unsynchronized capture crashed the gate with
-                    # "deque mutated during iteration" (run4, 2026-10-19).
-                    self.stream.feed(data)
-        self.dead = True
+        try:
+            while self.proc.isalive():
+                try:
+                    data = self.proc.read()
+                except Exception:
+                    break
+                if data:
+                    with self._lock:
+                        self.raw_chunks.append(data)
+                        plain, self._esc_tail = _strip_csi(
+                            self._esc_tail + data)
+                        self._raw_plain_chunks.append(plain)
+                        if self._raw_file:
+                            self._raw_file.write(
+                                data.encode("utf-8", errors="replace"))
+                        # Feed under the same lock the readers take: pyte's
+                        # history deque and display mutate in place, and an
+                        # unsynchronized capture crashed the gate with
+                        # "deque mutated during iteration" (run4,
+                        # 2026-10-19).
+                        #
+                        # A feed EXCEPTION must not kill the reader either
+                        # (jt444 run9: the pump died inside feed on the
+                        # `niu plugin source remove` output chunk — raw
+                        # append/file-write had already run, so the needle
+                        # sat in the artifacts while the screen froze and
+                        # `dead` never set, leaving every later wait to a
+                        # silent timeout). Degrade to raw-only: keep
+                        # capturing, ledger the real exception once.
+                        if not self._feed_dead:
+                            try:
+                                self.stream.feed(data)
+                            except Exception as err:
+                                self._feed_dead = True
+                                self._delivery_event(
+                                    "pump-feed", "", 1,
+                                    f"pyte feed raised {err!r} — screen "
+                                    f"model frozen from here; raw capture "
+                                    f"continues",
+                                    "raw-only")
+        except Exception as err:
+            # An escaping bug in the pump body itself: ledger the real
+            # exception instead of a silent thread death.
+            self._delivery_event(
+                "pump", "", 1, f"reader thread died: {err!r}", "pump-dead")
+        finally:
+            # Whatever ended the reader — pty EOF, a read exception, or an
+            # escaping bug — the session must never look alive with a dead
+            # pump: an unset `dead` turns the truth into a silent 90s
+            # timeout (the jt444 run9 shape).
+            self.dead = True
 
     def _write(self, data) -> bool:
         """One guarded ConPTY write. A child that dies mid-journey closes
@@ -469,26 +538,35 @@ class Session:
     def raw_stripped(self) -> str:
         """The raw byte stream with ANSI escape sequences removed — every
         line the terminal ever received, even ones a later screen clear
-        erased from pyte's model."""
-        raw = self.raw_text()
-        raw = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", raw)
-        raw = raw.replace("\r\n", "\n").replace("\r", "")
-        return raw
+        erased from pyte's model. Served from the pump's incremental
+        mirror (_raw_plain_chunks), so a CSI split across chunk reads is
+        still stripped exactly."""
+        with self._lock:
+            raw = "".join(self._raw_plain_chunks)
+        return raw.replace("\r\n", "\n").replace("\r", "")
 
     def wait_for(self, *needles, timeout=60, abort_on=()):
         """Wait until a needle shows on the viewport or in the raw stream
-        (screen clears hide text from pyte, never from the bytes).
+        (screen clears hide text from pyte, never from the bytes). The
+        raw fallback checks the STRIPPED mirror: the product's own SGR
+        coloring splits needles in the unstripped bytes (jt444 run9:
+        `\x1b[32mRemoved\x1b[0m source 'oh-my-bash'` — the stripped line
+        a user read was a substring-matchable line, the raw bytes were
+        not, and the wait ran out its 90s on a printed line).
         `abort_on` needles (viewport only) fail fast: they mean the flow
         moved past what we were waiting for."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.dead:
                 raise TimeoutError(
-                    f"pty closed (child exited) while waiting for {needles};"
+                    f"pty reader ended (child exit, or a pump-dead "
+                    f"delivery event) while waiting for {needles};"
                     f" screen:\n{self.text()}")
             body = self.text()
+            plain = self.raw_stripped()
             for needle in needles:
-                if needle in body or needle in self.raw_text():
+                if (needle in body or needle in self.raw_text()
+                        or needle in plain):
                     return needle
             for gone in abort_on:
                 if gone in body:
@@ -757,6 +835,11 @@ class Session:
             self.proc.terminate(force=True)
         except Exception:
             pass
+        # Reap the reader before closing the raw file: the pump writes to
+        # it under the lock on every chunk, and closing first raced it
+        # into 'write to closed file' (jt452 run1, J7 — ledgered as a
+        # pump-dead event by the guarded reader).
+        self._reader.join(timeout=5)
         if self._raw_file:
             try:
                 self._raw_file.close()
