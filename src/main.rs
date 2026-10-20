@@ -1537,7 +1537,7 @@ bash [GNU long option] [option] script-file ...
 "
     );
     eprintln!("GNU long options:");
-    for name in LONG_OPTIONS {
+    for name in rubash::usage::LONG_OPTIONS {
         eprintln!("	--{name}");
     }
     eprintln!("Shell options:");
@@ -1545,38 +1545,50 @@ bash [GNU long option] [option] script-file ...
     eprintln!("	-abefhkmnptuvxBCEHPT or -o option");
 }
 
-const LONG_OPTIONS: &[&str] = &[
-    "debug",
-    "debugger",
-    "dump-po-strings",
-    "dump-strings",
-    "help",
-    "init-file",
-    "login",
-    "noediting",
-    "noprofile",
-    "norc",
-    "posix",
-    "pretty-print",
-    "rcfile",
-    "restricted",
-    "verbose",
-    "version",
-];
-
 fn print_usage() {
     println!(
         "Niubash {} \u{2014} a bash-compatible shell that feels at home on Windows.",
         env!("CARGO_PKG_VERSION")
     );
     println!();
-    println!("Usage:  niu [option]");
+    // The GNU invocation face leads (niubash#385): the product help used to
+    // bury (or omit) the flags the engine actually parses, so every GNU
+    // long/shell option now comes first, in the `bash --help` order and
+    // GNU 5.3 wording. Both lists below are generated from the parser-side
+    // tables in `rubash::usage` (LONG_OPTIONS is the same table the engine's
+    // argv parser walks), so this face cannot advertise a flag the parser
+    // rejects, nor forget one it accepts. The binary invoked as `bash`/`sh`
+    // answers with the byte-for-byte GNU form instead (show_shell_help).
+    println!("Usage:  niu [GNU long option] [option] ...");
+    println!("        niu [GNU long option] [option] script-file ...");
     println!("        niu -c <cmd>         Run a command then exit");
     println!("        niu -C <cmd>         Run one REPL-style command then exit");
     println!("        niu setup           Re-run prompt/plugin setup");
     println!("        niu font            Nerd Font detection & install recommendations");
     println!("        niu doctor          Health-check the installation");
     println!("        niu <script> [args]  Run a script file");
+    println!();
+    println!("GNU long options:");
+    for name in rubash::usage::LONG_OPTIONS {
+        if rubash::usage::LONG_OPTIONS_WITH_VALUE.contains(&name) {
+            println!("    --{name} <file>");
+        } else {
+            println!("    --{name}");
+        }
+    }
+    println!();
+    println!("Shell options:");
+    println!("    -ilrsD or -c command or -O shopt_option		(invocation only)");
+    println!("    -abefhkmnptuvxBCEHPT or -o option");
+    println!();
+    println!("    -c <command> runs the command string (the word after it becomes $0);");
+    println!("    -s reads commands from standard input; --init-file and --rcfile each");
+    println!("    take <file>, replacing the default startup file (profile chain / rc).");
+    println!();
+    println!("Type `niu -c \"help set\"` for more information about shell options.");
+    println!("Type `niu -c help` for more information about shell builtin commands.");
+    println!("Report bugs at <https://github.com/unixwin/niubash/issues>.");
+    println!("Niubash home page: <https://github.com/unixwin/niubash>.");
     println!();
     println!("Options:");
     println!("  -h, --help                Show this help");
@@ -1594,7 +1606,8 @@ fn print_usage() {
     // Generated from rubash::usage::SHORT_OPTIONS — the same table the
     // parser's accepted-letter set derives from — so the product help lists
     // every working short option and cannot drift from the parser again
-    // (niubash#385; the long list below has been generated since b40ad8a).
+    // (niubash#385; the long list lives in the GNU invocation face above,
+    // generated from rubash::usage::LONG_OPTIONS since b40ad8a).
     for option in rubash::usage::SHORT_OPTIONS {
         let mut spec = format!("-{}", option.letter);
         if let Some(value) = option.value_name {
@@ -1607,10 +1620,6 @@ fn print_usage() {
             spec.push_str(long);
         }
         println!("  {spec:<26}{}", option.description);
-    }
-    println!("  GNU long options:");
-    for name in rubash::usage::LONG_OPTIONS {
-        println!("    --{name}");
     }
     println!("  Invoke the binary as `bash` or `sh` (shim or symlink) for the full");
     println!("  byte-for-byte GNU usage form: `bash --help`.");
