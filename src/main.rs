@@ -113,7 +113,48 @@ fn main() -> ExitCode {
     code
 }
 
+/// niubash#379: does this invocation plausibly want its console? False only
+/// when the run is provably non-interactive — anything else keeps the
+/// window (a false positive just preserves today's behavior).
+///
+/// - bare `niu` on a terminal stdin: the desktop/shortcut face — the user
+///   opened this window on purpose (an agent's bare `niu` over pipes reads
+///   stdin instead, non-terminal);
+/// - `-i`/`--interactive`/`-l`/`--login` in the leading option group: an
+///   explicit request for an interactive session.
+fn interactive_launch_wanted(args: &[String]) -> bool {
+    use std::io::IsTerminal;
+    let rest = if args.is_empty() { &[][..] } else { &args[1..] };
+    if rest.is_empty() {
+        return std::io::stdin().is_terminal();
+    }
+    for arg in rest {
+        if !arg.starts_with('-') || arg == "-" || arg == "--" {
+            break;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            if matches!(long, "interactive" | "login") {
+                return true;
+            }
+            continue;
+        }
+        let flags = &arg[1..];
+        if flags.bytes().all(|b| b.is_ascii_alphabetic()) && flags.contains(['i', 'l']) {
+            return true;
+        }
+    }
+    false
+}
+
 fn run_main() -> ExitCode {
+    // niubash#379: before anything else runs, drop a console Windows
+    // auto-allocated for this process alone — a console-less invoker that
+    // plainly spawns `niu -c`/`niu script.sh` gets a visible window that
+    // outlives the whole command. Interactive launches keep theirs.
+    if !interactive_launch_wanted(&std::env::args().collect::<Vec<_>>()) {
+        niubash_runtime::console_guard::release_orphan_console();
+    }
+
     // niubash#245: guard a piped stdout for non-interactive executions
     // BEFORE anything can write (Rust caches the stdio handle on first
     // use, so the interposition must land first). A reader that closes

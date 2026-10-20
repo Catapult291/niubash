@@ -57,6 +57,53 @@ pub fn restore(baseline: &ConsoleBaseline) {
     platform::restore(baseline);
 }
 
+/// niubash#379, host level: a console-less invoker (agent/CI/git hook that
+/// spawns `niu -c` plainly, without the `bash.exe` forwarder's
+/// CREATE_NO_WINDOW/DETACHED_PROCESS) makes Windows auto-allocate a
+/// *visible* console window for this console-subsystem binary before main()
+/// runs. Releasing that console kills the window within milliseconds
+/// instead of letting it outlive the whole command.
+///
+/// Safety rails, all required: `GetConsoleProcessList` must report this
+/// process as the console's sole attachment (an inherited console — a real
+/// terminal — has other processes on it and is never ours to free), and
+/// `GetConsoleWindow()` must report an actual window — a *hidden* console
+/// (CREATE_NO_WINDOW from the `bash.exe` forwarder, or ConPTY) is kept
+/// alive so grandchildren inherit it for free instead of paying ~22 ms
+/// per child spawn. The CALLER decides whether the invocation might be
+/// interactive before releasing: Windows binds the auto-allocated
+/// console's handles onto the standard streams, so an is_terminal() check
+/// cannot tell an agent's auto console from a user's freshly opened one.
+///
+/// Trade-off noted: `niu script.sh`-style non-interactive launches that
+/// arrive with their own fresh console (file-association/double-click
+/// spawns) lose the window — the script's output has nowhere to display.
+/// Shipped shortcuts launch `wt -p` without args (interactive), so the
+/// packaged faces never hit this; a user wanting a scripted window uses
+/// `start cmd /k niu script.sh`.
+pub fn release_orphan_console() {
+    platform::release_orphan_console();
+}
+
+/// niubash#451, child level: when niu itself is attached to no console
+/// (agent/CI spawn — e.g. a forwarder that launched us DETACHED, or after
+/// `release_orphan_console` fired), a plainly spawned console-subsystem
+/// child makes Windows allocate a *visible* console window for it.
+/// CREATE_NO_WINDOW gives the child a hidden console with full console-API
+/// access; under a real console or ConPTY (`GetConsoleCP()!=0`) this is a
+/// no-op and children inherit the real console as before.
+pub fn suppress_orphan_console(command: &mut std::process::Command) {
+    platform::suppress_orphan_console(command);
+}
+
+/// `Command::new` + `suppress_orphan_console` — the form spawn sites use
+/// when the Command is built inline for a fluent `.output()`/`.status()`.
+pub fn suppressed_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    platform::suppress_orphan_console(&mut command);
+    command
+}
+
 #[cfg(windows)]
 mod platform {
     use std::io::IsTerminal;
@@ -64,9 +111,10 @@ mod platform {
     use super::ConsoleBaseline;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleCP, SetConsoleMode, SetConsoleOutputCP,
-        ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WRAP_AT_EOL_OUTPUT,
-        STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        FreeConsole, GetConsoleCP, GetConsoleMode, GetConsoleProcessList, GetConsoleWindow,
+        GetStdHandle, SetConsoleCP, SetConsoleMode, SetConsoleOutputCP, ENABLE_PROCESSED_OUTPUT,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WRAP_AT_EOL_OUTPUT, STD_ERROR_HANDLE,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
 
     const UTF8_CODE_PAGE: u32 = 65001;
@@ -91,6 +139,34 @@ mod platform {
             if let Some(mode) = console_mode(handle_id) {
                 set_console_mode(handle_id, ensure_vt_bits(mode));
             }
+        }
+    }
+
+    pub fn release_orphan_console() {
+        // GetConsoleCP()!=0 says a console is attached; GetConsoleWindow()
+        // non-NULL says it owns a real (visible-capable) window — a
+        // CREATE_NO_WINDOW or ConPTY console reports NULL and is kept.
+        if unsafe { GetConsoleCP() } == 0 || unsafe { GetConsoleWindow() }.is_null() {
+            return;
+        }
+        let mut pids = [0u32; 64];
+        // The call reports the full attachment count even when the buffer
+        // is short, so ==1 means "allocated for this process alone".
+        if unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) } != 1 {
+            return;
+        }
+        unsafe {
+            FreeConsole();
+        }
+    }
+
+    pub fn suppress_orphan_console(command: &mut std::process::Command) {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW = 0x08000000 (WinBase.h). GetConsoleWindow() is
+        // not the gate: under ConPTY it reports NULL while a console is
+        // very much attached — GetConsoleCP()==0 means truly detached.
+        if unsafe { GetConsoleCP() } == 0 {
+            command.creation_flags(0x0800_0000);
         }
     }
 
@@ -187,6 +263,10 @@ mod platform {
     pub fn prefer_utf8_code_page() {}
 
     pub fn enable_vt_output() {}
+
+    pub fn release_orphan_console() {}
+
+    pub fn suppress_orphan_console(_command: &mut std::process::Command) {}
 
     pub fn restore(_baseline: &ConsoleBaseline) {}
 }
