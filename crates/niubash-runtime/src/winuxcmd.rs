@@ -5,7 +5,6 @@
 //! containing `winuxcmd.exe` to the process `PATH` so rubash finds it first.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{anyhow, Result};
 
@@ -101,7 +100,10 @@ fn find_winuxcmd_on_path(checked: &mut Vec<String>) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         checked.push("PATH lookup via where.exe winuxcmd.exe".to_string());
-        if let Ok(out) = Command::new("where.exe").arg("winuxcmd.exe").output() {
+        if let Ok(out) = crate::console_guard::suppressed_command("where.exe")
+            .arg("winuxcmd.exe")
+            .output()
+        {
             if out.status.success() {
                 let text = String::from_utf8_lossy(&out.stdout);
                 if let Some(line) = text.lines().next() {
@@ -483,7 +485,7 @@ fn auto_activate_bundled_winuxcmd(exe: &Path) {
     #[cfg(windows)]
     {
         let root = installation_root(exe);
-        match Command::new(exe)
+        match crate::console_guard::suppressed_command(exe)
             .args(["wpm", "links", "rebuild", "--root"])
             .arg(&root)
             .arg("--force")
@@ -534,7 +536,7 @@ fn auto_activate_bundled_winuxcmd(exe: &Path) {
         .file_name()
         .unwrap_or_else(|| std::ffi::OsStr::new("activate-winuxcmd.sh"));
 
-    match Command::new(current_exe)
+    match crate::console_guard::suppressed_command(current_exe)
         .arg(script_name)
         .current_dir(dir)
         .env("NIU_SKIP_WINUXCMD_ACTIVATION", "1")
@@ -581,7 +583,10 @@ pub fn command_links_ready() -> bool {
 /// Run `winuxcmd.exe --version` and return the first line of stdout.
 pub fn version() -> Option<String> {
     let exe = find_winuxcmd()?;
-    let out = Command::new(&exe).arg("--version").output().ok()?;
+    let out = crate::console_guard::suppressed_command(&exe)
+        .arg("--version")
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -594,7 +599,10 @@ pub fn version() -> Option<String> {
 pub fn list_commands() -> Vec<String> {
     // Try `--list` first (forward-compat with future winuxcmd versions).
     if let Some(exe) = find_winuxcmd() {
-        if let Ok(out) = Command::new(&exe).arg("--list").output() {
+        if let Ok(out) = crate::console_guard::suppressed_command(&exe)
+            .arg("--list")
+            .output()
+        {
             if out.status.success() {
                 let text = String::from_utf8_lossy(&out.stdout);
                 let cmds: Vec<String> = text

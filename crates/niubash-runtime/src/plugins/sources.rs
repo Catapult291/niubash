@@ -1127,6 +1127,7 @@ fn run_git_bounded(
     // on (measured: a 300ms budget turned into a 5.2s wall purely on the
     // orphan's own TLS-failure schedule). Closing the job handle at scope
     // end terminates everything still running under it.
+    crate::console_guard::suppress_orphan_console(&mut command);
     let job = kill_on_close_job();
     let mut child = command
         .spawn()
