@@ -1,9 +1,16 @@
 # Installer and Self-Update
 
-Niubash ships two Windows package shapes:
+Niubash ships the Windows release in two package shapes:
 
 - `niubash-v<version>-win-<arch>-setup.exe` for normal users.
-- `niubash-v<version>-win-<arch>.zip` for portable, agent, or scripted use.
+- `niubash-v<version>-win-<arch>.tar.gz` / `.7z` / `.zip` for portable,
+  agent, or scripted use. Prefer the `.tar.gz`: it ships the bundled
+  git/awk payload as real hardlinks, so it downloads and unpacks much
+  smaller than the `.zip`, and Windows 10+ untars it natively
+  (`tar -xf ...`). The `.zip` stays for tooling that only speaks zip.
+
+Linux (x86_64, aarch64) and macOS (aarch64, x86_64) ship as portable
+`.tar.gz` archives that use the system's own tools — untar and run `niu`.
 
 The installer is built with Inno Setup and installs per user by default under:
 

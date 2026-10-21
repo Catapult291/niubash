@@ -18,7 +18,8 @@ niu -C 'alias ll; pwd'       # one-shot REPL command
 
 - Use the interactive REPL for normal shell work.
 - Use `-c` for scripts, tests, CI, and coding agents. It does not load
-  `~/.niubashrc`, `~/.winshrc`, prompt plugins, or interactive lifecycle hooks.
+  `~/.niubashrc`, the generated plugin loader, prompt plugins, or interactive
+  lifecycle hooks.
 - Use `-C` only when a one-shot command needs the same startup state as the
   interactive REPL. It loads `~/.niubashrc` and lifecycle hooks, then exits.
 
@@ -69,15 +70,18 @@ export EDITOR=vim
 # eval "$(starship init bash)"
 ```
 
-Themes and plugins are enabled through `niu plugin`, which appends managed
-blocks at the end of the rc (see [Plugin Workflow](#plugin-workflow)); your
-lines outside those blocks are never rewritten.
+Themes and plugins are enabled through `niu plugin`. Plugin verbs never write
+the rc (niubash#359, v1.4.2): they update the manifest
+(`~/.niubash/plugins.toml` + `~/.niubash/sources/registry.toml`) and
+regenerate `~/.niubash/generated/plugins.niu`, which the host sources
+read-only *before* your rc — so rc lines always win
+(see [Plugin Workflow](#plugin-workflow)).
 
-The legacy files still exist, but they should not be the primary user path:
-
-- `~/.winshrc` is a fallback only when `~/.niubashrc` is absent.
-- Plugin CLI records, migration blocks, bundle versions, tests, and advanced
-  overrides are internal managed state, not a user configuration file.
+`~/.niubashrc` is the only startup file: the legacy `~/.winuxshrc`,
+`~/.winshrc`, and `~/.bashrc` names are never read, migrated, or written.
+Machine state — the plugin manifest, source registry and trust records, the
+generated loader, test isolation, completion directories — is maintained by
+Niubash itself and is not a user configuration entry point.
 
 Do not put automation-critical behavior only in an interactive rc file. Pass
 needed environment variables directly to `niu -c` or the script process, or
@@ -307,13 +311,13 @@ niu plugin list          # sources, their assets, activation state
 niu plugin discover      # read-only overview, including not-yet-installed managers
 ```
 
-Enablement is per source or per asset (a theme), and it edits your rc, not
-an internal database:
+Enablement is per source or per asset (a theme), and it lands in the
+generated loader, not your rc:
 
 ```sh
-niu plugin enable oh-my-bash   # guarded loader block appended to ~/.niubashrc
-niu plugin enable agnoster     # a theme asset -> sets OSH_THEME in that block
-niu plugin disable oh-my-bash  # removes the block; the built-in floor returns
+niu plugin enable oh-my-bash   # records the source; republishes ~/.niubash/generated/plugins.niu
+niu plugin enable agnoster     # a theme asset -> sets OSH_THEME in the loader
+niu plugin disable oh-my-bash  # manifest updated; the built-in floor returns
 ```
 
 `niu plugin update|sync|restore|clean` are the lockfile-style maintenance

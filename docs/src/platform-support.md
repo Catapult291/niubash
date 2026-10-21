@@ -55,6 +55,19 @@ in the release `needs`, artifacts go to the workflow run only. The runner
 cannot execute bionic binaries, so the four-check smoke gate has not run
 for these — a zip from this leg is build-verified, not smoke-verified.
 
+The leg does carry a **measured performance baseline** on real hardware
+(Termux aarch64, niubash 1.4.0 vs GNU bash 5.3.20):
+[niubash#352](https://github.com/unixwin/niubash/issues/352) — interpreter-bound
+workloads 2.3–3.7x slower (up to 7.3x on `${x^^}`), `niu -c true` 21.1 ms vs
+8.3 ms, peak RSS 2.2x, while fork-bound workloads run up to 5.2x *faster* and a
+real mkdir/write/read-back script 2.1x faster. The attributed root causes are
+all closed — engine interpreter triage (rubash#607-609) and the one-shot
+wrapper gap ([niubash#351](https://github.com/unixwin/niubash/issues/351):
+`niu -c true` 15 ms vs bash 13 ms after the fix, zero tput spawns) — but no
+post-fix re-measure on device exists yet; #352 stays open for it. The full
+table and the Windows-side numbers live in
+[Performance](performance.md).
+
 ## HarmonyOS
 
 The Rust target is `aarch64-unknown-linux-ohos`. Two facts make it mostly
