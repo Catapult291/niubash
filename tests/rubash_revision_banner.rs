@@ -105,3 +105,25 @@ fn version_banner_lines_match_release_smoke_greps() {
         );
     }
 }
+
+/// `--version` ends with the same unixwin portal lines as the `--help`
+/// tail (GNU home-page convention): the domain must be verbatim so users
+/// and downstream packaging can grep either face for the project home.
+#[test]
+fn version_banner_closes_with_the_unixwin_portal_lines() {
+    let output = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_niu")))
+        .arg("--version")
+        .output()
+        .expect("spawn niu --version");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for line in [
+        "Home: <https://unixwin.dev>",
+        "Docs & downloads: <https://unixwin.dev>",
+    ] {
+        assert!(
+            stdout.contains(line),
+            "niu --version lost the portal line `{line}`:\n{stdout}"
+        );
+    }
+}

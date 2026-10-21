@@ -81,6 +81,10 @@ fn help_opens_with_the_complete_gnu_invocation_face() {
         "Type `niu -c help` for more information about shell builtin commands.",
         "Report bugs at <https://github.com/unixwin/niubash/issues>.",
         "Niubash home page: <https://github.com/unixwin/niubash>.",
+        // Portal lines closing the output — the GNU home-page tail
+        // convention ("bash home page: <…>"), mirrored by --version.
+        "Home: <https://unixwin.dev>",
+        "Docs & downloads: <https://unixwin.dev>",
         // The restricted invocation face is advertised in both spellings.
         "    --restricted",
         "-r, --restricted",
