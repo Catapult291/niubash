@@ -288,13 +288,16 @@ pub fn build_line_editor(shell: &Rc<RefCell<Shell>>) -> anyhow::Result<Reedline>
         // normally (niubash#284). Ctrl+V (PasteSystem, bound below)
         // remains the one-shot clipboard path.
         .use_bracketed_paste(cfg!(not(target_os = "windows")))
-        .with_edit_mode(Box::new(PasteChunkEditMode::new(build_edit_mode(
-            shell_ref.editor_mode,
-            &shell_ref.native_widgets,
-            &shell_ref.native_widget_bindings,
-            &shell_ref.user_widget_bindings,
-            &shell_ref.engine_bindings,
-        ))));
+        .with_edit_mode(Box::new(PasteChunkEditMode::new(
+            build_edit_mode(
+                shell_ref.editor_mode,
+                &shell_ref.native_widgets,
+                &shell_ref.native_widget_bindings,
+                &shell_ref.user_widget_bindings,
+                &shell_ref.engine_bindings,
+            ),
+            menu_config.completion_style,
+        )));
 
     if shell_ref.autosuggest.history_strategy_enabled() {
         editor = editor.with_hinter(Box::new(HistoryAutosuggestHinter::new(
@@ -664,13 +667,25 @@ struct PasteChunkEditMode {
     lookahead: Lookahead,
     /// niubash#373: whether a completion menu may still be alive — a TAB
     /// opened the completion flow and no submit/chord has ended that
-    /// window. Gates the Enter dismissal prefix (see [`Self::delegate`]):
-    /// the prefix must never ride an Enter inside an active history search,
-    /// where reedline routes whole `Multiple` batches to the search handler
-    /// that drops them (`Multiple(_)` → `Inapplicable`) — that was the
-    /// Ctrl+R dead key. A CONTROL chord always ends the window: the verb it
-    /// invokes (search, cancel, EOF) owns the next Enter.
+    /// window. Gates the GNU style's Enter dismissal prefix (see
+    /// [`Self::delegate`]): the prefix must never ride an Enter inside an
+    /// active history search, where reedline routes whole `Multiple`
+    /// batches to the search handler that drops them (`Multiple(_)` →
+    /// `Inapplicable`) — that was the Ctrl+R dead key. A CONTROL chord
+    /// always ends the window: the verb it invokes (search, cancel, EOF)
+    /// owns the next Enter.
     menu_possible: bool,
+    /// niubash#486: whether an Enter inside the TAB window keeps the #373
+    /// dismissal prefix. Only the GNU printed list needs it: it reports
+    /// `is_active` while its candidate list is up but has no selectable
+    /// candidate (its `replace_in_buffer` is a deliberate no-op), so
+    /// reedline's `MenuAccept` would take the Enter and swallow it — a
+    /// dead key where GNU readline runs the line as typed. The
+    /// interactive menus (column/list/ide/inline) take reedline's menu
+    /// first-refusal natively: Enter commits the highlighted candidate
+    /// into the editable line — the 1.1.0 behavior niubash#486 restores —
+    /// and a second Enter submits.
+    enter_dismisses_menu: bool,
     /// niubash#420: put probe-consumed events BACK into the input stream.
     /// The live console cannot unread, so the events are written back into
     /// the kernel input queue (`WriteConsoleInputW`, the #417 reinjection
@@ -922,8 +937,13 @@ fn win_unread(events: &[crossterm29::event::Event]) {
 }
 
 impl PasteChunkEditMode {
-    fn new(inner: Box<dyn EditMode>) -> Self {
-        Self::with_lookahead(inner, Box::new(live_lookahead), Box::new(live_unread))
+    fn new(inner: Box<dyn EditMode>, completion_style: CompletionStyle) -> Self {
+        Self::with_lookahead(
+            inner,
+            Box::new(live_lookahead),
+            Box::new(live_unread),
+            completion_style,
+        )
     }
 
     /// The test constructor: a scripted lookahead queue in place of the
@@ -936,6 +956,7 @@ impl PasteChunkEditMode {
     fn with_scripted_queue(
         inner: Box<dyn EditMode>,
         queue: std::sync::Arc<std::sync::Mutex<VecDeque<crossterm29::event::Event>>>,
+        completion_style: CompletionStyle,
     ) -> Self {
         let unread_queue = std::sync::Arc::clone(&queue);
         Self::with_lookahead(
@@ -950,10 +971,16 @@ impl PasteChunkEditMode {
                     queue.push_front(event.clone());
                 }
             }),
+            completion_style,
         )
     }
 
-    fn with_lookahead(inner: Box<dyn EditMode>, lookahead: Lookahead, unread: Unread) -> Self {
+    fn with_lookahead(
+        inner: Box<dyn EditMode>,
+        lookahead: Lookahead,
+        unread: Unread,
+        completion_style: CompletionStyle,
+    ) -> Self {
         Self {
             inner,
             pending: None,
@@ -961,6 +988,7 @@ impl PasteChunkEditMode {
             pushback: VecDeque::new(),
             lookahead,
             menu_possible: false,
+            enter_dismisses_menu: matches!(completion_style, CompletionStyle::Gnu),
             unread,
         }
     }
@@ -1198,9 +1226,9 @@ impl EditMode for PasteChunkEditMode {
                 ReedlineEvent::None | ReedlineEvent::Edit(_) | ReedlineEvent::Resize(..)
             );
             // A wrapped submit arrives as its own `Multiple` (the flush
-            // event, then the dismissal+submit pair — niubash#373); splice
-            // the parts in, so a flush+submit batch stays one flat
-            // `Multiple` instead of nesting.
+            // event, then the dismissal+submit pair — niubash#373, the GNU
+            // style's shape); splice the parts in, so a flush+submit batch
+            // stays one flat `Multiple` instead of nesting.
             match translated {
                 ReedlineEvent::Multiple(inner) => events.extend(inner),
                 other => events.push(other),
@@ -1377,8 +1405,9 @@ impl PasteChunkEditMode {
             self.delegate(raw)
         };
         // A wrapped submit arrives as its own `Multiple` (dismissal Esc,
-        // then the submit Enter — niubash#373); splice the parts in, so a
-        // flush+submit batch stays one flat `Multiple` instead of nesting.
+        // then the submit Enter — niubash#373, the GNU style's shape);
+        // splice the parts in, so a flush+submit batch stays one flat
+        // `Multiple` instead of nesting.
         match translated {
             ReedlineEvent::Multiple(inner) => events.extend(inner),
             other => events.push(other),
@@ -1427,10 +1456,18 @@ impl PasteChunkEditMode {
         // every submit event (`menu_took_the_key`) — nushell's completion
         // cell, where Enter accepts the menu's selection and only a SECOND
         // Enter submits. GNU bash has no menu state at accept-line: Enter
-        // runs the line as typed, listing or not. When a menu CAN still be
-        // alive (the TAB window above), the Esc prefix dismisses it so the
-        // very same Enter submits — one Enter, bash's shape, with the
-        // committed text from the partial completion.
+        // runs the line as typed, listing or not.
+        //
+        // niubash#486: the interactive menus (column/list/ide/inline) want
+        // the first refusal — the 1.1.0 behavior, where Enter commits the
+        // highlighted candidate into the editable line — so their Enter
+        // stays bare and the engine's `MenuAccept` decides with the exact
+        // menu state. Only the GNU printed list keeps the dismissal prefix:
+        // it reports `is_active` while its list is up but has no candidate
+        // to accept, so `MenuAccept` would claim the Enter, splice nothing,
+        // and swallow the submit. Inside the TAB window the Esc prefix
+        // dismisses it so the very same Enter submits — one Enter, GNU's
+        // shape, with the committed text from the prefix completion.
         //
         // The gate is load-bearing beyond the menu: reedline 0.52 routes a
         // WHOLE `Multiple` batch to the history-search handler while a
@@ -1451,7 +1488,7 @@ impl PasteChunkEditMode {
             }
             _ => false,
         };
-        if submit_carries_enter && enter_press && self.menu_possible {
+        if submit_carries_enter && enter_press && self.menu_possible && self.enter_dismisses_menu {
             self.menu_possible = false;
             let mut events = vec![ReedlineEvent::Esc];
             match translated {
@@ -3746,7 +3783,10 @@ mod tests {
 
     /// A detector whose Enter lookahead reads a scripted queue instead of
     /// the live console. `events` model what the console input queue holds
-    /// at the moment the detector decides a bare Enter.
+    /// at the moment the detector decides a bare Enter. Built on the
+    /// product-default column completion style (niubash#486: its Enter
+    /// stays bare inside the TAB window — the engine's menu first-refusal
+    /// commits the highlighted candidate).
     fn paste_detector_with_queue(events: Vec<crossterm29::event::Event>) -> PasteChunkEditMode {
         paste_detector_and_queue(events).0
     }
@@ -3761,11 +3801,25 @@ mod tests {
         PasteChunkEditMode,
         std::sync::Arc<std::sync::Mutex<VecDeque<crossterm29::event::Event>>>,
     ) {
+        paste_detector_and_queue_for_style(events, CompletionStyle::Column)
+    }
+
+    /// [`paste_detector_and_queue`] under an explicit completion style —
+    /// the niubash#373 dismissal prefix is a GNU-style shape, so the tests
+    /// that pin it need a GNU detector (niubash#486).
+    fn paste_detector_and_queue_for_style(
+        events: Vec<crossterm29::event::Event>,
+        completion_style: CompletionStyle,
+    ) -> (
+        PasteChunkEditMode,
+        std::sync::Arc<std::sync::Mutex<VecDeque<crossterm29::event::Event>>>,
+    ) {
         use std::sync::{Arc, Mutex};
         let queue = Arc::new(Mutex::new(VecDeque::from(events)));
         let detector = PasteChunkEditMode::with_scripted_queue(
             Box::new(Emacs::new(default_emacs_keybindings())),
             queue.clone(),
+            completion_style,
         );
         (detector, queue)
     }
@@ -3774,6 +3828,13 @@ mod tests {
     /// submit, a ConPTY driver's `send_line`, an expect script).
     fn paste_detector() -> PasteChunkEditMode {
         paste_detector_with_queue(Vec::new())
+    }
+
+    /// [`paste_detector`] under the GNU completion style — the style whose
+    /// Enter inside the TAB window still carries the niubash#373 dismissal
+    /// prefix.
+    fn gnu_paste_detector() -> PasteChunkEditMode {
+        paste_detector_and_queue_for_style(Vec::new(), CompletionStyle::Gnu).0
     }
 
     fn cr() -> ReedlineRawEvent {
@@ -5032,7 +5093,8 @@ mod tests {
     }
 
     /// niubash#373 CR round: the menu-dismissal Esc rides an Enter ONLY
-    /// inside the TAB window. Outside it the Enter stays a bare
+    /// inside the TAB window, and (niubash#486) only under the GNU
+    /// completion style. Outside the window the Enter stays a bare
     /// `ReedlineEvent::Enter` — reedline 0.52 routes whole `Multiple`
     /// batches to the history-search handler while Ctrl+R is active, and
     /// that handler drops `Multiple(_)` as `Inapplicable`, so an
@@ -5040,18 +5102,25 @@ mod tests {
     /// dead key (the search match never loaded). A CONTROL chord (the
     /// Ctrl+R itself) ends the window.
     #[test]
-    fn paste_chunk_wrapper_dismissal_esc_rides_only_the_tab_window() {
+    fn paste_chunk_wrapper_dismissal_esc_rides_only_the_gnu_tab_window() {
         // No TAB since the last submit: the Enter stays bare — the shape
-        // history search (and every non-completion flow) requires.
-        let mut detector = paste_detector();
-        let event = detector.parse_event(cr());
-        assert!(
-            matches!(event, ReedlineEvent::Enter),
-            "an Enter outside the TAB window must stay bare: {event:?}"
-        );
+        // history search (and every non-completion flow) requires. True
+        // under every completion style.
+        for completion_style in [CompletionStyle::Column, CompletionStyle::Gnu] {
+            let (mut detector, _queue) =
+                paste_detector_and_queue_for_style(Vec::new(), completion_style);
+            let event = detector.parse_event(cr());
+            assert!(
+                matches!(event, ReedlineEvent::Enter),
+                "an Enter outside the TAB window must stay bare ({completion_style:?}): {event:?}"
+            );
+        }
 
-        // TAB opens the window: the follow-up Enter carries the dismissal.
-        let mut detector = paste_detector();
+        // TAB opens the window: the GNU style's follow-up Enter carries
+        // the dismissal — its printed list reports `is_active` with no
+        // selectable candidate, so a bare Enter would die in the engine's
+        // no-op `MenuAccept`.
+        let mut detector = gnu_paste_detector();
         detector.parse_event(tab());
         let event = detector.parse_event(cr());
         match &event {
@@ -5072,7 +5141,7 @@ mod tests {
 
         // A CONTROL chord ends the window without a submit: TAB, Ctrl+R,
         // Enter — the Enter belongs to the search and stays bare.
-        let mut detector = paste_detector();
+        let mut detector = gnu_paste_detector();
         detector.parse_event(tab());
         detector.parse_event(ctrl_r());
         let event = detector.parse_event(cr());
@@ -5080,5 +5149,38 @@ mod tests {
             matches!(event, ReedlineEvent::Enter),
             "a chord-cleared window must leave the search's Enter bare: {event:?}"
         );
+    }
+
+    /// niubash#486: under an interactive menu style the Enter inside the
+    /// TAB window stays BARE — reedline's `menu_took_the_key` (`MenuAccept`)
+    /// gives the open menu its first refusal and commits the highlighted
+    /// candidate into the editable line (the 1.1.0 behavior); a second
+    /// Enter then submits. The #373 wrap would dismiss the menu WITHOUT
+    /// committing — the regression this issue reports.
+    #[test]
+    fn paste_chunk_wrapper_interactive_menu_enter_stays_bare_for_the_accept() {
+        for completion_style in [
+            CompletionStyle::Column,
+            CompletionStyle::List,
+            CompletionStyle::Ide,
+            CompletionStyle::Inline,
+        ] {
+            let (mut detector, _queue) =
+                paste_detector_and_queue_for_style(Vec::new(), completion_style);
+            detector.parse_event(tab());
+            let event = detector.parse_event(cr());
+            assert!(
+                matches!(event, ReedlineEvent::Enter),
+                "inside the TAB window an interactive menu's Enter must stay bare \
+                 ({completion_style:?}) so the engine can commit the candidate: {event:?}"
+            );
+
+            // The next Enter (the committed line's submit) is bare too.
+            let event = detector.parse_event(cr());
+            assert!(
+                matches!(event, ReedlineEvent::Enter),
+                "the follow-up submit stays bare ({completion_style:?}): {event:?}"
+            );
+        }
     }
 }

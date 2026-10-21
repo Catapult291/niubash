@@ -802,6 +802,13 @@ fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
 /// follow-up input; with the partial completion the typed word's candidates
 /// commit their common prefix into the line and the Enter after the
 /// completion submits it.
+///
+/// niubash#486: the open menu gets reedline's first refusal at Enter, so
+/// the finishing text and the Enter are sent on opposite sides of a
+/// repaint — a ` text\r` burst could reach the menu while its candidate
+/// list is still stale (refreshed only at repaint) and commit instead of
+/// submitting. The echo of `tab-cmd-ok` proves that repaint ran, leaving
+/// the Enter a plain submit — the interactive shape a typist produces.
 #[test]
 fn tab_completes_command_name() {
     if !require_pty_or_skip("tab_completes_command_name") {
@@ -813,7 +820,9 @@ fn tab_completes_command_name() {
     s.send(TAB);
     // Whether the completion is inline or a menu, the buffer must end up
     // usable: finish the line and require the printf round trip.
-    s.send_line(" tab-cmd-ok");
+    s.send(" tab-cmd-ok");
+    s.expect("tab-cmd-ok");
+    s.send("\r");
     s.expect("tab-cmd-ok");
     s.expect_prompt();
 }
@@ -821,10 +830,15 @@ fn tab_completes_command_name() {
 /// TAB completes a unique file path prefix in the working directory.
 ///
 /// niubash#373 sub-item 2 (niubash#355 finding 4): un-ignored, and the
-/// assertion is the execution-level one — a single Enter after the TAB must
-/// run the COMPLETED path (unique match commits outright, like bash
-/// readline); if the suffix stayed a menu preview, `cat uniqfix` would fail
-/// and the body could never print.
+/// assertion is the execution-level one — the Enter after the TAB must run
+/// the COMPLETED path (unique match commits outright, like bash readline);
+/// if the suffix stayed a menu preview, `cat uniqfix` would fail and the
+/// body could never print.
+///
+/// niubash#486: the unique commit leaves the menu open on the re-queried
+/// set (`uniqfix.dat` answers its own completion), so the first Enter
+/// commits that highlighted candidate — the 1.1.0 menu semantics — and the
+/// second Enter submits the completed line.
 #[test]
 fn tab_completes_unique_file_path() {
     if !require_pty_or_skip("tab_completes_unique_file_path") {
@@ -835,6 +849,7 @@ fn tab_completes_unique_file_path() {
     s.wait_ready();
     s.send("cat uniqfix");
     s.send(TAB);
+    s.send("\r");
     s.send("\r");
     s.expect("uniq-file-body");
     s.expect_prompt();
@@ -858,6 +873,51 @@ fn tab_completion_empty_set_enter_still_submits() {
     s.send("\r");
     s.expect("tab373-nomatch");
     s.expect_prompt();
+}
+
+/// niubash#486 (regression vs 1.1.0): with the completion menu OPEN, Enter
+/// must commit the highlighted candidate into the editable line — not
+/// execute the partial line — and a second Enter submits. The #373
+/// dismissal prefix made the first Enter close the menu and run `cat
+/// m486-` (a "No such file" error); pinned for both interactive menu
+/// styles (`column`, the default, and `list`).
+#[test]
+fn completion_menu_enter_commits_highlighted_candidate() {
+    if !require_pty_or_skip("completion_menu_enter_commits_highlighted_candidate") {
+        return;
+    }
+    for style in ["column", "list"] {
+        let mut s = NiuSession::spawn_custom(
+            "menu-enter-486",
+            &driver::default_rc(),
+            &[("NIU_COMPLETION_STYLE".to_string(), style.to_string())],
+            (120, 30),
+            DEFAULT_TIMEOUT,
+        );
+        // Two candidates sharing the typed prefix, same body in both so the
+        // executed output does not depend on which candidate the menu
+        // highlights first.
+        std::fs::write(s.start().join("m486-one.txt"), "m486-body\n").unwrap();
+        std::fs::write(s.start().join("m486-two.txt"), "m486-body\n").unwrap();
+        s.wait_ready();
+        s.send("cat m486-");
+        s.send(TAB);
+        // The menu is visibly up — its grid carries the candidates (styled
+        // cells split the file names at the common prefix, so the needle is
+        // the suffix). Without this the Enter below could race a
+        // still-settling completion and read as flake rather than the
+        // pinned commit-or-submit contract.
+        s.expect("one.txt");
+        // The commit Enter: the candidate lands in the line and NOTHING
+        // executes — no file body, no partial-line `cat m486-` error.
+        s.send("\r");
+        s.expect_absent("m486-body", ABSENT_WINDOW);
+        s.expect_absent("No such file", ABSENT_WINDOW);
+        // The second Enter submits the committed line.
+        s.send("\r");
+        s.expect("m486-body");
+        s.expect_prompt();
+    }
 }
 
 /// The session history survives into `~/.niubash_history` and `history`
