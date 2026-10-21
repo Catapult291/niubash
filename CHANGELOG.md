@@ -8,6 +8,34 @@ All notable changes to Niubash are documented in this file.
 
 - Upgrades now reconcile the bundled package shims (`winuxcmd\usr\bin\gawk.exe`, `awk.exe`): `wpm links rebuild` cannot reach them on a bundled install because the product ships no `.wpm` state, so replacing `winuxcmd.exe` left those names on the previous image — the 1.4.1 stale `awk.exe`/`gawk.exe` residue of #468. The installer runs `niu --relink-bundled-shims --force` after the wpm rebuild, and shell-startup activation runs the same reconcile: missing or stale declared names are parked and relinked to the current `winuxcmd.exe`, extracted copies are upgraded to real hardlinks, and names owned by the machine's own `.wpm` state (e.g. a user `wpm install awk`) are never touched.
 
+## [1.4.3] - 2026-10-21
+
+Release fixing the interactive gather wedge (P1), converging bare-drive behavior, hardening installer guards, and upgrading the vendored bash engine to patch 20. Carries WinuxCmd v1.1.19 (gawk BINMODE argv-prefix adapter) and the rubash 1.4.2 engine.
+
+### Fixed
+
+- Interactive multi-line groups no longer wedge the REPL: a stray `)` inside an open group now ends the gather with a single GNU-style diagnostic and rc 2, returning to the prompt (engine reader rubash#955 + host repl niubash#484; #482).
+- Bare drive designators (`D:`, `cd D:`) now converge on the engine dispatch across the host fast path, grouped route, and piped `niu -i` (rubash#953; #481, #483).
+- `unset` of an inherited environment name now clears the process-env copy (9-probe matrix realigned to GNU; #943 rework of #917).
+- Marker-zone literals in `-c` operands pass through verbatim — the respawn exclusion is double-escape only (rubash#952; #948).
+- `find_user_command`'s Windows listing negative cache now invalidates when candidate files appear, so newly installed commands are immediately visible (rubash#951).
+
+### Added
+
+- Launcher accepts `-EncodedCommand` and `--ec` spellings for the verbatim base64 handoff, with `v1:` rewrite-guard semantics preserved across all spellings (niubash#477).
+- `niu --help` and `--version` close with the unixwin portal lines (niubash#490).
+
+### Security / hardening
+
+- Installer-surface guards: constant-fold coverage for `{syswow64}`/`{sysnative}`/`{autocf}`, `{sys}` name-boundary enforcement, and mutation vectors pinned by test (niubash#472).
+- The staged gawk pipeline gate now asserts raw output bytes — LF contract is enforced by the gate once WinuxCmd ships the BINMODE adapter (niubash#479).
+
+### Engine
+
+- Vendored bash upgraded from Bash-5.3 patch 15 to **patch 20** (rubash#957): readline multibyte prompt redraw (17), long-prompt crash fix (18), high-byte identifier guard (19), SIGWINCH prompt recompute (20), macOS pipe sizing (16).
+- Marker-boundary divergences closed: E400-aware sentinel decode family for marker output (rubash#947, #840) and catalogue batches with an exhaustiveness gate (rubash#944, #746).
+- Environment: `export`/`unset` per-op cost reduction (rubash#943 env fast-path family).
+
 ## [1.4.2] - 2026-10-20
 
 Release addressing P0 transient console window pop-ups across WinuxCmd shims, rubash child spawns, and niubash runtime helpers, plus the v1.4.1 golden-journey release audit fixes.
