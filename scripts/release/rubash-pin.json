@@ -1,12 +1,10 @@
 {
   "schema": 1,
-  "rubash_rev": "a83a09d32b4a4f953d29af0acc0e781b542206b8",
-  "rubash_version": "1.4.1",
-  "description": "Rubash source pin for niubash releases (rubash#827, conclusion B). Every release job fetches exactly this rubash commit into ../rubash -- where the [patch] path override in Cargo.toml deterministically picks it up -- and fails the release unless the checked-out HEAD equals rubash_rev. This is the source-level twin of winuxcmd-pin.json (niubash#312/#327): the bundled WinuxCmd was already pinned, but the compiled engine was 'whatever rubash master HEAD was at build time'.",
+  "rubash_rev": "25b0850df24fd28260715128c000b7b3d895ae24",
+  "rubash_version": "1.4.2",
+  "description": "Rubash source pin for niubash releases (rubash#827, conclusion B). Every release job fetches exactly this rubash commit into ../rubash -- where the [patch] path override in Cargo.toml deterministically picks it up -- and fails the release unless the checked-out HEAD equals rubash_rev. This is the source-level twin of winuxcmd-pin.json (niubash#312/#327): the bundled WinuxCmd was already pinned, but the compiled engine was \"whatever rubash master HEAD was at build time\".",
   "notes": [
-    "Recorded from rubash master HEAD a83a09d32b4a4f953d29af0acc0e781b542206b8 (2026-10-20, Cargo.toml version 1.4.1) — includes rubash#909 (child spawn console suppression when parent has no visible console) and rubash#911 (preserve argv[0]-marked login_shell shopt across reset_shell_options).",
-    "NOTE: the rev includes #863 — rubash's own Cargo.lock self-entry must be 1.4.1 or the release build's --locked cargo calls (bash shim) fail inside the pinned clone.",
-    "Bumping the pin is a deliberate release decision: update rubash_rev and rubash_version together.",
-    "verify with: python scripts/release/verify-rubash-pin.py --fetch-self-test"
+    "Recorded from rubash master 25b0850d (2026-10-21, Cargo.toml version 1.4.2) — includes #939 (build provenance stamp), #946/#947/#944 (marker/fd/catalogue families), #953/#952 (bare-drive + -c escaping), #955+#484 chain (gather wedge P1), #957 (vendored bash patch 20), #943 (env unbind inherited-name fix), #925-#927 (perf + test matrices).",
+    "NOTE: the rev includes #863-era lock self-entry discipline; rubash Cargo.toml version 1.4.2 must match this pin's rubash_version."
   ]
 }
