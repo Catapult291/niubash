@@ -31,7 +31,11 @@ prompt, and a permission-modeled plugin system. Git comes from
 [niu-git](https://github.com/unixwin/niu-git): the real git-for-windows C
 source built with MSVC, so the `git` on PATH *is* the git binary — no MSYS
 runtime, no launcher hop, no bundled perl. `git --version` starts in **~14
-ms** where Git Bash's `git` takes 45-103 ms, and the shell-script parts of
+ms** (13.7 ms avg / 11.5 ms min measured; `git status` 22.6 ms) where Git
+Bash's `git` takes 45-103 ms
+([niu-git#12](https://github.com/unixwin/niu-git/pull/12),
+[niubash#374](https://github.com/unixwin/niubash/pull/374)), and the
+shell-script parts of
 git (hooks, `git bisect`, `git mergetool`) run on niubash's own `sh`. Agents
 launched from a niu session inherit it as their shell through `SHELL`; see
 [Coding agents on Windows](docs/src/agents.md) for which shell each agent runs
@@ -55,10 +59,15 @@ honest status of every target, lives in
 
 "Smoke-gated" means the artifact is built, then run on its own OS against
 four checks (`--version`, `-c` execution, a pipeline through native
-coreutils, the offline plugin stack) before upload. Android and OpenHarmony
-have not passed that gate: Android artifacts are build-verified only,
-OpenHarmony is compile-checked only, and neither claims device readiness.
-The per-platform contract and the full status matrix live in
+coreutils, the offline plugin stack) before upload — the gate lives in
+`release.yml` ("no smoke, no artifact": Linux legs run it natively on
+`ubuntu-22.04`/`ubuntu-22.04-arm`, the macOS x86_64 leg under Rosetta 2),
+and the release as a whole additionally blocks on the golden user journey
+and the per-asset timing budget gates. Android and OpenHarmony have not
+passed that gate: Android artifacts are build- and link-verified only (an
+ELF shape check, explicitly not a runtime smoke), OpenHarmony is
+compile-checked only, and neither claims device readiness. The
+per-platform contract and the full status matrix live in
 [platform-support.md](docs/src/platform-support.md).
 
 Quick answers:
@@ -69,7 +78,8 @@ Quick answers:
 - **What platforms does niu run on?** Released builds cover Windows (x64,
   ARM64), Linux (x86_64, aarch64; glibc 2.35+), and macOS (aarch64,
   x86_64). Android (aarch64, armv7) and OpenHarmony (aarch64) build in CI
-  and have no release yet.
+  and have no release yet; Android additionally carries a measured
+  performance baseline (see [Performance](#performance)).
 - **Does niu run real Bash scripts?** Yes. The rubash engine is gated on
   GNU Bash's own upstream test suites; the record lives in the
   [compatibility matrix](docs/src/rubash-bash-compat-matrix.md).
@@ -107,8 +117,83 @@ budget is a hard fail). The
 [release pipeline](.github/workflows/release.yml) runs the `perfbudget`
 gate and fails the release on a breach; a nightly run watches the trend.
 
-The GNU Bash upstream golden-suite record belongs here too; it returns
-once the fix currently in flight lands.
+The GNU Bash upstream golden-suite record lives with the engine: the
+[rubash README](https://github.com/unixwin/rubash#readme) carries the
+ledger (83/83 upstream suites on the 2026-10-12 full re-run), and rubash
+CI replays the upstream corpus on Linux on every push (the "Bash upstream
+test progress" job, `scripts/run-bash-upstream-tests.sh`).
+
+## Performance
+
+Every number below is pinned to the issue or PR that measured it, and the
+tests or gates that keep it honest are named.
+
+**Windows spawn cost — one hidden console per session, not per child.** A
+console-less session (direct `niu -c`, detached, CI) used to pay a hidden
+console allocation on every external spawn, ~22 ms per child (design and
+shape in [niubash#462](https://github.com/unixwin/niubash/issues/462)).
+The fix landed engine-side
+([rubash#913](https://github.com/unixwin/rubash/pull/913)): a windowless
+console is pre-allocated once on Windows 11 24H2+/Server 2025
+(`AllocConsoleWithOptions`), or adopted from the first `CREATE_NO_WINDOW`
+child (`AttachConsole`) on older builds, so an entire `niu -c 'a; b; c'`
+tree pays at most one allocation and later spawns inherit it. 14
+regression tests pin zero visible windows and the scaling behavior
+(rubash `tests/console_window_gate.rs`).
+
+**`$(tput …)` terminal queries answered in-process.** The inline tput
+whitelist arm ([rubash#884](https://github.com/unixwin/rubash/pull/884))
+answers admitted TERM×capability shapes in-process, byte-equal to GNU
+ncurses (269-row differential matrix, diff = 0; 8 regression tests). On
+the ticket probe — 64 tput calls through command substitution — wall time
+fell 1165 ms → 47 ms (~25x, zero spawns). The winuxcmd-side twin removed
+the ~17 ms per-call i18n overhead in the real binary (~0.4 ms in-process
+after the fix; 3208-row replay byte-identical:
+[WinuxCmd#1269](https://github.com/unixwin/WinuxCmd/pull/1269)). The other
+harvest SLOW face — `read` on EOF, ~4.8 s/call — is still open on
+[rubash#800](https://github.com/unixwin/rubash/issues/800).
+
+**Engine hot paths** (the embedded [rubash](https://github.com/unixwin/rubash)
+engine; each fix carries its measured delta and GNU differential battery):
+
+- Multi-word literal command fast path: `[ 1 -eq 2 ]` ×20k ≈177→155 ms
+  ([rubash#967](https://github.com/unixwin/rubash/pull/967)).
+- `[[ ]]` direct numeric leaf + decimal fast path: 50k `[[ 1 -eq 2 ]]`
+  1.41x→1.10x vs GNU
+  ([rubash#966](https://github.com/unixwin/rubash/pull/966)).
+- Whitelist-skip of the procsub metadata scan: 1.56x→1.39x (~11%)
+  ([rubash#974](https://github.com/unixwin/rubash/pull/974)).
+- Decimal-subscript array write lane: interleaved 8k 3.65x→3.16x; also
+  fixes a real double side-effect in `a[$((i++))]=v`
+  ([rubash#959](https://github.com/unixwin/rubash/pull/959)).
+- Case: head-only `$BASH_COMMAND` render: 20-arm ×10k −10%, plus the
+  divergence fix ([rubash#958](https://github.com/unixwin/rubash/pull/958)).
+
+The interpreter triage behind that wave is closed with numbers: scalar
+assignment ~1.06x GNU (rubash#609 → #672/#678), arithmetic loops and
+parameter expansion via rubash#607/#608 (#665/#671/#679, #666), and the
+O(n²) array element write became O(1) amortized (rubash#618/#616:
+associative 5000-key writes 445x→9.9x vs GNU, indexed 736x→3.8x; the
+ledger lives in rubash's `docs/performance.md`). The export/unset
+fast-lane family has landed (#917/#918/#920, reworked for correctness in
+#943); [rubash#916](https://github.com/unixwin/rubash/issues/916) stays
+open on the residual.
+
+**Android baseline — measured, honest, not yet re-measured.** On a Termux
+aarch64 tablet, niubash 1.4.0 vs GNU bash 5.3.20
+([niubash#352](https://github.com/unixwin/niubash/issues/352), full
+method and matrix in the issue): interpreter-bound workloads 2.3-3.7x
+slower (up to 7.3x on `${x^^}` itself), `niu -c true` 21.1 ms vs bash's
+8.3 ms (median of 30), peak RSS 2.2x — while fork-bound workloads run up
+to 5.2x faster and a real mkdir/write/read-back script 2.1x faster. The
+engine-side root causes were fixed and closed (rubash#607-609) and the
+wrapper's one-shot startup gap closed too
+([niubash#351](https://github.com/unixwin/niubash/issues/351):
+`niu -c true` 15 ms vs bash 13 ms after the fix, zero tput spawns).
+[niubash#349](https://github.com/unixwin/niubash/issues/349) is the
+original ~2.1x arithmetic/function datapoint. No post-fix re-measure on
+Android hardware exists yet — #352 stays open for that re-run, and the
+Android leg still ships build-verified only.
 
 ## Quick start
 
