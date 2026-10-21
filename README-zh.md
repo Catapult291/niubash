@@ -11,6 +11,8 @@
 
 [English](README.md) · [中文](README-zh.md)
 
+文档与下载：[unixwin.dev](https://unixwin.dev)
+
 [![niubash CI](https://github.com/unixwin/niubash/actions/workflows/ci.yml/badge.svg)](https://github.com/unixwin/niubash/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/unixwin/niubash)](https://github.com/unixwin/niubash/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue)](https://github.com/unixwin/niubash)
@@ -79,6 +81,8 @@ dotfiles 里加载 nvm.sh 的链路也走同一套 harness，分相计时在案
 GNU Bash 上游 golden 套件的实测记录也属于这里；等手上的修复落地，它就回来。
 
 ## 快速开始
+
+下载统一从 [unixwin.dev](https://unixwin.dev) 进入。
 
 Windows：去 [Releases](https://github.com/unixwin/niubash/releases) 下载
 `niubash-v*-win-*-setup.exe` 双击——不要管理员权限，PATH 和 Windows

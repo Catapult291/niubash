@@ -12,6 +12,8 @@
 
 [English](README.md) · [中文](README-zh.md)
 
+Docs & downloads: [unixwin.dev](https://unixwin.dev)
+
 [![niubash CI](https://github.com/unixwin/niubash/actions/workflows/ci.yml/badge.svg)](https://github.com/unixwin/niubash/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/unixwin/niubash)](https://github.com/unixwin/niubash/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue)](https://github.com/unixwin/niubash)
@@ -109,6 +111,8 @@ The GNU Bash upstream golden-suite record belongs here too; it returns
 once the fix currently in flight lands.
 
 ## Quick start
+
+All downloads start at [unixwin.dev](https://unixwin.dev).
 
 Windows: grab `niubash-v*-win-*-setup.exe` from
 [Releases](https://github.com/unixwin/niubash/releases) and run it — no
