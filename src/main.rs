@@ -1756,6 +1756,12 @@ fn print_usage() {
     println!("  BASH_ENV=<file>         GNU bash compatible: same as NIU_ENV, lower precedence.");
     println!("  NIU_LANG=<lang>         Setup wizard language (zh / en). Falls back to the");
     println!("                          Windows UI language, then LC_ALL/LANG.");
+    println!();
+    // GNU --help convention: the portal lines close the output (bash ends its
+    // --help with "bash home page: <…>"). Kept identical to the --version
+    // tail so both launcher faces name the same home.
+    println!("Home: <https://unixwin.dev>");
+    println!("Docs & downloads: <https://unixwin.dev>");
 }
 
 fn run_plugin_command(args: &[String]) -> anyhow::Result<()> {
@@ -4470,6 +4476,10 @@ fn print_version() {
     if let Some(v) = niubash_runtime::winuxcmd::version() {
         let _ = writeln!(out, "  winuxcmd {}", v);
     }
+    // Same portal lines as the --help tail (GNU home-page convention);
+    // keep the two faces identical.
+    let _ = writeln!(out, "Home: <https://unixwin.dev>");
+    let _ = writeln!(out, "Docs & downloads: <https://unixwin.dev>");
 }
 
 /// Format the embedded rubash revision. The `git ` prefix is only truthful
