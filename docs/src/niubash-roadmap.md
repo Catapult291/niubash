@@ -10,26 +10,33 @@ Niubash is a Windows-native, non-isolated Bash-compatible shell for humans and
 agents.
 
 ```text
-niubash = rubash + winuxcmd + reedline + oh-my-niu
+niubash = rubash + winuxcmd + reedline + the external bash ecosystem
 ```
 
 ## Done
 
-- `rubash` is embedded as the shell language engine.
+- `rubash` is embedded as the shell language engine, pinned to verified
+  upstream commits (v1.4.3 vendors the Bash-5.3 patch-20 surface).
 - WinuxCmd command links provide bundled Unix-style commands through PATH.
 - The REPL uses reedline for editing, history, menus, autosuggestions, syntax
   highlighting, vi/emacs modes, and prompt rendering.
-- `~/.niubashrc` is the primary interactive startup file.
-- `~/.winshrc` is an old fallback only when `~/.niubashrc` is absent.
-- Plugin CLI decisions, permissions, bundle versions, tests, and advanced
-  overrides are maintained as internal managed state, not user configuration.
+- `~/.niubashrc` is the primary — and only — interactive startup file; the
+  legacy `~/.winuxshrc`/`~/.winshrc`/`~/.bashrc` names are never read.
+- The plugin system is the external bash ecosystem: real sources
+  (oh-my-bash, bash-it, bash-completion, wild git repos) installed over
+  `git clone`, gated by an explicit trust protocol, driven by the declarative
+  manifest `~/.niubash/plugins.toml`, and activated through the generated
+  loader `~/.niubash/generated/plugins.niu` — no verb writes the user rc
+  (niubash#359, v1.4.2).
 - Plugin inventory, review, doctor, enable/disable, update, and rollback
-  surfaces exist.
-- `oh-my-niu` is the official bundled plugin distribution.
+  surfaces exist, plus a ~540-row recipe index and collections
+  (`niu plugin distro`).
 - Git completions, Git prompt status, prompt templates, and p10-style segment
   presets are available.
 - Host contract tests cover cwd, env, stdin, stdout/stderr, script args,
   command-mode parsing, and exit-code propagation.
+- Released and smoke-gated beyond Windows: Linux (x86_64, aarch64) and macOS
+  (aarch64, x86_64) portable builds ship beside the Windows installer.
 
 ## Current Direction
 
@@ -43,20 +50,23 @@ niubash = rubash + winuxcmd + reedline + oh-my-niu
 - Keep prompt layout user/theme owned. Providers such as native Git status or
   Starship-backed Git supply segment data; they do not replace the whole prompt
   unless the selected theme chooses that layout.
-- Keep third-party integration on reviewed source packs and explicit process
+- Keep third-party integration on reviewed sources and explicit process
   adapters until a real host API justifies another runtime.
 
 ## Near-Term Work
 
-- Normalize first-party pack manifests around exports and permissions.
-- Move more alias/completion/theme assets from compiled fallback into the
-  bundled `oh-my-niu` distribution.
+- Grow the source coverage of the plugin ecosystem: more catalog managers,
+  recipes, and collections riding the manifest + generated-loader plane.
+- Land the remaining agent-facing installer paths named in
+  [agents.md](agents.md#recommended-order-of-work) — persisted `SHELL`,
+  `niu setup agents`, and an accepted opt-in elevated task for the Git Bash
+  convention slot.
+- Re-measure the Android baseline post-fix (niubash#352) and move the Android
+  leg from build-verified toward smoke-gated.
 - Split prompt responsibilities clearly:
   - theme owns layout and connective text;
   - prompt-core renders templates;
   - Git/Starship providers supply data for `{git}` and related tokens.
-- Add regression tests for installed bundle startup, prompt provider selection,
-  and missing external binaries.
 - File and fix WinuxCmd command issues separately from rubash language issues.
 
 ## Verification
@@ -73,7 +83,9 @@ niubash = rubash + winuxcmd + reedline + oh-my-niu
 - License: MIT.
 - `rubash` follows latest `unixwin/rubash` master.
 - WinuxCmd stays integrated through PATH injection and command links.
-- `~/.niubashrc` is the normal user-authored interactive config.
+- `~/.niubashrc` is the normal user-authored interactive config — and the
+  only rc file the shell reads.
 - Machine-managed state is not a human-authored configuration surface.
-- `oh-my-niu` is the official bundle, not a fork of another shell
-  framework.
+- The official plugin story is the upstream ecosystem itself — oh-my-bash,
+  bash-it, bash-completion — installed under the trust protocol, never
+  vendored into the product.

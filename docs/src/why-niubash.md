@@ -157,9 +157,10 @@ documentation of that fact.
 The correct architecture is not a better emulator. It is no emulator: a
 native implementation where the Windows path is the only representation
 that exists, where Bash is implemented as a language — and proven against
-GNU Bash's own 83-suite upstream test corpus (82 suites byte-identical as
-of the 2026-09-25 ledger re-run, with the single nameref residual
-individually audited — see the [rubash compatibility
+GNU Bash's own 83-suite upstream test corpus (83/83 suites pass on the
+2026-10-12 full ledger re-run: 62 byte-identical on Windows, 20
+environment-attributed, and the single nameref residual proven to be GNU
+Bash's own coproc race — see the [rubash compatibility
 ledger](https://github.com/unixwin/rubash#compatibility-at-a-glance)) — and
 where native programs are called as
 what they are: native. That is what niubash ships, and it is why the

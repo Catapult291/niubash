@@ -10,6 +10,7 @@
 - [Hooks](hooks.md)
 - [Install & Self-Update](installer.md)
 - [Bash Compatibility Matrix](rubash-bash-compat-matrix.md)
+- [Performance](performance.md)
 - [Built-ins & Fast Paths](builtins.md)
 - [Architecture](architecture.md)
 - [Windows Path Contract](windows-path-contract.md)

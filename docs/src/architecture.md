@@ -1,11 +1,14 @@
 # Niubash v2 Architecture
 
-> A Windows-native, Bash-compatible terminal built on rubash + winuxcmd
+> A native, Bash-compatible shell built on rubash + winuxcmd — Windows flagship,
+> Linux and macOS shipped beside it
 
 ## Positioning
 
-Niubash is a Windows-native, non-isolated, Bash-compatible terminal for both
-humans and agents. It does **not implement the shell language itself** — it is
+Niubash is a native, non-isolated, Bash-compatible shell for both
+humans and agents — released for Windows (x64, ARM64), Linux (x86_64,
+aarch64), and macOS, with Windows the flagship. It does **not implement the
+shell language itself** — it is
 the interactive front end to the **rubash lib** (the bash-compatible engine)
 plus the routing layer onto **winuxcmd** (coreutils). Its core value is the
 Windows-native process/environment experience: a reedline REPL, the
@@ -13,9 +16,9 @@ completion system, the prompt floor, Ctrl+C handling, terminal integration,
 and a stable non-interactive agent execution contract.
 
 Niubash is not an MSYS2, Git Bash, Cygwin, or WSL-style isolated
-environment. `~` points at the normal Windows user home (`USERPROFILE` /
+environment. `~` points at the normal user home (`USERPROFILE` /
 `dirs::home_dir()`); `PATH`, cwd, env, stdout, stderr, and exit codes are
-ordinary Windows process state.
+ordinary host process state.
 
 ## Three-layer architecture
 
@@ -106,18 +109,20 @@ differentiators.
 - `~/.niubashrc` is the primary interactive entry point. Plain
   niubash/bash syntax declares plugin lists, theme, prompt template,
   `export`, `alias`, functions, and local startup logic.
-- `~/.winshrc` is the compatibility fallback; it is read as the legacy user
-  rc only when `~/.niubashrc` does not exist.
-- Machine state — plugin CLI enable/disable records, permissions, source
-  registry/trust state, legacy managed blocks, test isolation, completion
+- `~/.niubashrc` is also the **only** entry point: the legacy `~/.winuxshrc`,
+  `~/.winshrc`, and `~/.bashrc` names are never read, migrated, or written —
+  a session without `~/.niubashrc` starts with the defaults.
+- Plugin activation is a derived plane, not an rc edit (niubash#359): the
+  manifest (`~/.niubash/plugins.toml` + `~/.niubash/sources/registry.toml`)
+  drives the generated loader `~/.niubash/generated/plugins.niu`, which the
+  host sources read-only before the user rc. No `niu plugin` verb writes
+  `~/.niubashrc`.
+- Machine state — the plugin manifest, source registry/trust state, the
+  generated loader, test isolation, completion
   directories — is maintained by the internal managed-state mechanism and is
   not a user configuration entry point.
-- When `~/.niubashrc` exists, it is the single entry point for sourcing
-  plugins/frameworks; the host no longer silently sources the official
-  source plugins a second time from managed-state defaults, avoiding double
-  entry points and duplicate prompt/git-state refreshes.
 - Plain `niu -c`, script files, and stdin scripts stay quiet and
-  deterministic: no interactive rc, no source plugins.
+  deterministic: no interactive rc, no generated loader, no source plugins.
 
 The design principle is to minimize user-visible entry points: users edit
 `~/.niubashrc` day to day; machine state is maintained by Niubash itself and
@@ -153,11 +158,10 @@ packages stage no plugin content (niubash#161). The plugin system is the
 ```text
 niubash/
 ├── Cargo.toml
-├── LICENSE                   # GPL-3.0-or-later
+├── LICENSE                   # MIT
 ├── README.md / README-zh.md
-├── .niubashrc                 # primary interactive user entry
-├── .winshrc                   # legacy fallback rc
-├── managed state              # internal machine-managed state
+├── .niubashrc                 # primary interactive user entry (~/)
+├── managed state              # internal machine-managed state (~/.niubash/)
 ├── crates/
 │   └── niubash-runtime/
 │       ├── Cargo.toml
@@ -215,7 +219,7 @@ user types "ls -la | grep foo"
 | Completion | src/completion/ | fully preserved, migrated |
 | Themes | theme.rs (8 themes) | built-in stack retired (niubash#145); themes come from external sources |
 | Plugins | Plugin trait + Oh-My-Niubash | external bash ecosystem as sources (add/trust/enable; no bundles) |
-| License | MIT | GPL-3.0-or-later |
+| License | MIT | MIT |
 
 ## Version planning
 
@@ -227,10 +231,14 @@ user types "ls -la | grep foo"
 - v3: the external-ecosystem plugin system — first-party packs replaced by
   real upstream sources (oh-my-bash, bash-it, bash-completion, wild
   plugins) under the trust protocol; the `oh-my-niu` bundle format was
-  retired along the way (niubash#145/#161)
-- Non-goals: Linux/macOS native shell products; rubash itself is reusable
-  across platforms, but the niubash product targets Windows
+  retired along the way (niubash#145/#161). Activation moved off the user rc
+  in 1.4.2: the manifest drives a generated loader at
+  `~/.niubash/generated/plugins.niu` (niubash#359).
+- Shipping beyond Windows is no longer a non-goal: Linux and macOS portable
+  builds are released and smoke-gated beside the Windows installer (see
+  [Platform Support](platform-support.md)); Android and OpenHarmony remain
+  incubating CI targets.
 
 ---
 
-*Last updated: 2026-09-08*
+*Last updated: 2026-10-22*

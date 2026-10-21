@@ -47,6 +47,14 @@ spec `~/.niubash/plugins.toml` — the single source of truth for what is
 declared; `niu plugin sync` reconciles the spec with what is installed,
 and `niu plugin update <id>` (no id = all) moves sources to their ref tips.
 
+What activation writes is never your rc (niubash#359, v1.4.2): every mutating
+verb regenerates `~/.niubash/generated/plugins.niu` — a deterministic,
+validate-then-publish loader the host sources read-only before
+`~/.niubashrc`, so user rc lines win. `NIU_PLUGIN_LOADER=off` disables
+loading; legacy `# >>> niu source` managed blocks left in an old rc keep the
+loader off until you remove them (`niu plugin migrate-rc --diff` diagnoses —
+it never edits the rc either).
+
 ### Imperative mode → adoption (1.3.1)
 
 A machine with installed sources but no spec is in *imperative mode*: the
@@ -130,9 +138,10 @@ When the picked collection installs a theme-bearing source (`recommended`/
 out of the box. The gallery lists trusted sources only, so the flow first
 asks a single trust question (the wizard's phrasing of
 `niu plugin trust`, same checksum tier); answering it lists the fresh
-source's themes, and the pick lands in the rc through the same guarded
-block a later `niu plugin enable <theme>` writes, journaled with its own
-undo line. Declining (or Esc) changes nothing — the run prints the exact
+source's themes, and the pick lands through the same manifest +
+generated-loader path a later `niu plugin enable <theme>` uses, journaled
+with its own undo line. Declining (or Esc) changes nothing — the run prints
+the exact
 `niu plugin trust <id>` command plus the re-run/enable follow-up instead.
 
 ## Tools: package-manager recommendations

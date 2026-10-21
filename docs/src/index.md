@@ -24,9 +24,10 @@ C:\Program Files
 - **Bash syntax.** `if`, `for`, `case`, `$(...)`, pipes, redirects, heredocs,
   functions, aliases — the whole grammar, powered by
   [rubash](https://github.com/unixwin/rubash), which is gated on the GNU Bash
-  project's own 83-suite upstream test corpus (**82 of 83 suites
-  byte-identical, per the 2026-09-25 ledger re-run**; the one residual,
-  nameref, is individually audited — see the [rubash compatibility
+  project's own 83-suite upstream test corpus (**83 of 83 suites pass, per the
+  2026-10-12 full re-run**: 62 byte-identical on Windows, 20 differing only on
+  environment-bound lines, and the one nameref residual proven to be GNU
+  Bash's own coproc reap-timing race — see the [rubash compatibility
   ledger](https://github.com/unixwin/rubash#compatibility-at-a-glance)).
 - **Windows-native.** One binary, one process. Native Windows paths
   (`C:\...` and `C:/...`), direct execution of `git.exe`, `node.exe`,
@@ -49,13 +50,15 @@ C:\Program Files
   stdout/stderr, exact exit-code propagation. What an agent writes is what
   the process receives — the quoting roulette of PowerShell and the path
   mangling of MSYS/Git Bash are both gone.
-- **A prompt you'll enjoy.** 27 bundled themes (agnoster, spaceship, pure,
-  catppuccin-mocha, tokyonight, p10 family, ...), a git prompt that grows
-  teeth inside any repository, syntax highlighting, autosuggestions, vi and
-  emacs modes, and Ctrl+R history search.
-- **Plugins with a permission model.** 40+ bundled packs (`git`, `docker`,
-  `kubectl`, `npm`, `zoxide`, `direnv`, `fzf`, `thefuck`, ...), with reviewed
-  source packs and process adapters declaring the host access they need.
+- **A prompt you'll enjoy.** The real theme ecosystems — oh-my-bash's and
+  bash-it's catalogs (agnoster, spaceship, pure, the p10 family, ...) — plus a
+  git prompt that grows teeth inside any repository, syntax highlighting,
+  autosuggestions, vi and emacs modes, and Ctrl+R history search.
+- **The bash ecosystem as the plugin system.** oh-my-bash, bash-it,
+  bash-completion and any git source install through `niu plugin` under an
+  explicit trust review — nothing is sourced until you say so. A ~540-row
+  recipe index (`niu plugin recipe list`) covers themes, plugins, aliases,
+  completions and prompt tools.
 
 ## The documentation
 
@@ -65,6 +68,7 @@ C:\Program Files
 | [Advanced Usage](advanced-usage.md) | Execution modes, startup files, themes, plugins, completion, debugging |
 | [Install & Self-Update](installer.md) | Installer, portable zip, Windows Terminal profile, updates |
 | [Bash Compatibility Matrix](rubash-bash-compat-matrix.md) | What Bash surface is verified, layer by layer |
+| [Performance](performance.md) | Every number pinned to the issue or PR that measured it |
 | [Built-ins & Fast Paths](builtins.md) | All 64 built-ins, fast-path fallbacks, WinuxCmd overlap |
 | [Architecture](architecture.md) | rubash + WinuxCmd + reedline, path model, host contract |
 | [Windows Path Contract](windows-path-contract.md) | logical root, dispatcher selection, and layer ownership |

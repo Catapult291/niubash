@@ -11,7 +11,7 @@ belongs in rubash or in the Niubash host layer.
 | --- | --- | --- |
 | Local compat fixtures | Focused Niubash binary tests for common bash semantics that depend on rubash plus winuxcmd command links. | `CARGO_TARGET_DIR=target/codex-verify-phase17 cargo test --test compat --locked -- --ignored` passed 18/18 on 2026-07-31. |
 | Host contract tests | Windows process, cwd, stdin, script, env, and stdio behavior around rubash execution. | Covered by `tests/host_contract.rs`; full workspace test passed in the Phase 16 verification run. |
-| GNU Bash upstream local gate | Broader upstream bash fixture from a sibling rubash checkout, intentionally local-only and not vendored. | `docs/planning/bash-upstream-local.md` records the Niubash local gate; the current rubash upstream ledger is the rubash README "Compatibility at a Glance" section: 83 suites, 82 pass, 1 residual (nameref), re-run 2026-09-25 on rubash master 71c933eb. |
+| GNU Bash upstream local gate | Broader upstream bash fixture from a sibling rubash checkout, intentionally local-only and not vendored. | `docs/planning/bash-upstream-local.md` records the Niubash local gate; the current rubash upstream ledger is the rubash README "Compatibility at a Glance" section: **83/83 suites pass** on the 2026-10-12 full re-run (rubash master 764b9dde) — 62 byte-identical stdout on Windows, 20 environment-attributed, and the nameref suite's single residual line proven to be GNU Bash's own coproc reap-timing race. rubash CI also replays the upstream corpus on Linux on every push. |
 
 ## Focused Compat Fixtures
 

@@ -137,10 +137,12 @@ hello() {
 one-shot REPL command path. It does not run for `niu -c ...`, script files,
 or stdin script execution, so agent and CI surfaces stay deterministic.
 
-`~/.winshrc` is a legacy compatibility fallback and is used only when
-`~/.niubashrc` is absent. Plugin CLI enable/disable records, migration blocks,
-completion overrides, test isolation, and advanced machine state are managed
-internally. Prefer `~/.niubashrc` for normal interactive customization.
+`~/.niubashrc` is the **only** startup file niu reads. The legacy
+`~/.winuxshrc`, `~/.winshrc`, and `~/.bashrc` files are never sourced,
+migrated, or modified — a session that finds no `~/.niubashrc` simply starts
+without one. Plugin enable/disable state, the source registry, and other
+machine state live under `~/.niubash/` and are managed by `niu plugin`, not
+by editing files.
 
 ## 6b. Prompts and themes
 
@@ -171,16 +173,22 @@ they ship runs until you review and trust them:
 ```sh
 niu plugin add oh-my-bash     # install from the catalog (untrusted)
 niu plugin trust oh-my-bash   # review, then pass the execution gate
-niu plugin enable oh-my-bash  # writes a guarded loader block into ~/.niubashrc
-niu plugin enable agnoster    # a theme asset -> sets OSH_THEME in that block
-niu plugin disable oh-my-bash # removes the block; the built-in floor returns
+niu plugin enable oh-my-bash  # records the source in the manifest
+niu plugin enable agnoster    # a theme asset -> OSH_THEME in the loader
+niu plugin disable oh-my-bash # manifest updated; the built-in floor returns
 ```
 
-`niu plugin enable/disable` maintains one managed block per source between
-`# >>> niu source <id>` / `# <<< niu source <id>` markers at the end of
-`~/.niubashrc`; everything outside the markers is yours and is never
-rewritten. Use `niu plugin list` and `niu plugin discover` for the current
-inventory and state.
+Since the niubash#359 rework (v1.4.2), **plugin verbs never write your rc**.
+What `enable`/`disable` update is the manifest — `~/.niubash/plugins.toml`
+plus `~/.niubash/sources/registry.toml` — and every mutating verb regenerates
+`~/.niubash/generated/plugins.niu`, the derived activation plane the host
+sources *before* `~/.niubashrc` (so your own PS1/alias/function lines always
+win). A failed generation never replaces the last good loader, and
+`NIU_PLUGIN_LOADER=off` disables loading entirely. If your rc still contains
+legacy `# >>> niu source <id>` managed blocks, the loader stays off until
+they are removed — `niu plugin migrate-rc --diff` shows exactly what to take
+out; the removal is always your own edit. Use `niu plugin list` and
+`niu plugin discover` for the current inventory and state.
 
 Executable CLI tools (starship, fzf, eza, bat, fd, ripgrep, zoxide, dust,
 duf, erdtree, direnv, niu-git …) install through your real package
