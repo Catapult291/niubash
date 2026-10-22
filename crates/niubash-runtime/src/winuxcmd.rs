@@ -32,7 +32,17 @@ struct WinuxCmdSearchReport {
 }
 
 fn find_winuxcmd_with_report() -> WinuxCmdSearchReport {
-    let override_path = std::env::var("WINUXCMD_PATH").ok().map(PathBuf::from);
+    // niubash#504: under a package identity a leftover `WINUXCMD_PATH`
+    // names a foreign install's engine — honoring it downgrades the
+    // packaged session to whatever an old install left behind. The env
+    // var is ignored; programmatic overrides (callers passing a path)
+    // still apply. Sessions also strip it in `sanitize_packaged_env`,
+    // so this gate mainly covers non-shell entry points like `niu doctor`.
+    let override_path = if crate::msix::is_packaged() {
+        None
+    } else {
+        std::env::var("WINUXCMD_PATH").ok().map(PathBuf::from)
+    };
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));

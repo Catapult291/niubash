@@ -275,6 +275,24 @@ pub fn run_doctor(skill_files: &[crate::skill::SkillFile]) -> anyhow::Result<()>
         _ => {}
     }
 
+    // ── Advisory: foreign-install env leftovers under a package identity ──
+    // (niubash#504) An old NSIS/unpackaged install can leave WINUXCMD_PATH /
+    // WINUXSH_ROOT pointed at its own tree; the Store build ignores them,
+    // but they are a silent-downgrade trap worth naming. Packaged sessions
+    // strip them at startup — this row explains why they still linger in
+    // the parent environment.
+    if crate::msix::is_packaged() {
+        let leftovers = crate::msix::legacy_env_leftovers();
+        if !leftovers.is_empty() {
+            writeln!(
+                out,
+                "  {warn} foreign env vars   {} set — ignored under the Store build \
+                 (they point at a foreign install; unset them to silence this)",
+                leftovers.join(", ")
+            )?;
+        }
+    }
+
     // ── Advisory rows ───────────────────────────────────────────────────────
     if crate::fonts::nerd_font_installed() {
         writeln!(

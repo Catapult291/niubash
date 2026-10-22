@@ -121,6 +121,44 @@ pub fn writable_root() -> Option<PathBuf> {
     }
 }
 
+/// Environment variable names a *foreign* install can leave behind
+/// (niubash#504): an old NSIS/unpackaged install points them at its own
+/// tree, and a packaged process honoring them silently downgrades — a
+/// stale `WINUXCMD_PATH` resolves the old install's engine instead of
+/// the package's, and a stale `WINUXSH_ROOT` redirects the shell root
+/// (the deprecated name is still read by `prepare_shell_root`/rubash).
+/// Under a package identity neither can ever name a supported layout.
+pub(crate) const LEGACY_ENV_VARS: &[&str] = &["WINUXCMD_PATH", "WINUXSH_ROOT"];
+
+/// Which of `LEGACY_ENV_VARS` are currently set in the environment.
+/// Diagnostics read this raw — before any sanitizing — so a packaged
+/// session can name the exact downgrade hazard it ignored.
+pub(crate) fn legacy_env_leftovers() -> Vec<&'static str> {
+    LEGACY_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|name| std::env::var_os(name).is_some())
+        .collect()
+}
+
+/// Drop the legacy cross-install variables under a package identity
+/// (niubash#504). They name another install's tree — under MSIX they can
+/// only downgrade — while the supported overrides stay: `NIU_ROOT` for
+/// the shell root and programmatic (non-env) overrides for the engine.
+/// Removal, not just ignoring: the embedded engine reads `WINUXSH_ROOT`
+/// itself, so a value left in the environment would still win inside
+/// rubash. Run before `apply_writable_shell_root`, which reads
+/// `configured_shell_root` — including the deprecated name.
+pub fn sanitize_packaged_env() {
+    if !is_packaged() {
+        return;
+    }
+    for name in legacy_env_leftovers() {
+        std::env::remove_var(name);
+        log::debug!("msix: ignored foreign-install env var {name}");
+    }
+}
+
 /// `NIU_ROOT`/`WINUXSH_ROOT` already present in the environment (the
 /// deprecated bridge name is still read by `prepare_shell_root`).
 fn configured_shell_root() -> Option<PathBuf> {
@@ -317,6 +355,33 @@ mod tests {
         assert!(!is_packaged());
         assert!(writable_root().is_none());
         assert!(session_writable_root().is_none());
+    }
+
+    /// niubash#504: the leftovers scan names exactly the foreign-install
+    /// variables present, and unpackaged sanitizing never touches the
+    /// environment (this process is not packaged on a dev machine/CI).
+    #[test]
+    fn legacy_leftovers_reflect_the_environment() {
+        for name in LEGACY_ENV_VARS {
+            std::env::remove_var(name);
+        }
+        assert!(legacy_env_leftovers().is_empty());
+
+        std::env::set_var("WINUXCMD_PATH", r"C:\old\winuxcmd.exe");
+        std::env::set_var("WINUXSH_ROOT", r"C:\old\root");
+        assert_eq!(
+            legacy_env_leftovers(),
+            vec!["WINUXCMD_PATH", "WINUXSH_ROOT"]
+        );
+
+        sanitize_packaged_env();
+        // Unpackaged here: the vars must survive — sanitize is a no-op.
+        assert!(std::env::var_os("WINUXCMD_PATH").is_some());
+        assert!(std::env::var_os("WINUXSH_ROOT").is_some());
+
+        for name in LEGACY_ENV_VARS {
+            std::env::remove_var(name);
+        }
     }
 
     /// The mount-point reparse buffer is hand-built; pin its header fields
