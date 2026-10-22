@@ -111,10 +111,11 @@ line per command). Launcher verbs and the plugin verb table:
   and deterministic. Non-interactive init: `NIU_ENV=<file>` (or
   bash-compatible `BASH_ENV`, lower precedence) is sourced once before
   the command.
-- **When `NIU_SHELL` matters.** Niubash exports `NIU_SHELL` (and `SHELL`,
-  the POSIX-convention variable agents probe) with its own `niu.exe` path
-  in every process it starts; the `bash`/`sh` faces and the rc bootstrap
-  resolve the shell through it. `WINUXSH_SHELL` is a deprecated bridge
+- **When `NIU_SHELL` matters.** Niubash exports `NIU_SHELL` with its own
+  `niu.exe` path in every process it starts, and fills `SHELL` — the
+  POSIX-convention variable agents probe — with the same path when the
+  host left it unset; the `bash`/`sh` faces and the rc bootstrap resolve
+  the shell through `NIU_SHELL`. `WINUXSH_SHELL` is a deprecated bridge
   the engine still reads — do not build on it.
 
 ## Behavior notes — recent engine fixes an agent can rely on
