@@ -1647,7 +1647,7 @@ jobs:
   # artifact's Inno Setup installer to stage the exact shipped tree (niu +
   # bundled WinuxCmd + the must-install bundle), then packs it through
   # scripts/make_msix.py with the identity from
-  # scripts/release/msix-identity.json (a preview placeholder until Partner
+  # scripts/release/msix-identity.json (a preview stand-in identity until Partner
   # Center reserves the real one — verification-grade, not submittable).
   build-msix:
     name: build-msix (Store package, unsigned)
