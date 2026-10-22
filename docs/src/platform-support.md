@@ -22,7 +22,7 @@ a bug.
 | macOS aarch64 | ✅ `macos-latest` | ✅ release gate | ✅ | |
 | macOS x86_64 | ✅ `macos-latest` | ✅ (Rosetta 2) | ✅ | Apple cross-compile |
 | Linux x86_64 (musl) | ✅ `ubuntu-latest` | ✅ `cross-target-smoke` | ⬜ | static; see below |
-| Android (`aarch64-linux-android`, `armv7-linux-androideabi`) | ✅ release `build-android` | ⬜ | ⬜ | incubating: NDK-linked zip, no runtime smoke; see below |
+| Android (`aarch64-linux-android`, `armv7-linux-androideabi`) | ✅ release `build-android` | ⬜ | ✅ `.zip` since v1.4.3 | NDK-linked zip, CI runs no runtime smoke; see below |
 | HarmonyOS PC (`aarch64-linux-ohos`) | ✅ `ubuntu-latest` check | ⬜ | ⬜ | see below |
 
 "Smoke-gated" means the artifact is built, then run on its own OS, against
@@ -51,9 +51,13 @@ The `build-android` legs in `release.yml` build `aarch64-linux-android` and
 (`nttld/setup-ndk`, API 24 clang drivers). The bionic cfg surface was fixed
 upstream in rubash#456 (`AT_EACCESS`, `confstr`, `sa_restorer`, 32-bit
 `off_t`/`S_IFMT` widths). The legs are incubating: `continue-on-error`, not
-in the release `needs`, artifacts go to the workflow run only. The runner
-cannot execute bionic binaries, so the four-check smoke gate has not run
-for these — a zip from this leg is build-verified, not smoke-verified.
+in the release `needs` — the runner cannot execute bionic binaries, so the
+four-check smoke gate has not run for these in CI. Since v1.4.3 the zips
+still ship on the GitHub Release page (`niubash-v1.4.3-android-aarch64.zip`
+and `-armv7.zip`), and the aarch64 zip runs on real hardware: smoke-checked
+on a Termux aarch64 device (`--version`, `-c` execution, a pipeline through
+sort). Build-verified in CI, run-verified on one real device — not yet
+gate-verified.
 
 The leg does carry a **measured performance baseline** on real hardware
 (Termux aarch64, niubash 1.4.0 vs GNU bash 5.3.20):

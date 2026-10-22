@@ -77,7 +77,8 @@ C:\Program Files
 ## Get it
 
 Download the installer from
-[GitHub Releases](https://github.com/unixwin/niubash/releases), or build
+[GitHub Releases](https://github.com/unixwin/niubash/releases), install it
+with winget (`winget install --id Unixwin.Niubash`), or build
 from source:
 
 ```sh
