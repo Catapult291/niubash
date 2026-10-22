@@ -166,7 +166,10 @@ niubash 1.4.0 对 GNU bash 5.3.20
 
 Windows：去 [Releases](https://github.com/unixwin/niubash/releases) 下载
 `niubash-v*-win-*-setup.exe` 双击——不要管理员权限，PATH 和 Windows
-Terminal 配置自动配好。要便携版就拿 `.tar.gz`——捆绑的 git/awk 载荷以真
+Terminal 配置自动配好。
+Windows（winget）：`winget install --id Unixwin.Niubash`——不要管理员权限，
+PATH 和 Windows Terminal 配置自动配好。
+要便携版就拿 `.tar.gz`——捆绑的 git/awk 载荷以真
 硬链接出厂，下载和解包都比 `.zip` 小得多（`tar -xf
 niubash-v*-win-x64.tar.gz`，Windows 10+ 自带）；`.zip` 留给只认 zip 的
 工具链。

@@ -202,6 +202,8 @@ All downloads start at [unixwin.dev](https://unixwin.dev).
 Windows: grab `niubash-v*-win-*-setup.exe` from
 [Releases](https://github.com/unixwin/niubash/releases) and run it — no
 admin rights; PATH and a Windows Terminal profile are set up for you.
+Windows (winget): `winget install --id Unixwin.Niubash` — no admin
+rights; PATH and a Windows Terminal profile are set up for you.
 Prefer portable? Take the `.tar.gz` — it ships the bundled git/awk payload
 as real hardlinks, so it downloads and unpacks much smaller than the `.zip`
 (`tar -xf niubash-v*-win-x64.tar.gz`, built into Windows 10+). The `.zip`
