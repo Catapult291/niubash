@@ -1364,7 +1364,11 @@ impl Shell {
             // GNU evalfile.c:120: ENOENT with FEVAL_ENOENTOK is silent.
             return None;
         }
-        if !path.is_file() {
+        // GNU maybe_execute_file (evalfile.c) only refuses directories;
+        // every other existing path is opened and read, so a character
+        // device like /dev/null sources as an empty file (niubash#512:
+        // `!path.is_file()` misreported /dev/null as a directory).
+        if path.is_dir() {
             eprintln!("niu: {}: Is a directory", path.display());
             return None;
         }
@@ -1446,7 +1450,9 @@ impl Shell {
             // stdout/stderr byte-stable for one-shot agents.
             return None;
         }
-        if !path.is_file() {
+        // Only a directory is refused (see execute_env_file, niubash#512):
+        // /dev/null and other non-regular files are read like GNU does.
+        if path.is_dir() {
             eprintln!("niu: {}: Is a directory", path.display());
             return None;
         }
@@ -4549,6 +4555,36 @@ alias hello='echo from-alias'
         let _ = shell.source_non_interactive_env();
 
         assert_eq!(shell.executor.get_env("NIU_AGENT_ENV"), Some("bash-loaded"));
+
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    /// niubash#512: `BASH_ENV=/dev/null` is the standard idiom for
+    /// neutralizing startup files. GNU bash sources it silently (a
+    /// readable character device is an empty file to maybe_execute_file);
+    /// the loader must not refuse it as "Is a directory" — only a real
+    /// directory gets that diagnostic. The refusal printed to stderr and
+    /// returned before sourcing, so the observable contract here is that
+    /// the env step completes and the shell runs its command normally.
+    #[cfg(unix)]
+    #[test]
+    fn bash_env_dev_null_sources_silently() {
+        let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cwd_guard = CwdGuard::capture();
+        let _niu_guard = EnvVarGuard::unset("NIU_ENV");
+
+        let temp = unique_temp_dir("niubash-env-devnull");
+        let home = temp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let _bash_guard = EnvVarGuard::set_value("BASH_ENV", "/dev/null");
+
+        let mut shell = test_shell(HookConfig::default());
+        shell.home_dir = home;
+        let exit = shell.source_non_interactive_env();
+
+        assert!(exit.is_none());
+        assert_eq!(shell.execute_script("echo ok").unwrap(), 0);
 
         let _ = std::fs::remove_dir_all(temp);
     }
