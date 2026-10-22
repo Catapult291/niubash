@@ -114,18 +114,17 @@ fn find_winuxcmd_on_path(checked: &mut Vec<String>) -> Option<PathBuf> {
         // ~30 ms spawn tax.
         checked.push("PATH lookup for winuxcmd.exe (in-process walk)".to_string());
         let exe = find_file_in_path_dirs("winuxcmd.exe");
-        if let Some(ref path) = exe {
+        if let Some(path) = exe.as_ref() {
             checked.push(path.display().to_string());
         }
-        return exe;
+        exe
     }
 
     #[cfg(not(windows))]
     {
         checked.push("PATH lookup for winuxcmd.exe is only available on Windows".to_string());
+        None
     }
-
-    None
 }
 
 /// `where.exe <name>` without the child: current directory first, then PATH
@@ -133,6 +132,7 @@ fn find_winuxcmd_on_path(checked: &mut Vec<String>) -> Option<PathBuf> {
 /// semantics, same as `where.exe`), first exact-name file wins. Pure
 /// filesystem checks, so it is safe on a console-less host where a spawn
 /// would claim a hidden session console (niubash#451/#462).
+#[cfg(any(windows, test))]
 fn find_file_in_path_dirs(file_name: &str) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
