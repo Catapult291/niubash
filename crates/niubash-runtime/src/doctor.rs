@@ -257,7 +257,8 @@ pub fn run_doctor(skill_files: &[crate::skill::SkillFile]) -> anyhow::Result<()>
     // vintages print `unknown plugin subcommand` noise on every start.
     match find_niu_on_path() {
         Some(path_niu)
-            if !same_executable(&path_niu, &std::env::current_exe().unwrap_or_default()) =>
+            if !same_executable(&path_niu, &std::env::current_exe().unwrap_or_default())
+                && !same_packaged_origin(&path_niu) =>
         {
             writeln!(
                 out,
@@ -611,6 +612,15 @@ fn same_executable(a: &PathBuf, b: &PathBuf) -> bool {
     let (a, b) = (canon(a), canon(b));
     a.to_string_lossy()
         .eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+/// niubash#495: under MSIX the PATH copy is the AppExecutionAlias stub —
+/// `%LOCALAPPDATA%\Microsoft\WindowsApps\niu.exe`, a reparse point that
+/// never canonicalizes to the package's real `niu.exe` under
+/// `C:\Program Files\WindowsApps`. Both names start this exact package, so
+/// the shadow warning must not fire on them.
+fn same_packaged_origin(path_niu: &PathBuf) -> bool {
+    crate::msix::is_packaged() && crate::msix::is_app_execution_alias_path(path_niu)
 }
 
 #[cfg(test)]

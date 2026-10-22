@@ -187,6 +187,7 @@ pub fn prepare_winuxcmd_with_override(override_path: Option<&Path>) -> Result<Pa
         .unwrap_or_else(|| installation_root(&exe));
     auto_activate_bundled_winuxcmd(&exe);
     prepend_root_dirs_to_path(&root, &exe)?;
+    prepend_session_link_dirs(&exe);
     Ok(exe)
 }
 
@@ -207,7 +208,27 @@ pub fn ensure_on_path_with_override(override_path: Option<&Path>) -> Result<Path
     let root = installation_root_for_report(&report, &exe);
     auto_activate_bundled_winuxcmd(&exe);
     prepend_root_dirs_to_path(&root, &exe)?;
+    prepend_session_link_dirs(&exe);
     Ok(root.join("usr").join("bin"))
+}
+
+/// The root that owns this session's link family. A packaged (MSIX)
+/// install keeps its own tree read-only, so command links materialize in
+/// the per-package writable root — the same root `prepare_shell_root`
+/// prepares (`NIU_ROOT`). Everywhere else links live in the installation
+/// root beside `winuxcmd.exe` (niubash#495).
+fn session_links_root(exe: &Path) -> PathBuf {
+    crate::msix::session_writable_root().unwrap_or_else(|| installation_root(exe))
+}
+
+/// The directory carrying the session's command links: `<root>\usr\bin`
+/// under MSIX, the executable's own directory otherwise (exactly the
+/// location the unpackaged contract always used).
+fn session_link_bin(exe: &Path) -> PathBuf {
+    if let Some(root) = crate::msix::session_writable_root() {
+        return root.join("usr").join("bin");
+    }
+    exe.parent().map(Path::to_path_buf).unwrap_or_default()
 }
 
 /// Return the real installation root for a selected WinuxCmd executable.
@@ -375,7 +396,34 @@ fn prepend_root_dirs_to_path(root: &Path, exe: &Path) -> Result<PathBuf> {
     Ok(exe_dir)
 }
 
+/// Under MSIX the link family sits in the writable per-package root, not
+/// the read-only install tree. Its PATH dirs go ahead of the package's —
+/// session-resolved applets and wpm-managed shims win — without stripping
+/// the package dirs the flat payloads (git.exe, rg.exe, …) still ride in
+/// (niubash#495). Non-packaged installs are a no-op here.
+fn prepend_session_link_dirs(exe: &Path) {
+    let Some(links_root) = crate::msix::session_writable_root() else {
+        return;
+    };
+    let dirs = injected_path_dirs(&links_root, exe);
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = path_with_dirs_prepended_impl(&current_path, &dirs, false);
+    if new_path == current_path {
+        return;
+    }
+    std::env::set_var("PATH", &new_path);
+    log::debug!("msix session PATH injected from: {}", links_root.display());
+}
+
 fn path_with_dirs_prepended(current_path: &str, dirs: &[PathBuf]) -> String {
+    path_with_dirs_prepended_impl(current_path, dirs, true)
+}
+
+fn path_with_dirs_prepended_impl(
+    current_path: &str,
+    dirs: &[PathBuf],
+    strip_winuxcmd_entries: bool,
+) -> String {
     let desired = dirs
         .iter()
         .map(|dir| comparable_path_entry(&dir.to_string_lossy()))
@@ -387,7 +435,7 @@ fn path_with_dirs_prepended(current_path: &str, dirs: &[PathBuf]) -> String {
             let comparable = comparable_path_entry(entry);
             (!entry.is_empty()
                 && !desired.iter().any(|dir| dir == &comparable)
-                && !is_winuxcmd_installation_entry(entry))
+                && !(strip_winuxcmd_entries && is_winuxcmd_installation_entry(entry)))
             .then(|| entry.to_string())
         })
         .collect();
@@ -466,11 +514,12 @@ fn auto_activate_bundled_winuxcmd(exe: &Path) {
         return;
     }
 
-    let Some(dir) = exe.parent() else {
+    let link_bin = session_link_bin(exe);
+    if link_bin.as_os_str().is_empty() {
         return;
-    };
+    }
 
-    if has_required_command_links(dir) {
+    if has_required_command_links(&link_bin, exe) {
         return;
     }
 
@@ -484,17 +533,23 @@ fn auto_activate_bundled_winuxcmd(exe: &Path) {
     // builds, and winuxcmd.exe is a Windows binary anyway).
     #[cfg(windows)]
     {
-        let root = installation_root(exe);
+        let install_root = installation_root(exe);
+        // niubash#495: under MSIX the install tree is read-only; the link
+        // family lands in the per-package writable root instead.
+        let links_root = session_links_root(exe);
+        if links_root != install_root {
+            prepare_packaged_links_root(&links_root, &install_root, exe);
+        }
         match crate::console_guard::suppressed_command(exe)
             .args(["wpm", "links", "rebuild", "--root"])
-            .arg(&root)
+            .arg(&links_root)
             .arg("--force")
             .output()
         {
             Ok(output) if output.status.success() => {
                 log::debug!(
                     "winuxcmd activation completed via wpm links rebuild (root {})",
-                    root.display()
+                    links_root.display()
                 );
             }
             Ok(output) => {
@@ -514,19 +569,19 @@ fn auto_activate_bundled_winuxcmd(exe: &Path) {
         // install, so a successful `links rebuild` can still leave them on
         // the previous winuxcmd.exe image. Heal them in-process before
         // reporting the set complete.
-        let shims = reconcile_bundled_shims(&root, true);
+        let shims = reconcile_bundled_shims(&links_root, true);
         if !shims.failed.is_empty() {
             log::debug!(
                 "bundled shim reconcile left {} name(s) unresolved",
                 shims.failed.len()
             );
         }
-        if has_required_command_links(dir) {
+        if has_required_command_links(&link_bin, exe) {
             return;
         }
         log::debug!(
             "expected links are still missing in {}; falling back to activation script",
-            dir.display()
+            link_bin.display()
         );
     }
 
@@ -548,9 +603,12 @@ fn auto_activate_bundled_winuxcmd(exe: &Path) {
         .file_name()
         .unwrap_or_else(|| std::ffi::OsStr::new("activate-winuxcmd.sh"));
 
+    let Some(script_dir) = script.parent() else {
+        return;
+    };
     match crate::console_guard::suppressed_command(current_exe)
         .arg(script_name)
-        .current_dir(dir)
+        .current_dir(script_dir)
         .env("NIU_SKIP_WINUXCMD_ACTIVATION", "1")
         .output()
     {
@@ -577,21 +635,20 @@ fn bundled_activation_script(exe: &Path) -> Option<PathBuf> {
     script.is_file().then_some(script)
 }
 
-fn has_required_command_links(dir: &Path) -> bool {
+fn has_required_command_links(bin_dir: &Path, engine: &Path) -> bool {
     // Presence is not enough: a command link left on the *previous*
     // winuxcmd.exe by an update runs an older build forever, and nothing else
     // notices (unixwin/WinuxCmd#1206 - observed as a stale `yes.exe` hours
     // after the update). Comparing identity makes activation - which runs
     // `wpm links rebuild --force` when this returns false - repair the set on
     // the next shell start instead of waiting for someone to look.
-    let engine = dir.join("winuxcmd.exe");
     let builtins_ready = ["ls.exe", "cat.exe", "grep.exe", "ln.exe"]
         .iter()
         .all(|name| {
-            let link = dir.join(name);
-            link.is_file() && super::shell_links::same_file(&engine, &link)
+            let link = bin_dir.join(name);
+            link.is_file() && super::shell_links::same_file(engine, &link)
         });
-    builtins_ready && bundled_shim_links_current(dir)
+    builtins_ready && bundled_shim_links_current(bin_dir, engine)
 }
 
 /// The bundled-shim half of `has_required_command_links` (niubash#468): a
@@ -599,12 +656,13 @@ fn has_required_command_links(dir: &Path) -> bool {
 /// image counts as "activation needed", so a stale `awk.exe`/`gawk.exe`
 /// heals on the next shell start the way the builtins heal.
 ///
-/// `dir` is the directory holding `winuxcmd.exe`; the bundled contract only
-/// exists for the `<root>\usr\bin` layout — a flat portable layout or the
-/// `bin` PATH-entry directory declares nothing and is always "current".
-/// Names the machine's own `.wpm` state claims are wpm's problem, not ours.
-fn bundled_shim_links_current(dir: &Path) -> bool {
-    let Some(usr) = dir.parent() else {
+/// `bin_dir` is the directory holding the session's `winuxcmd` links; the
+/// bundled contract only exists for the `<root>\usr\bin` layout — a flat
+/// portable layout or the `bin` PATH-entry directory declares nothing and
+/// is always "current". Names the machine's own `.wpm` state claims are
+/// wpm's problem, not ours.
+fn bundled_shim_links_current(bin_dir: &Path, engine: &Path) -> bool {
+    let Some(usr) = bin_dir.parent() else {
         return true;
     };
     if usr.file_name().is_none_or(|name| name != "usr") {
@@ -613,8 +671,7 @@ fn bundled_shim_links_current(dir: &Path) -> bool {
     let Some(root) = usr.parent() else {
         return true;
     };
-    let engine = dir.join("winuxcmd.exe");
-    let forwarder = dir.join("winuxcmd-shim.exe");
+    let forwarder = bin_dir.join("winuxcmd-shim.exe");
     for component in crate::setup_wizard::bundled_link_shim_components() {
         let opt = root.join("opt").join(component.opt_dir);
         for shim in component.shims {
@@ -625,8 +682,8 @@ fn bundled_shim_links_current(dir: &Path) -> bool {
             if wpm_declares_command(root, shim) {
                 continue;
             }
-            let target = dir.join(shim);
-            if !bundled_shim_is_current(&target, &engine, &forwarder) {
+            let target = bin_dir.join(shim);
+            if !bundled_shim_is_current(&target, engine, &forwarder) {
                 return false;
             }
         }
@@ -729,6 +786,55 @@ fn materialize_link(source: &Path, target: &Path) -> Result<()> {
                 target.display()
             )
         }),
+    }
+}
+
+/// Materialize the pieces of the writable link root that
+/// `wpm links rebuild --root <writable>` does not cover (niubash#495):
+///
+/// - `usr\bin\winuxcmd.exe` so the canonical engine the links bind to is
+///   the package's image — and so a `winuxcmd`/`wpm` resolved through the
+///   injected PATH derives its default root from its own module path,
+///   which keeps `.wpm` receipts beside the links they manage;
+/// - an `opt` junction to the install's payload tree, so shim-layout
+///   forwarding (`forwardToOptPayload` resolves `<root>\opt` from the
+///   invoked link's own path) reaches the read-only package payloads.
+#[cfg(windows)]
+fn prepare_packaged_links_root(links_root: &Path, install_root: &Path, exe: &Path) {
+    let links_bin = links_root.join("usr").join("bin");
+    if let Err(error) = std::fs::create_dir_all(&links_bin) {
+        log::debug!(
+            "msix links bin {} is not writable: {}",
+            links_bin.display(),
+            error
+        );
+        return;
+    }
+    let engine_link = links_bin.join("winuxcmd.exe");
+    if !super::shell_links::same_file(&engine_link, exe) {
+        if let Err(error) = materialize_link(exe, &engine_link) {
+            log::debug!(
+                "msix engine link {} -> {} failed: {}",
+                engine_link.display(),
+                exe.display(),
+                error
+            );
+        }
+    }
+    let package_opt = install_root.join("opt");
+    let opt_link = links_root.join("opt");
+    // `symlink_metadata`: presence is what counts — a live junction, a real
+    // directory wpm created, or a dead junction all stay untouched; only a
+    // truly absent name gets the junction.
+    if package_opt.is_dir() && std::fs::symlink_metadata(&opt_link).is_err() {
+        if let Err(error) = crate::msix::create_junction(&opt_link, &package_opt) {
+            log::debug!(
+                "msix opt junction {} -> {} failed: {}",
+                opt_link.display(),
+                package_opt.display(),
+                error
+            );
+        }
     }
 }
 
@@ -845,7 +951,7 @@ pub fn reconcile_bundled_shims(root: &Path, force: bool) -> crate::shell_links::
 /// check; activation itself runs automatically at shell startup.
 pub fn command_links_ready() -> bool {
     find_winuxcmd()
-        .and_then(|exe| exe.parent().map(|dir| has_required_command_links(dir)))
+        .map(|exe| has_required_command_links(&session_link_bin(&exe), &exe))
         .unwrap_or(false)
 }
 
@@ -886,10 +992,13 @@ pub fn list_commands() -> Vec<String> {
         }
     }
 
-    // Fallback: scan the directory for *.exe shims.
+    // Fallback: scan the link directory for *.exe shims (under MSIX the
+    // family lives in the writable root, not beside the package's
+    // winuxcmd.exe — niubash#495).
     if let Some(exe) = find_winuxcmd() {
-        if let Some(dir) = exe.parent() {
-            if let Ok(entries) = std::fs::read_dir(dir) {
+        let dir = session_link_bin(&exe);
+        {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
                 let mut cmds: Vec<String> = Vec::new();
                 for entry in entries.flatten() {
                     let path = entry.path();
@@ -1201,28 +1310,29 @@ mod tests {
     fn command_links_are_required_before_skipping_activation() {
         let dir = unique_temp_dir("winuxcmd-required-links");
         std::fs::create_dir_all(&dir).unwrap();
+        let engine = dir.join("winuxcmd.exe");
 
-        assert!(!has_required_command_links(&dir));
+        assert!(!has_required_command_links(&dir, &engine));
 
         // Names that are not links to this winuxcmd.exe do not count: an
         // update that left them on the previous image must trigger the rebuild.
         for name in ["ls.exe", "cat.exe", "grep.exe", "ln.exe"] {
             std::fs::write(dir.join(name), b"a different image").unwrap();
         }
-        assert!(!has_required_command_links(&dir));
+        assert!(!has_required_command_links(&dir, &engine));
 
         std::fs::write(dir.join("winuxcmd.exe"), b"the installed engine").unwrap();
         for name in ["ls.exe", "cat.exe", "grep.exe", "ln.exe"] {
             let _ = std::fs::remove_file(dir.join(name));
             std::fs::hard_link(dir.join("winuxcmd.exe"), dir.join(name)).unwrap();
         }
-        assert!(has_required_command_links(&dir));
+        assert!(has_required_command_links(&dir, &engine));
 
         // One stale name is enough to ask for a rebuild.
         let stale = dir.join("cat.exe");
         let _ = std::fs::remove_file(&stale);
         std::fs::write(&stale, b"previous image").unwrap();
-        assert!(!has_required_command_links(&dir));
+        assert!(!has_required_command_links(&dir, &engine));
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1394,19 +1504,20 @@ mod tests {
     fn stale_bundled_shim_counts_as_activation_needed() {
         let root = fake_winuxcmd_root("winuxcmd-shim-gate", true);
         let bin = root.join("usr").join("bin");
-        std::fs::hard_link(bin.join("winuxcmd.exe"), bin.join("gawk.exe")).unwrap();
-        std::fs::hard_link(bin.join("winuxcmd.exe"), bin.join("awk.exe")).unwrap();
-        assert!(has_required_command_links(&bin));
+        let engine = bin.join("winuxcmd.exe");
+        std::fs::hard_link(&engine, bin.join("gawk.exe")).unwrap();
+        std::fs::hard_link(&engine, bin.join("awk.exe")).unwrap();
+        assert!(has_required_command_links(&bin, &engine));
 
         // A shim left on the previous image reopens activation.
         let stale = bin.join("awk.exe");
         std::fs::remove_file(&stale).unwrap();
         std::fs::write(&stale, b"the previous engine image").unwrap();
-        assert!(!has_required_command_links(&bin));
+        assert!(!has_required_command_links(&bin, &engine));
 
         // ... and a missing name does too.
         std::fs::remove_file(&stale).unwrap();
-        assert!(!has_required_command_links(&bin));
+        assert!(!has_required_command_links(&bin, &engine));
 
         let _ = std::fs::remove_dir_all(&root);
     }

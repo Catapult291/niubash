@@ -84,11 +84,23 @@ struct GitHubAsset {
 }
 
 pub fn run(args: &[String]) -> Result<()> {
+    run_with_packaged(args, niubash_runtime::msix::is_packaged())
+}
+
+fn run_with_packaged(args: &[String], store_managed: bool) -> Result<()> {
     if args
         .iter()
         .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
     {
         print_self_update_usage();
+        return Ok(());
+    }
+
+    // niubash#495: an MSIX install is serviced by the Microsoft Store —
+    // overwriting the packaged exe would fail against the read-only
+    // package root, so self-update is a no-op that points at the Store.
+    if store_managed {
+        println!("{}", store_managed_notice());
         return Ok(());
     }
 
@@ -154,10 +166,27 @@ fn self_update_supported() -> bool {
     true
 }
 
+/// The no-op message a Store-managed install prints instead of updating
+/// (niubash#495): the package is serviced by the Store, never by an
+/// in-place exe overwrite against the read-only package root.
+fn store_managed_notice() -> String {
+    format!(
+        "Niubash {} is managed by the Microsoft Store — update it from the Store; \
+         self-update does not apply to this install.",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 pub fn maybe_print_update_hint() {
     // No self-update channel exists off Windows yet (ledger N5): skip the
     // background check instead of spawning a thread that can only fail.
-    if !self_update_supported() || update_check_disabled() || !update_check_due() {
+    // Store-managed installs are also skipped (niubash#495): the Store
+    // ships their updates, so a "run self-update" hint is wrong there.
+    if niubash_runtime::msix::is_packaged()
+        || !self_update_supported()
+        || update_check_disabled()
+        || !update_check_due()
+    {
         return;
     }
 
@@ -1018,6 +1047,31 @@ fn parse_version_tag(tag: &str) -> Option<(u64, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// niubash#495: a Store-managed install must no-op before any release
+    /// resolution, download, or option parsing — every flag form included,
+    /// even an unknown one.
+    #[test]
+    fn store_managed_install_noops_before_any_network() {
+        for args in [
+            vec![],
+            vec!["--check".to_string()],
+            vec!["--dry-run".to_string()],
+            vec!["--force".to_string()],
+            vec!["--bogus-option".to_string()],
+        ] {
+            run_with_packaged(&args, true).unwrap();
+        }
+    }
+
+    /// The no-op message is the contract users see: it names the Store as
+    /// the update channel and the self-update verb that does not apply.
+    #[test]
+    fn store_managed_notice_points_at_the_store() {
+        let notice = store_managed_notice();
+        assert!(notice.contains("Store"), "{notice}");
+        assert!(notice.contains("self-update"), "{notice}");
+    }
 
     #[test]
     fn builds_versioned_installer_asset() {

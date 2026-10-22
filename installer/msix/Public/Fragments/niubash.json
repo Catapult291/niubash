@@ -1,0 +1,9 @@
+{
+  "profiles": [
+    {
+      "name": "Niubash",
+      "commandline": "niu.exe",
+      "icon": "niubash.png"
+    }
+  ]
+}

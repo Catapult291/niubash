@@ -73,6 +73,7 @@ pub mod git_prompt;
 pub(crate) mod history;
 pub mod interactive_menu;
 pub mod logo;
+pub mod msix;
 pub mod panic_restore;
 pub(crate) mod path_utils;
 pub mod plugins;

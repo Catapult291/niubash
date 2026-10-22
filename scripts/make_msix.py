@@ -40,6 +40,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_TEMPLATE = REPO_ROOT / "installer" / "msix" / "AppxManifest.xml"
+FRAGMENTS_SRC = REPO_ROOT / "installer" / "msix" / "Public"
 ICON_SOURCE = REPO_ROOT / "assets" / "niubash-icon-256.png"
 CARGO_TOML = REPO_ROOT / "Cargo.toml"
 LAYOUT_DIR = REPO_ROOT / "target" / "msix" / "layout"
@@ -63,6 +64,9 @@ Shell scripts     : niu script.sh
 
 Store build notes:
   - All bundled commands live inside this package next to niu.exe.
+  - The applet command links materialize into the package's private
+    LocalCache at first launch (the package root is read-only); the links
+    are visible inside niubash sessions only.
   - No system settings are modified; configuration stays under the user
     profile (~/.niubashrc).
 """
@@ -112,6 +116,30 @@ def generate_visual_assets() -> None:
         else:
             out = source.resize((width, height), Image.LANCZOS)
         out.save(assets_dir / name)
+
+
+def copy_fragments() -> None:
+    """Copy the packaged Public/ tree into the layout and emit the Windows
+    Terminal fragment icon beside the JSON.
+
+    The manifest declares the com.microsoft.windows.terminal.settings app
+    extension with PublicFolder="Public"; WT reads Public\\Fragments\\*.json
+    directly (no subdirectories). A bare icon name resolves against the
+    fragment file's own directory on WT >= 1.24.
+    """
+    if not FRAGMENTS_SRC.is_dir():
+        return
+    dest = LAYOUT_DIR / "Public"
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(FRAGMENTS_SRC, dest)
+
+    from PIL import Image
+
+    icon = Image.open(ICON_SOURCE).convert("RGBA").resize((64, 64), Image.LANCZOS)
+    fragments_dir = dest / "Fragments"
+    fragments_dir.mkdir(parents=True, exist_ok=True)
+    icon.save(fragments_dir / "niubash.png")
 
 
 def copy_payload(args: argparse.Namespace) -> None:
@@ -199,6 +227,7 @@ def main() -> None:
     render_manifest(args.identity_name, args.publisher,
                     args.publisher_display_name, version)
     generate_visual_assets()
+    copy_fragments()
     copy_payload(args)
     output = pack(version, find_makeappx())
     print(f"packed: {output}")
