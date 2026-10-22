@@ -992,6 +992,7 @@ fn ensure_opt_payload_copy(
     target: &Path,
 ) {
     let current = target.is_dir()
+        && !is_reparse_point(target)
         && component
             .exes
             .iter()
@@ -1759,6 +1760,15 @@ mod tests {
         std::fs::remove_dir_all(&gone).unwrap();
         prepare_packaged_opt_view(&links_root, &install);
         assert!(other.join("tool.exe").is_file());
+
+        // A forwarded payload that somehow stayed a *live* junction — even
+        // one whose bytes match — converts to a real copy: the junction is
+        // the shape the app container denies at CreateProcess time.
+        std::fs::remove_dir_all(&gawk).unwrap();
+        crate::msix::create_junction(&gawk, &install_opt.join("gawk")).unwrap();
+        prepare_packaged_opt_view(&links_root, &install);
+        assert!(!is_reparse_point(&gawk));
+        assert_eq!(std::fs::read(gawk.join("gawk.exe")).unwrap(), b"new awk");
 
         let _ = std::fs::remove_dir_all(&base);
     }
