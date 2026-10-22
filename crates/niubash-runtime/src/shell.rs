@@ -303,7 +303,10 @@ impl Shell {
         // shell-root resolution fails every session with os error 5. Point
         // NIU_ROOT at the package's private LocalCache before the root is
         // prepared — and before winuxcmd activation, which roots the link
-        // family under the same writable tree.
+        // family under the same writable tree. niubash#504: first drop
+        // foreign-install leftovers (`WINUXCMD_PATH`/`WINUXSH_ROOT`) that
+        // would otherwise silently downgrade the packaged session.
+        crate::msix::sanitize_packaged_env();
         crate::msix::apply_writable_shell_root();
         // 1. Load runtime defaults and environment-backed state.
         let mut config = load_config();
