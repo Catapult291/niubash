@@ -30,7 +30,12 @@ jobs:
           stale-pr-label: "stale"
           operations-per-run: 200
   greet:
-    if: github.event_name == 'issues' || github.event_name == 'pull_request_target'
+    # Never greet the maintainers: the action's first-time detection has been
+    # observed to misfire (API hiccup treated as "first") and greeted the repo
+    # owner on their own bug reports. The login check is authoritative.
+    if: >
+      (github.event_name == 'issues' && github.event.issue.user.login != 'caomengxuan666') ||
+      (github.event_name == 'pull_request_target' && github.event.pull_request.user.login != 'caomengxuan666')
     runs-on: ubuntu-latest
     steps:
       # Inputs are snake_case in first-interaction@v3 (action.yml:
