@@ -1114,12 +1114,18 @@ impl Shell {
     fn login_profile_paths(&self) -> Vec<PathBuf> {
         let mut files = Vec::new();
         let system_profile = self.executor.resolve_shell_path("/etc/profile");
-        if system_profile.is_file() {
+        if system_profile.exists() {
             files.push(system_profile);
         }
         for name in [".bash_profile", ".bash_login", ".profile"] {
             let candidate = self.home_dir.join(name);
-            if candidate.is_file() {
+            // GNU execute_profile_file (shell.c:1124-1126) chains on
+            // maybe_execute_file's result: only an ENOENT (missing) file
+            // falls through to the next candidate — a candidate that
+            // EXISTS but cannot be sourced (a directory, unreadable)
+            // ends the chain with a warning (rubash#1160). Existence,
+            // not is_file, is therefore the selection test.
+            if candidate.exists() {
                 files.push(candidate);
                 break;
             }
@@ -1137,6 +1143,14 @@ impl Shell {
             return None;
         }
         for path in self.login_profile_paths() {
+            if !path.is_file() {
+                // GNU evalfile.c:126-140: an existing-but-unsourceable
+                // startup file warns (`is a directory`) instead of
+                // failing silently (rubash#1160) — the same shape the
+                // env-file paths below already use.
+                eprintln!("niu: {}: Is a directory", path.display());
+                continue;
+            }
             if let Some(status) = self.source_startup_file(&path) {
                 return Some(status);
             }
@@ -1224,7 +1238,7 @@ impl Shell {
         if self.no_rc {
             return None;
         }
-        let rc_path = self.startup_rc_path().filter(|path| path.is_file());
+        let rc_path = self.startup_rc_path();
         // niubash#359: the generated plugin loader is the host-owned,
         // read-only activation channel. It sources BEFORE the user rc so
         // user overrides (PS1/alias/function) win, and only when the rc
@@ -1240,6 +1254,23 @@ impl Shell {
         let Some(path) = rc_path else {
             return None;
         };
+        if !path.exists() {
+            // GNU maybe_execute_file passes FEVAL_ENOENTOK (evalfile.c:345):
+            // a missing --rcfile is silent, exactly like a missing default.
+            return None;
+        }
+        if !path.is_file() {
+            // GNU evalfile.c:126-140: an existing-but-unsourceable rc
+            // (a directory) warns and the shell runs without it — the
+            // old is_file filter dropped it silently (rubash#1160).
+            eprintln!("niu: {}: Is a directory", path.display());
+            self.update_completion_state();
+            if repl {
+                self.finish_startup();
+                self.run_greeting_hooks();
+            }
+            return None;
+        }
 
         if repl {
             self.executor.set_env("NIU_REPL_STARTUP", "1");
@@ -1521,7 +1552,7 @@ impl Shell {
             return Some(file.clone());
         }
         let primary = self.home_dir.join(NIU_RC_FILE);
-        if primary.is_file() {
+        if primary.exists() {
             return Some(primary);
         }
         None
