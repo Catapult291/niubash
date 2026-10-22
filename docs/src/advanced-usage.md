@@ -26,6 +26,26 @@ niu -C 'alias ll; pwd'       # one-shot REPL command
 This separation keeps automation deterministic while still allowing a rich
 interactive shell.
 
+### Verbatim base64 handoff: `--encoded-command`
+
+When the command text cannot survive another shell's quoting (an agent
+handoff, a CI matrix, a PowerShell launcher), pass it base64-encoded. The
+payload is decoded and run through the `-c` route, so leading flags keep
+their meaning (`-e -u -o pipefail --norc ...`) and words after the payload
+are `$0` and positional parameters, exactly like `-c`:
+
+```pwsh
+niu --encoded-command 'cHdkOyBlY2hvIG9r'
+niu --ec 'cHdkOyBlY2hvIG9r'          # short alias, same route
+niu -EncodedCommand 'cHdkOyBlY2hvIG9r'  # PowerShell spelling
+```
+
+Three spellings work: `--encoded-command`, `--ec`, and `-EncodedCommand`
+matched case-insensitively (niubash#474, #477). A lone `-ec` is not one of
+them — with a single dash it stays GNU `-e -c`. An optional `v1:` prefix on
+the payload guards against MSYS path rewriting on the way in. A missing
+payload is an error, not an empty run.
+
 ### One-shot init file: `NIU_ENV` / `BASH_ENV`
 
 By default `-c` loads nothing — no rc, no plugins, no hooks. If your script,
