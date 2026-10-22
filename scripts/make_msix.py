@@ -149,8 +149,25 @@ def copy_payload(args: argparse.Namespace) -> None:
         dest = LAYOUT_DIR / "winuxcmd"
         if dest.exists():
             shutil.rmtree(dest)
+        # The package root is read-only, so shipped link directories are dead
+        # weight: the applet links materialize into the package's private
+        # LocalCache at first launch from the multicall's own applet table.
+        # bin/ (PATH-entry links) and usr/bin/ (applet links) hold nothing
+        # but hardlinks to winuxcmd.exe / forwarders — copying them would
+        # balloon the MSIX with hundreds of expanded copies of the same
+        # payload (makeappx has no hardlink notion). Everything that IS data
+        # (etc/, share/, Library/, opt/ wpm payloads, the multicall itself)
+        # ships. Deleted AFTER the copy: ignore_patterns would match any
+        # depth, and wpm payloads may legitimately carry their own bin/.
         shutil.copytree(args.winuxcmd_dir, dest,
-                        ignore=shutil.ignore_patterns("*.pdb", "*.lib", "*.exp"))
+                        ignore=shutil.ignore_patterns(
+                            "*.pdb", "*.lib", "*.exp",
+                            "tmp", "home",
+                            "__pycache__"))
+        for link_dir in ("bin", "usr/bin"):
+            link_path = dest / link_dir
+            if link_path.exists():
+                shutil.rmtree(link_path)
 
     if args.bundle_dir:
         dest = LAYOUT_DIR / "bundle"
@@ -197,15 +214,39 @@ def pack(version: str, makeappx: str) -> Path:
     return output
 
 
+def resolve_identity(args: argparse.Namespace) -> tuple[str, str, str]:
+    """Identity triple: explicit flags win, else scripts/release/msix-identity.json,
+    else a clearly-marked preview placeholder. The Store re-signs the uploaded
+    package under the Partner Center identity, so a placeholder build is fine
+    for container verification but must never be submitted."""
+    if args.identity_name and args.publisher:
+        return args.identity_name, args.publisher, args.publisher_display_name
+    pin_path = REPO_ROOT / "scripts" / "release" / "msix-identity.json"
+    if pin_path.exists():
+        import json
+
+        pin = json.loads(pin_path.read_text(encoding="utf-8"))
+        return (args.identity_name or pin["identity_name"],
+                args.publisher or pin["publisher"],
+                args.publisher_display_name or pin.get("publisher_display_name",
+                                                        "unixwin"))
+    if args.identity_name or args.publisher:
+        missing = "publisher" if args.identity_name else "identity-name"
+        raise SystemExit(f"error: --{missing} is required when only one identity "
+                         "flag is given (or provide scripts/release/msix-identity.json)")
+    return ("NiubashPreview", "CN=00000000-0000-0000-0000-000000000000", "unixwin")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--identity-name", required=True,
-                        help="Package/Identity Name from Partner Center")
-    parser.add_argument("--publisher", required=True,
-                        help='Publisher subject, e.g. "CN=XXXXXXXX-..."')
-    parser.add_argument("--publisher-display-name", default="unixwin",
-                        help="Publisher display name shown in the Store")
+    parser.add_argument("--identity-name", default=None,
+                        help="Package/Identity Name from Partner Center "
+                             "(default: scripts/release/msix-identity.json, else a preview placeholder)")
+    parser.add_argument("--publisher", default=None,
+                        help='Publisher subject, e.g. "CN=XXXXXXXX-..." (default: pin file)')
+    parser.add_argument("--publisher-display-name", default=None,
+                        help="Publisher display name shown in the Store (default: pin file)")
     parser.add_argument("--niu-exe", type=Path,
                         default=REPO_ROOT / "target" / "release" / "niu.exe",
                         help="Release niu.exe to package (default: target/release/niu.exe)")
@@ -224,8 +265,13 @@ def main() -> None:
     LAYOUT_DIR.mkdir(parents=True)
 
     version = read_version()
-    render_manifest(args.identity_name, args.publisher,
-                    args.publisher_display_name, version)
+    identity_name, publisher, publisher_display_name = resolve_identity(args)
+    if identity_name == "NiubashPreview":
+        print("NOTE: packing with the PREVIEW placeholder identity — fine for "
+              "container verification, NOT submittable to the Store (set "
+              "scripts/release/msix-identity.json to the Partner Center values).")
+    render_manifest(identity_name, publisher,
+                    publisher_display_name, version)
     generate_visual_assets()
     copy_fragments()
     copy_payload(args)
