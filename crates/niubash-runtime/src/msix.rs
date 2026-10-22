@@ -16,6 +16,7 @@
 use std::path::{Path, PathBuf};
 
 /// The shell-root directory created under the package's `LocalCache`.
+#[cfg(windows)]
 const WRITABLE_ROOT_DIR: &str = "niubash-root";
 
 /// The process's MSIX package family name, or `None` when it is not
