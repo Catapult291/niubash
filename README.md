@@ -2,6 +2,8 @@
   <img src="assets/niubash-banner.svg" alt="niubash — real Bash, native on Windows, Linux, and macOS." />
 </p>
 
+# Niubash — native Bash for Windows (Git Bash alternative)
+
 > **Real Bash, native on Windows, Linux, and macOS.** "Windows-only" is the
 > old story: five platforms build from this tree now, and Windows remains
 > the flagship — no WSL. No VM. No `/mnt/c`. No cmdlet dialect. One binary:
@@ -23,7 +25,7 @@ Docs & downloads: [unixwin.dev](https://unixwin.dev)
 
 </div>
 
-**niubash** is a Bash-compatible shell implemented natively in Rust. On
+**niubash** is a Bash-compatible shell implemented natively in Rust, a Git Bash alternative. On
 Windows, the flagship platform, one `niu.exe` bundles everything: the
 [rubash](https://github.com/unixwin/rubash) language engine, real Unix
 commands from [winuxcmd](https://github.com/unixwin/winuxcmd), a git-aware
@@ -43,7 +45,7 @@ and how to point the rest at niu. The
 Linux and macOS builds
 are portable `niu` binaries that use your system's own tools. niu is not
 MSYS2, Cygwin, Git Bash, or WSL — there is no POSIX emulation layer and no
-path-conversion heuristics. The full per-platform contract, including the
+path-conversion heuristics. It is a from-scratch replacement for Git Bash: a native Windows binary with no POSIX emulation. The full per-platform contract, including the
 honest status of every target, lives in
 [platform-support.md](docs/src/platform-support.md).
 
@@ -54,7 +56,7 @@ honest status of every target, lives in
 | Windows x64 / ARM64 | Released; smoke-gated every release | installer `.exe` + portable `.tar.gz`/`.7z`/`.zip`, Unix commands bundled |
 | Linux x86_64 / aarch64 (glibc 2.35+) | Released; smoke-gated every release | portable `.tar.gz`, uses system tools |
 | macOS aarch64 / x86_64 | Released; smoke-gated every release | portable `.tar.gz`, uses system tools |
-| Android aarch64 / armv7 | CI build only, no release | NDK-linked zip on workflow runs, not smoke-tested |
+| Android aarch64 / armv7 | Shipped since v1.4.3; runs on real devices (Termux), release smoke gate not yet wired in CI | NDK-linked `.zip` release asset |
 | OpenHarmony (`aarch64-unknown-linux-ohos`) | CI check only, no release | kept compiling by CI, never run on a device |
 
 "Smoke-gated" means the artifact is built, then run on its own OS against
@@ -63,10 +65,12 @@ coreutils, the offline plugin stack) before upload — the gate lives in
 `release.yml` ("no smoke, no artifact": Linux legs run it natively on
 `ubuntu-22.04`/`ubuntu-22.04-arm`, the macOS x86_64 leg under Rosetta 2),
 and the release as a whole additionally blocks on the golden user journey
-and the per-asset timing budget gates. Android and OpenHarmony have not
-passed that gate: Android artifacts are build- and link-verified only (an
-ELF shape check, explicitly not a runtime smoke), OpenHarmony is
-compile-checked only, and neither claims device readiness. The
+and the per-asset timing budget gates. OpenHarmony has not passed that
+gate (compile-checked only, never run on a device). Android ships release
+`.zip` assets since v1.4.3 and runs on real devices (Termux aarch64/armv7,
+daily-driven with on-device benchmark baselines); what it lacks is the
+automated per-release smoke leg in CI, which is wired for Windows/Linux/
+macOS only. The
 per-platform contract and the full status matrix live in
 [platform-support.md](docs/src/platform-support.md).
 
@@ -77,15 +81,17 @@ Quick answers:
   `/mnt/c`.
 - **What platforms does niu run on?** Released builds cover Windows (x64,
   ARM64), Linux (x86_64, aarch64; glibc 2.35+), and macOS (aarch64,
-  x86_64). Android (aarch64, armv7) and OpenHarmony (aarch64) build in CI
-  and have no release yet; Android additionally carries a measured
+  x86_64). OpenHarmony (aarch64) builds in CI and has no release yet;
+  Android (aarch64, armv7) ships release `.zip` assets since v1.4.3 and
+  runs on real devices (Termux). Android additionally carries a measured
   performance baseline (see [Performance](#performance)).
 - **Does niu run real Bash scripts?** Yes. The rubash engine is gated on
   GNU Bash's own upstream test suites; the record lives in the
   [compatibility matrix](docs/src/rubash-bash-compat-matrix.md).
-- **Can I install niu on Android or HarmonyOS today?** Not yet. Both
-  targets compile in CI, neither has passed a runtime smoke test, so there
-  is nothing to install.
+- **Can I install niu on Android or HarmonyOS today?** Android yes:
+  release `.zip` assets ship since v1.4.3 and run on real devices
+  (Termux aarch64/armv7). HarmonyOS not yet: it compiles in CI but has
+  no installable artifact.
 
 ## Receipts
 
@@ -101,7 +107,7 @@ The full log is committed
 [eco-test.py](scripts/harvest/eco-test.py), snapshot
 [wt92-local-20261005](scripts/harvest/snapshots/wt92-local-20261005/)).
 
-**Framework assets are sourced and timed, not just "supported."** The
+**Framework assets are sourced and timed.** The
 timing baseline loads 437 real oh-my-bash and bash-it assets (166 themes
 plus plugins, completions, aliases) and measures three phases per asset
 (source, first prompt, re-render) as a median of three runs. That includes
@@ -202,10 +208,14 @@ All downloads start at [unixwin.dev](https://unixwin.dev).
 Windows: grab `niubash-v*-win-*-setup.exe` from
 [Releases](https://github.com/unixwin/niubash/releases) and run it — no
 admin rights; PATH and a Windows Terminal profile are set up for you.
-Prefer portable? Take the `.tar.gz` — it ships the bundled git/awk payload
-as real hardlinks, so it downloads and unpacks much smaller than the `.zip`
-(`tar -xf niubash-v*-win-x64.tar.gz`, built into Windows 10+). The `.zip`
-stays for tooling that only speaks zip.
+Windows (winget): `winget install --id Unixwin.Niubash` — no admin
+rights; PATH and a Windows Terminal profile are set up for you.
+Prefer portable? Take the `.7z` — it preserves the bundled git/awk
+payload's hardlinks, so it stays small. The `.tar.gz` works too
+(`tar -xf niubash-v*-win-x64.tar.gz`, built into Windows 10+). Avoid the
+`.zip`: it cannot represent hardlinks, so the payload is stored
+duplicated and the archive is much larger — it stays only for tooling
+that speaks nothing but zip.
 
 Linux (x86_64, aarch64; glibc 2.35+) and macOS (aarch64, x86_64): take the
 portable tarball, untar, run:

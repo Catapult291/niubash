@@ -2,6 +2,8 @@
   <img src="assets/niubash-banner.svg" alt="niubash — real Bash, native on Windows, Linux, and macOS." />
 </p>
 
+# Niubash — 原生 Windows Bash（Git Bash alternative）
+
 > **真·Bash，Windows、Linux、macOS 原生构建。**"只能跑 Windows"是旧印象：
 > 现在有五个平台从这条树里构建，Windows 依旧是旗舰——不用 WSL，不开虚拟机，
 > 没有 `/mnt/c`，没有 cmdlet 方言。一个二进制：你手指肌肉记得的那个 shell，
@@ -22,7 +24,7 @@
 
 </div>
 
-**niubash** 是用 Rust 原生实现的 Bash 兼容 shell。在旗舰平台 Windows 上，
+**niubash** 是用 Rust 原生实现的 Bash 兼容 shell（Git Bash alternative）。在旗舰平台 Windows 上，
 一个 `niu.exe` 打包全部：[rubash](https://github.com/unixwin/rubash) 语言引擎、
 来自 [winuxcmd](https://github.com/unixwin/winuxcmd) 的真 Unix 命令、
 带 git 状态的 prompt，以及带权限模型的插件系统。git 来自
@@ -37,7 +39,7 @@ shell 脚本部分（hooks、`git bisect`、`git mergetool`）跑在 niubash 自
 agent 跑什么 shell、怎么把其余的指过来，见
 [Coding agents on Windows](docs/src/agents.md)。Linux 与 macOS 构建是
 便携 `niu` 二进制，直接用系统自带的工具。niu 不是 MSYS2、Cygwin、Git Bash，
-也不是 WSL——没有 POSIX 模拟层，也没有启发式的路径转换。每个平台的完整契约
+也不是 WSL——没有 POSIX 模拟层，也没有启发式的路径转换。它是 Git Bash 的 from-scratch replacement：原生 Windows 二进制，无 POSIX 模拟层。每个平台的完整契约
 （包括每个目标的诚实状态）见
 [platform-support.md](docs/src/platform-support.md)。
 
@@ -45,10 +47,10 @@ agent 跑什么 shell、怎么把其余的指过来，见
 
 | 平台 | 状态 | 发布形态 |
 |---|---|---|
-| Windows x64 / ARM64 | 已发布；每次发布过烟测门禁 | 安装器 `.exe` + `.zip`，Unix 命令随包 |
+| Windows x64 / ARM64 | 已发布；每次发布过烟测门禁 | 安装器 `.exe` + 便携 `.tar.gz`/`.7z`/`.zip`，Unix 命令随包 |
 | Linux x86_64 / aarch64（glibc 2.35+） | 已发布；每次发布过烟测门禁 | 便携 `.tar.gz`，用系统自带工具 |
 | macOS aarch64 / x86_64 | 已发布；每次发布过烟测门禁 | 便携 `.tar.gz`，用系统自带工具 |
-| Android aarch64 / armv7 | 仅 CI 构建，未发布 | NDK 链接 zip，只进 workflow 产物，未过烟测 |
+| Android aarch64 / armv7 | v1.4.3 起随 release 发货；在真机上运行（Termux），CI 自动烟测腿尚未接上 | NDK 链接 `.zip` release 资产 |
 | OpenHarmony（`aarch64-unknown-linux-ohos`） | 仅 CI check，未发布 | CI 保持可编译，未在真机运行 |
 
 "烟测门禁"指产物构建完成后、上传之前，在它自己的 OS 上跑四项检查
@@ -56,17 +58,18 @@ agent 跑什么 shell、怎么把其余的指过来，见
 ——门禁在 `release.yml` 里（"no smoke, no artifact"：Linux 腿在
 `ubuntu-22.04`/`ubuntu-22.04-arm` 原生跑，macOS x86_64 腿在 Rosetta 2 下跑），
 发布整体还额外被 golden user journey 与逐资产计时预算两道门拦着。
-Android 和 OpenHarmony 还没过这道门：Android 产物只做了构建与链接验证
-（ELF 形状检查，明确不是运行时烟测），OpenHarmony 只做了编译检查，
-两者都不宣称可日常使用。各平台完整契约与
+OpenHarmony 还没过这道门（只做编译检查，没在真机上跑过）。Android 自
+v1.4.3 起随 release 发货 `.zip`，在真机上运行（Termux aarch64/armv7，
+日常使用 + 机上实测基线）；缺的是 CI 里那条自动化逐 release 烟测腿，
+目前只接了 Windows/Linux/macOS。OpenHarmony 仍不宣称可用。各平台完整契约与
 全量状态矩阵见 [platform-support.md](docs/src/platform-support.md)。
 
 快答：
 
 - **niu 需要 WSL 吗？** 不需要。niu 在所有发布平台上都是原生构建：Windows 上没有 Linux 虚拟机、没有模拟层、没有 `/mnt/c`。
-- **niu 能跑在哪些平台？** 已发布：Windows（x64、ARM64）、Linux（x86_64、aarch64；glibc 2.35+）、macOS（aarch64、x86_64）。Android（aarch64、armv7）与 OpenHarmony（aarch64）在 CI 里构建，尚无发布；Android 另有一份实测性能基线（见[性能](#性能)）。
+- **niu 能跑在哪些平台？** 已发布：Windows（x64、ARM64）、Linux（x86_64、aarch64；glibc 2.35+）、macOS（aarch64、x86_64）、Android（aarch64、armv7；v1.4.3 起 `.zip` 随 release 发货，真机可运行）。OpenHarmony（aarch64）在 CI 里构建，尚无发布；Android 另有一份实测性能基线（见[性能](#性能)）。
 - **niu 跑得了真 Bash 脚本吗？** 跑得了。rubash 引擎以 GNU Bash 官方上游测试套件作门禁，记录在[兼容性矩阵](docs/src/rubash-bash-compat-matrix.md)。
-- **现在能在 Android 或鸿蒙上装 niu 吗？** 还不能。两个目标都能在 CI 里编译，但都没跑过运行时烟测，没有可安装的产物。
+- **现在能在 Android 或鸿蒙上装 niu 吗？** Android 能：v1.4.3 起 release 自带 `.zip`，真机（Termux aarch64/armv7）可运行。鸿蒙还不能：CI 能编译，但没有可安装产物。
 
 ## 实证
 
@@ -79,7 +82,7 @@ OK，350 个慢，224 个 GNU Bash 也过不了，101 个挂起，698 个拉取�
 [eco-test.py](scripts/harvest/eco-test.py)、快照
 [wt92-local-20261005](scripts/harvest/snapshots/wt92-local-20261005/)）。
 
-**生态框架是被 source、被计时的，不是一句"支持了"。** 逐资产计时基线
+**生态框架是被 source、被计时的。** 逐资产计时基线
 加载 437 个真实 oh-my-bash / bash-it 资产（166 款主题加上 plugins、
 completions、aliases），每资产测三个阶段（source、首帧 prompt、重渲染），
 取三次运行的中位数。两个框架自带的 nvm 资产就在这份基线里；真实用户
@@ -166,10 +169,13 @@ niubash 1.4.0 对 GNU bash 5.3.20
 
 Windows：去 [Releases](https://github.com/unixwin/niubash/releases) 下载
 `niubash-v*-win-*-setup.exe` 双击——不要管理员权限，PATH 和 Windows
-Terminal 配置自动配好。要便携版就拿 `.tar.gz`——捆绑的 git/awk 载荷以真
-硬链接出厂，下载和解包都比 `.zip` 小得多（`tar -xf
-niubash-v*-win-x64.tar.gz`，Windows 10+ 自带）；`.zip` 留给只认 zip 的
-工具链。
+Terminal 配置自动配好。
+Windows（winget）：`winget install --id Unixwin.Niubash`——不要管理员权限，
+PATH 和 Windows Terminal 配置自动配好。
+要便携版就拿 `.7z`——捆绑的 git/awk 载荷硬链接原样保留，体积最小；
+`.tar.gz` 也行（`tar -xf niubash-v*-win-x64.tar.gz`，Windows 10+ 自带）。
+别用 `.zip`：它存不了硬链接，载荷被重复存放，包大得多，只留给除 zip
+什么都不认的工具链。
 
 Linux（x86_64、aarch64；glibc 2.35+）与 macOS（aarch64、x86_64）：拿
 便携 tarball，解包即跑：
