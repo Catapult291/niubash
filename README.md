@@ -105,7 +105,7 @@ The full log is committed
 [eco-test.py](scripts/harvest/eco-test.py), snapshot
 [wt92-local-20261005](scripts/harvest/snapshots/wt92-local-20261005/)).
 
-**Framework assets are sourced and timed, not just "supported."** The
+**Framework assets are sourced and timed.** The
 timing baseline loads 437 real oh-my-bash and bash-it assets (166 themes
 plus plugins, completions, aliases) and measures three phases per asset
 (source, first prompt, re-render) as a median of three runs. That includes

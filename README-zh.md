@@ -80,7 +80,7 @@ OK，350 个慢，224 个 GNU Bash 也过不了，101 个挂起，698 个拉取�
 [eco-test.py](scripts/harvest/eco-test.py)、快照
 [wt92-local-20261005](scripts/harvest/snapshots/wt92-local-20261005/)）。
 
-**生态框架是被 source、被计时的，不是一句"支持了"。** 逐资产计时基线
+**生态框架是被 source、被计时的。** 逐资产计时基线
 加载 437 个真实 oh-my-bash / bash-it 资产（166 款主题加上 plugins、
 completions、aliases），每资产测三个阶段（source、首帧 prompt、重渲染），
 取三次运行的中位数。两个框架自带的 nvm 资产就在这份基线里；真实用户
