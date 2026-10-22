@@ -30,31 +30,32 @@ unset __niubash_home_drive __niubash_home_rest
 
 # ── External frameworks (oh-my-bash / bash-it / starship) ──
 # Prefer the plugin manager over hand-writing loaders:
-#   niu plugin add oh-my-bash          # install from the curated catalog
+#   niu plugin add oh-my-bash          # install from the catalog (untrusted)
 #   niu plugin trust oh-my-bash        # review, then pass the execution gate
-#   niu plugin enable oh-my-bash       # guarded loader block (below)
-#   niu plugin enable agnoster         # theme -> OSH_THEME inside the block
-#   niu plugin disable oh-my-bash      # remove the block; the floor returns
+#   niu plugin enable oh-my-bash       # records the source in the manifest
+#   niu plugin enable agnoster         # theme pick -> OSH_THEME in the loader
+#   niu plugin disable oh-my-bash      # manifest updated; the floor returns
 #
-# `niu plugin enable/disable` maintains one managed block per source between
-# `# >>> niu source …` / `# <<< niu source …` markers appended at the end of
-# this file. Everything outside the markers is yours and is never rewritten.
-# The block shape (shown commented; let `niu plugin` write the real one):
+# Since niubash#359 (v1.4.2) no plugin verb writes this file. `enable`/`disable`
+# update the manifest (`~/.niubash/plugins.toml` +
+# `~/.niubash/sources/registry.toml`) and regenerate the derived loader
+# `~/.niubash/generated/plugins.niu`, which the host sources BEFORE this rc —
+# your own PS1/alias/function lines below always win.
+# `niu plugin list` / `niu plugin discover` report the current state, and
+# `niu plugin sync` reconciles a hand-edited spec with reality.
 #
-# # >>> niu source oh-my-bash (managed by `niu plugin enable/disable`) >>>
-# OSH_THEME='agnoster'
-# plugins=('git')
-# # oh-my-bash source (external, primary; fallback stays active when absent)
-# if [ -f "${NIU_PLUGIN_SOURCES_ROOT:-$HOME/.niubash/sources}/oh-my-bash/oh-my-bash.sh" ]; then
-#   OSH="${NIU_PLUGIN_SOURCES_ROOT:-$HOME/.niubash/sources}/oh-my-bash"
-#   OSH="${OSH//\\//}"
-#   export OSH
-#   export NIU_THEME_SOURCE=omb
-#   . "$OSH/oh-my-bash.sh"
-# fi
-# # <<< niu source oh-my-bash <<<
+# Two conditions keep the loader off:
+#   NIU_PLUGIN_LOADER=off              # rollback switch (also false/0/no):
+#                                      # skip the loader; unsetting rolls forward
+#   legacy `# >>> niu source …` / `# <<< niu source …` managed blocks still in
+#   this rc                            # double-execution guard: the old block is
+#                                      # the live path. `niu plugin migrate-rc`
+#                                      # (read-only; `--diff` publishes a
+#                                      # candidate rc under
+#                                      # `~/.niubash/candidates/`) diagnoses —
+#                                      # removal is always your own edit.
 #
-# starship needs no managed block; its own init claims PS1 per prompt:
+# starship needs no source; its own init claims PS1 per prompt:
 #   eval "$(starship init bash)"
 
 # ── Personal aliases and environment ──
