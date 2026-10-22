@@ -7,11 +7,12 @@
 //! Binary-level evidence in this file:
 //! * the shipped `.niubashrc.example` sells zero retired-stack fields;
 //! * a real enable → boot cycle: the OMB guarded loader block claims PS1
-//!   end-to-end (managed rc block → `oh-my-bash.sh` → theme → PS1), and the
+//!   end-to-end (generated loader → `oh-my-bash.sh` → theme → PS1), and the
 //!   product floor does not overwrite it;
 //! * disabling the source releases the slot (fresh boot, PS1 unclaimed);
-//! * the managed framework block lands after floor config and user lines,
-//!   and disable never rewrites anything outside its markers;
+//! * the generated framework loader is sourced before floor config and user
+//!   lines (niubash#359: enable never rewrites the user's rc at all), and
+//!   disable drops the loader section with the rc untouched;
 //! * the real oh-my-bash checkout keeps the claim-or-floor invariant under
 //!   the current engine (rubash#251 gates interactive theme activation; the
 //!   floor stays active meanwhile — iron law 2).
@@ -185,8 +186,9 @@ fn install_trusted_omb(sandbox: &Sandbox) {
 /// The shipped example rc must sell the post-migration shape only: zero
 /// retired-stack fields (niubash#145: NIU_THEME/NIU_THEME_PLUGIN/
 /// NIU_PLUGINS/NIU_BANNER/NIUBASH + `oh-my-niu.winux` chain), floor knobs
-/// documented as floor-only, HOME bootstrap, and the managed-block marker
-/// discipline shown for reference.
+/// documented as floor-only, HOME bootstrap, and the loader/migrate-rc
+/// contract (niubash#359/#499: activation lives in the generated loader —
+/// the example carries NO managed-block sample for `niu plugin` to write).
 #[test]
 fn example_rc_sells_no_retired_stack_fields() {
     let example =
@@ -207,18 +209,26 @@ fn example_rc_sells_no_retired_stack_fields() {
         );
     }
     // The post-migration shape is documented: floor knobs (commented, they
-    // are optional), the HOME bootstrap, and the niu-managed block markers.
+    // are optional), the HOME bootstrap, and the loader contract — with NO
+    // managed-block sample (niubash#499: a hand-written block would keep the
+    // generated loader OFF by design).
     assert!(example.contains("NIU_PROMPT_CWD_STYLE"), "{example}");
     assert!(example.contains("NIU_COMPLETION_STYLE"), "{example}");
     assert!(example.contains("USERPROFILE"), "{example}");
     assert!(
-        example.contains(">>> niu source oh-my-bash (managed by `niu plugin enable/disable`) >>>"),
-        "{example}"
+        !example.contains(">>> niu source oh-my-bash (managed by `niu plugin enable/disable`) >>>"),
+        "retired managed-block sample still taught: {example}"
     );
     assert!(
-        example.contains("<<< niu source oh-my-bash <<<"),
-        "{example}"
+        !example.contains("<<< niu source oh-my-bash <<<"),
+        "retired managed-block sample still taught: {example}"
     );
+    // The current model (niubash#359): manifest + generated loader, the
+    // rollback switch, and the read-only migration verb for legacy blocks.
+    assert!(example.contains("plugins.toml"), "{example}");
+    assert!(example.contains("generated/plugins.niu"), "{example}");
+    assert!(example.contains("NIU_PLUGIN_LOADER"), "{example}");
+    assert!(example.contains("migrate-rc"), "{example}");
     // The example must stay parseable under the engine (niubash#157 guards
     // the closed `${USERPROFILE//\\//}` form; a broken expansion silently
     // disables every alias in an adopted rc).
