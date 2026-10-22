@@ -1,6 +1,7 @@
 Niubash <version> — a bash-compatible shell that feels at home on Windows.
 
-Usage:  niu [option]
+Usage:  niu [GNU long option] [option] ...
+        niu [GNU long option] [option] script-file ...
         niu -c <cmd>         Run a command then exit
         niu -C <cmd>         Run one REPL-style command then exit
         niu setup           Re-run prompt/plugin setup
@@ -8,15 +9,88 @@ Usage:  niu [option]
         niu doctor          Health-check the installation
         niu <script> [args]  Run a script file
 
+GNU long options:
+    --debug
+    --debugger
+    --dump-po-strings
+    --dump-strings
+    --help
+    --init-file <file>
+    --login
+    --noediting
+    --noprofile
+    --norc
+    --posix
+    --pretty-print
+    --rcfile <file>
+    --restricted
+    --verbose
+    --version
+
+Shell options:
+    -ilrsD or -c command or -O shopt_option		(invocation only)
+    -abefhkmnptuvxBCEHPT or -o option
+
+    -c <command> runs the command string (the word after it becomes $0);
+    -s reads commands from standard input; --init-file and --rcfile each
+    take <file>, replacing the default startup file (profile chain / rc).
+
+Type `niu -c "help set"` for more information about shell options.
+Type `niu -c help` for more information about shell builtin commands.
+Report bugs at <https://github.com/unixwin/niubash/issues>.
+Niubash home page: <https://github.com/unixwin/niubash>.
+
 Options:
   -h, --help                Show this help
   -V, --version             Version and component info
   -c <command>              Execute a command ad-hoc
   -C, --repl-command <cmd>  Execute one non-interactive REPL command
+  Verbatim handoff (execute a base64-encoded command, no quoting):
+      --encoded-command <b64>  canonical spelling
+      -EncodedCommand <b64>    PowerShell spelling, matched case-insensitively
+      --ec <b64>               short alias for --encoded-command
+                               optional `v1:` prefix guards against MSYS path rewrite
+      --cwd-state <file>       Restore the recorded directory at startup and
+                               record the final directory back on exit
+
+Bash-compatible invocation options (GNU semantics, parsed by the engine):
+  -c <command>              Execute the next non-option argument as a command
+  -i                        Force the interactive shell
+  -l, --login               Act as a login shell
+  -r, --restricted          Restricted shell (restricts cd and PATH/ENV changes)
+  -s                        Read commands from standard input
+  -D                        Dump locale-translatable strings and exit
+  -o <option>               Set a `set -o` option by name
+  -O <shopt>                Set a `shopt` option by name
+  -a                        allexport: export all new and modified variables
+  -b                        notify: report the status of terminated background jobs
+  -e                        errexit: exit immediately if a command fails
+  -f                        noglob: disable pathname expansion
+  -h                        hashall: remember the location of executed commands
+  -k                        keyword: keep keyword=value arguments in the environment
+  -m                        monitor: enable job control
+  -n                        noexec: read commands without executing them
+  -p                        privileged: do not reset the effective uid
+  -t                        onecmd: exit after reading and executing one command
+  -u                        nounset: error when expanding an unset variable
+  -v, --verbose             verbose: echo input lines as they are read
+  -x                        xtrace: trace expanded commands
+  -B                        braceexpand: enable brace expansion
+  -C                        noclobber: refuse to overwrite existing files with >
+  -E                        errtrace: inherit the ERR trap in functions and subshells
+  -H                        histexpand: enable ! history expansion
+  -P                        physical: do not resolve symlinks in cd
+  -T                        functrace: inherit DEBUG and RETURN traps
+  Invoke the binary as `bash` or `sh` (shim or symlink) for the full
+  byte-for-byte GNU usage form: `bash --help`.
 
   --install-wt-profile      Add/update the Windows Terminal profile
       --set-default         Also set Niubash as the WT default profile
       --quiet               Suppress non-error profile output
+  --install-wt-shortcuts    Rewrite desktop/Start-menu shortcuts (WT form
+                            `wt.exe -p Niubash` when WT is detected)
+      --update-only         Only touch shortcut files that already exist
+      --quiet               Suppress non-error shortcut output
   --self-update             Download and run the latest release installer
       --check               Only report the latest release
       --dry-run             Download installer without running it
@@ -30,6 +104,9 @@ Options:
   plugin update|sync|restore|rollback|clean
                             Lockfile verbs (vim-plug/lazy.nvim-style)
   plugin trust <id>         Review and activate a source's assets
+  plugin migrate-rc [--diff]
+                            Read-only migration report for legacy managed
+                            blocks (never writes the rc)
   plugin discover [--verbose]
                             Read-only overview of external plugin sources
   plugin source <command>   Full source protocol (add/trust/sign/verify/
@@ -39,9 +116,12 @@ Options:
   plugin mirror <command>   Git fetch mirroring (list/show/set)
   plugin ui                 Menu UI (sections by state, same verbs)
 
+  skill install|status      Install/check the AI agent skill bundle
+                            ([--target claude|zcode|cursor|all|<dir>])
+
   --completion-probe <line> [cursor]  Debug: print completion candidates
 
-Configuration: ~/.niubashrc for interactive startup; a pre-rename ~/.winuxshrc is migrated once into ~/.niubashrc
+Configuration: ~/.niubashrc for interactive startup (primary-only; no automatic legacy migration)
 
 Environment:
   NIU_ENV=<file>          Non-interactive init file sourced by -c, scripts, and stdin
@@ -50,3 +130,6 @@ Environment:
   BASH_ENV=<file>         GNU bash compatible: same as NIU_ENV, lower precedence.
   NIU_LANG=<lang>         Setup wizard language (zh / en). Falls back to the
                           Windows UI language, then LC_ALL/LANG.
+
+Home: <https://unixwin.dev>
+Docs & downloads: <https://unixwin.dev>

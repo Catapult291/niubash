@@ -17,8 +17,15 @@ and no environment variable to disable one.
 | `/home/me` | users dialect | real users directory (`C:/Users`) |
 | `/dev/null` | null device | Windows `NUL` |
 | `~` | home | `USERPROFILE` (kept consistent with `HOME`) |
+| `D:` (bare) | drive designator | the drive's root — `D:` and `cd D:` land on `/d/` |
 
 Key facts for agents:
+
+- Bare drive designators are the cmd-style drive switch: `D:` or `cd D:`
+  jumps to that drive's root, and the behavior is identical across
+  `niu -c`, brace groups/subshells, and piped `niu -i` (the engine owns
+  the dispatch on every route). `D:rel\path` drive-relative spellings are
+  not a dialect — use `D:/rel/path` or `/d/rel/path`.
 
 - `> /tmp/f` and `cat /tmp/f` agree: both hit the real Windows temp
   directory. The install tree ships **no** `tmp/` directory at all — there

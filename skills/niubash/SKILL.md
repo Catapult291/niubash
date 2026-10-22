@@ -1,6 +1,6 @@
 ---
 name: niubash
-description: Run Windows tasks in Niubash, the GNU Bash-compatible Windows-native shell. Use when the active shell is Niubash (the `niu` prompt), when editing ~/.niubashrc or oh-my-niu plugins, when installing Unix commands with wpm, or for any Windows task where bash syntax should run natively — no PowerShell, WSL, Git Bash, or MSYS involved, and no path-conversion environment variables required.
+description: Run Windows tasks in Niubash, the GNU Bash-compatible Windows-native shell. Use when the active shell is Niubash (the `niu` prompt), when editing ~/.niubashrc or the external plugin manifest, when installing Unix commands with wpm, or for any Windows task where bash syntax should run natively — no PowerShell, WSL, Git Bash, or MSYS involved, and no path-conversion environment variables required.
 ---
 
 # Niubash
@@ -9,9 +9,10 @@ description: Run Windows tasks in Niubash, the GNU Bash-compatible Windows-nativ
 
 Niubash is bash implemented natively in Rust for Windows: the language
 engine ([rubash](https://github.com/unixwin/rubash)) is a from-scratch Bash
-interpreter gated on GNU Bash's own upstream test suite — **82 of 83 full
-suites byte-identical to GNU output** (2026-09-25 ledger re-run; the one
-residual, nameref, is individually audited — ledger in rubash's
+interpreter gated on GNU Bash's own upstream test suite — **all 83 suites
+pass on the 2026-10-12 full re-run: 62 byte-identical stdout on Windows,
+20 environment-attributed, and the nameref suite's single residual line
+proven to be GNU Bash's own coproc reap-timing race** (ledger in rubash's
 [README, "Compatibility at a
 Glance"](https://github.com/unixwin/rubash#compatibility-at-a-glance)). What it is not matters as much:
 
@@ -27,11 +28,12 @@ Glance"](https://github.com/unixwin/rubash#compatibility-at-a-glance)). What it 
   not exist here and are never needed. Full contract:
   `references/paths.md`.
 - **Verbatim argv at the boundary** ("Option B"): the bundled `bash.exe` /
-  `sh.exe` forwarders pass the command line through to `niu.exe` untouched
-  — no re-quoting, no path rewriting at the shim. What a child process
-  receives is always a native Windows path when the argument is a shell
-  path; literal data arguments (`printf '%s\n' /tmp/x`) are never rewritten
-  (GNU bash behavior).
+  `sh.exe` are hardlinks to `niu.exe` — the same binary taking the GNU
+  face from `argv[0]` (a forwarding shim stands in only where the
+  filesystem cannot hardlink). No re-quoting, no path rewriting at the
+  boundary. What a child process receives is always a native Windows path
+  when the argument is a shell path; literal data arguments
+  (`printf '%s\n' /tmp/x`) are never rewritten (GNU bash behavior).
 - **No bundler downloads.** Plugin sources arrive by git clone only; fonts
   and CLI tools are package-manager recommendations. `wpm`/WinuxCmd is the
   separate command-layer package manager.
@@ -56,8 +58,9 @@ Glance"](https://github.com/unixwin/rubash#compatibility-at-a-glance)). What it 
 <!-- BEGIN GENERATED:capability-snapshot -->
 - **77 shell built-ins & reserved words** — the GNU bash 5.3 `shell_builtins[]` table (`alias`, `cd`, `declare`, `printf`, `set`, `trap`, `if`/`while`/`case`, ...); every one documents itself via `help <name>`.
 - **180 winuxcmd applets** on PATH (`ls`, `grep`, `sed`, `awk`, `find`, `tar`, `top`, `xxd`, ...) — real Windows binaries, not emulated inside the shell; full inventory in `references/quickref.md`.
-- **Launcher verbs** — `setup`, `font`, `doctor`, `plugin`, `skill`, `--self-update`; table in `references/quickref.md`.
-- **Plugin system** — git-clone-only external sources (oh-my-bash, bash-it, bpkg) behind an explicit trust gate, driven by a declarative spec (`~/.niubash/plugins.toml`) with lockfile verbs (`add/list/enable/disable/trust/sync/update/restore/rollback/clean/source/recipe/distro/mirror/ui`).
+- **Launcher verbs** — `setup`, `font`, `doctor`, `config`, `plugin`, `skill`, `--self-update`; table in `references/quickref.md`.
+- **Verbatim handoff** — `--encoded-command`/`-EncodedCommand`/`--ec <b64>` runs a base64 payload with zero quoting; optional `v1:` prefix guards MSYS-family rewriting in transit.
+- **Plugin system** — git-clone-only external sources (oh-my-bash, bash-it, bpkg) behind an explicit trust gate, driven by a declarative spec (`~/.niubash/plugins.toml`) with lockfile verbs (`add/list/enable/disable/trust/sync/update/restore/rollback/clean/migrate-rc/source/recipe/distro/mirror/ui`).
 - **TUI surfaces** — `niu setup` wizard (theme/prompt/tools), `niu plugin ui` menu, theme gallery, `niu font` picker; all non-interactive-friendly and safe to skip (`-c` loads none of them).
 - **Bundle version**: niubash 1.4.3 (generated; see `scripts/generate-skill.py`).
 <!-- END GENERATED:capability-snapshot -->
@@ -84,24 +87,58 @@ line per command). Launcher verbs and the plugin verb table:
 - **Path forms.** Native `C:/Users/me` (or `C:\Users\me`) is always safe
   and is what Windows executables should receive. `/tmp` is the **real
   Windows temp directory**, never the install tree; `/usr/bin` is the
-  WinuxCmd install root, not a POSIX root; `~` = `USERPROFILE`. Details and
-  the MSYS contrast table: `references/paths.md`.
-- **Theme system.** The interactive prompt is configured by `~/.niubashrc`
-  (`NIU_THEME`, `NIU_PLUGINS=(...)` packs) and `niu setup`; icon themes
-  need a Nerd Font (`niu font`). Don't invent theme or pack names — check
-  `references/prompt-plugins.md`, and never edit files inside the installed
-  bundle directory (user plugins live in `~/.niubash/custom`).
-- **Startup flow.** Interactive start sources `~/.niubashrc`, which loads
-  the oh-my-niu bundle and ends in a guarded `plugin sync --bootstrap`
-  block (idempotent, keyed on `"${NIU_SHELL:-niu}"`). `niu -c` and script
-  runs load **no rc and no plugins** by design — quiet and deterministic.
-  Non-interactive init: `NIU_ENV=<file>` (or bash-compatible `BASH_ENV`,
-  lower precedence) is sourced once before the command.
-- **When `NIU_SHELL` matters.** Niubash exports it (its own executable
-  path) in every process it starts; the `bash`/`sh` forwarder shims and the
-  rc bootstrap resolve the shell through it. When sourcing `~/.niubashrc`
-  from a *foreign* shell, the guarded block is safe only because of that
-  fallback chain — don't "simplify" it to a bare `niu`.
+  WinuxCmd install root, not a POSIX root; `~` = `USERPROFILE`. Bare drive
+  designators work the cmd way: `D:` and `cd D:` jump to that drive's
+  root (`/d/`), identical across `-c`, brace groups, and piped `niu -i`.
+  Details and the MSYS contrast table: `references/paths.md`.
+- **Prompt & plugins.** There is no built-in theme engine: the rc is
+  plain bash and the prompt belongs to whatever claims `PS1` — a hand-set
+  line, `eval "$(starship init bash)"`, or an external framework
+  (oh-my-bash, bash-it) installed through `niu plugin` and activated by
+  the generated loader. `NIU_THEME`/`NIU_PLUGINS` lines in an old rc are
+  inert assignments — the native pack/theme stack is retired
+  (niubash#145). Icon themes need a Nerd Font (`niu font`). Contract:
+  `references/prompt-plugins.md`.
+- **Startup flow.** Interactive start sources the generated plugin loader
+  `~/.niubash/generated/plugins.niu` — host-owned, derived from the
+  `plugins.toml` manifest, regenerated by `niu plugin` verbs, never
+  hand-edited — BEFORE `~/.niubashrc`, so user PS1/alias/function
+  overrides win. The loader stays off while the rc still carries a
+  superseded managed block (a one-time hint names `niu plugin migrate-rc`,
+  the read-only review; removing the block is always the user's own edit)
+  or when `NIU_PLUGIN_LOADER=off` is set. No verb writes `~/.niubashrc`.
+  `niu -c` and script runs load **no rc and no plugins** by design — quiet
+  and deterministic. Non-interactive init: `NIU_ENV=<file>` (or
+  bash-compatible `BASH_ENV`, lower precedence) is sourced once before
+  the command.
+- **When `NIU_SHELL` matters.** Niubash exports `NIU_SHELL` with its own
+  `niu.exe` path in every process it starts, and fills `SHELL` — the
+  POSIX-convention variable agents probe — with the same path when the
+  host left it unset; the `bash`/`sh` faces and the rc bootstrap resolve
+  the shell through `NIU_SHELL`. `WINUXSH_SHELL` is a deprecated bridge
+  the engine still reads — do not build on it.
+
+## Behavior notes — recent engine fixes an agent can rely on
+
+- A `wpm install` (or any new file landing on `PATH`) is runnable in the
+  same session: the command resolver's negative cache invalidates when the
+  file appears — no shell restart or `hash -r` needed (the builtin still
+  works).
+- `unset NAME` on a variable inherited from the process environment
+  removes it for real — children spawned afterwards no longer see it.
+- Interactive multi-line input cannot wedge on a stray `)` any more:
+  inside an open group it ends the gather with a single GNU-style
+  diagnostic and rc 2, returning to PS1.
+- `${...}` expansions containing quotes or command substitutions parse to
+  the real closing brace (no early-close split), redirect diagnostics
+  name the fd that actually failed through the ordered fd table, and
+  negated groups like `! { ...; }` parse.
+- Literal private-use-area characters in a `-c` operand pass through
+  verbatim — the engine's internal marker zone is only re-entered under
+  double-escape, so real U+E3xx bytes in a script are safe.
+- The interactive line editor redraws multibyte/CJK prompts correctly
+  (vendored Bash patches 17–20 rode in with the engine's upgrade to
+  patch 20).
 
 ## Decision guidance — niu vs cmd vs powershell
 
@@ -129,11 +166,20 @@ own native APIs, never as a compatibility detour.
   workarounds.
 - Reserve `niu -c "..."` for when an external host must launch Niubash
   non-interactively: quiet, deterministic, exit codes propagate exactly.
+- When a host cannot safely quote a command line at all, use the verbatim
+  handoff — a base64 payload instead of an inline command:
+  `niu --encoded-command <b64>` (canonical), `-EncodedCommand <b64>`
+  (PowerShell spelling, case-insensitive), or `--ec <b64>`; an optional
+  `v1:` prefix on the payload guards it against MSYS-family rewriting in
+  transit. `niu -C <cmd>` runs one command with REPL startup semantics,
+  and `--cwd-state <file>` lets a relaunching host restore and re-record
+  the session directory.
 
 ## References
 
 - `references/quickref.md` — generated command tables: launcher verbs,
   plugin verbs, full built-in table, winuxcmd applet inventory.
 - `references/paths.md` — the path contract and the MSYS contrast.
-- `references/prompt-plugins.md` — rc contract, themes, oh-my-niu packs.
+- `references/prompt-plugins.md` — rc contract, prompt ownership, the
+  external plugin sources and the generated loader.
 - `references/wpm.md` — package discovery, links repair, index flows.
