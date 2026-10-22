@@ -2,6 +2,8 @@
   <img src="assets/niubash-banner.svg" alt="niubash — real Bash, native on Windows, Linux, and macOS." />
 </p>
 
+# Niubash — native Bash for Windows (Git Bash alternative)
+
 > **Real Bash, native on Windows, Linux, and macOS.** "Windows-only" is the
 > old story: five platforms build from this tree now, and Windows remains
 > the flagship — no WSL. No VM. No `/mnt/c`. No cmdlet dialect. One binary:
@@ -23,7 +25,7 @@ Docs & downloads: [unixwin.dev](https://unixwin.dev)
 
 </div>
 
-**niubash** is a Bash-compatible shell implemented natively in Rust. On
+**niubash** is a Bash-compatible shell implemented natively in Rust, a Git Bash alternative. On
 Windows, the flagship platform, one `niu.exe` bundles everything: the
 [rubash](https://github.com/unixwin/rubash) language engine, real Unix
 commands from [winuxcmd](https://github.com/unixwin/winuxcmd), a git-aware
@@ -43,7 +45,7 @@ and how to point the rest at niu. The
 Linux and macOS builds
 are portable `niu` binaries that use your system's own tools. niu is not
 MSYS2, Cygwin, Git Bash, or WSL — there is no POSIX emulation layer and no
-path-conversion heuristics. The full per-platform contract, including the
+path-conversion heuristics. It is a from-scratch replacement for Git Bash: a native Windows binary with no POSIX emulation. The full per-platform contract, including the
 honest status of every target, lives in
 [platform-support.md](docs/src/platform-support.md).
 

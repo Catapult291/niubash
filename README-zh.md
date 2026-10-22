@@ -2,6 +2,8 @@
   <img src="assets/niubash-banner.svg" alt="niubash — real Bash, native on Windows, Linux, and macOS." />
 </p>
 
+# Niubash — 原生 Windows Bash（Git Bash alternative）
+
 > **真·Bash，Windows、Linux、macOS 原生构建。**"只能跑 Windows"是旧印象：
 > 现在有五个平台从这条树里构建，Windows 依旧是旗舰——不用 WSL，不开虚拟机，
 > 没有 `/mnt/c`，没有 cmdlet 方言。一个二进制：你手指肌肉记得的那个 shell，
@@ -22,7 +24,7 @@
 
 </div>
 
-**niubash** 是用 Rust 原生实现的 Bash 兼容 shell。在旗舰平台 Windows 上，
+**niubash** 是用 Rust 原生实现的 Bash 兼容 shell（Git Bash alternative）。在旗舰平台 Windows 上，
 一个 `niu.exe` 打包全部：[rubash](https://github.com/unixwin/rubash) 语言引擎、
 来自 [winuxcmd](https://github.com/unixwin/winuxcmd) 的真 Unix 命令、
 带 git 状态的 prompt，以及带权限模型的插件系统。git 来自
@@ -37,7 +39,7 @@ shell 脚本部分（hooks、`git bisect`、`git mergetool`）跑在 niubash 自
 agent 跑什么 shell、怎么把其余的指过来，见
 [Coding agents on Windows](docs/src/agents.md)。Linux 与 macOS 构建是
 便携 `niu` 二进制，直接用系统自带的工具。niu 不是 MSYS2、Cygwin、Git Bash，
-也不是 WSL——没有 POSIX 模拟层，也没有启发式的路径转换。每个平台的完整契约
+也不是 WSL——没有 POSIX 模拟层，也没有启发式的路径转换。它是 Git Bash 的 from-scratch replacement：原生 Windows 二进制，无 POSIX 模拟层。每个平台的完整契约
 （包括每个目标的诚实状态）见
 [platform-support.md](docs/src/platform-support.md)。
 
