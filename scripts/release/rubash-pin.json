@@ -1,10 +1,10 @@
 {
   "schema": 1,
-  "rubash_rev": "25b0850df24fd28260715128c000b7b3d895ae24",
-  "rubash_version": "1.4.2",
+  "rubash_rev": "fa64d58dfb9c97d05f2f3d1f9bf3b73e68a2e28e",
+  "rubash_version": "1.4.3",
   "description": "Rubash source pin for niubash releases (rubash#827, conclusion B). Every release job fetches exactly this rubash commit into ../rubash -- where the [patch] path override in Cargo.toml deterministically picks it up -- and fails the release unless the checked-out HEAD equals rubash_rev. This is the source-level twin of winuxcmd-pin.json (niubash#312/#327): the bundled WinuxCmd was already pinned, but the compiled engine was \"whatever rubash master HEAD was at build time\".",
   "notes": [
-    "Recorded from rubash master 25b0850d (2026-10-21, Cargo.toml version 1.4.2) — includes #939 (build provenance stamp), #946/#947/#944 (marker/fd/catalogue families), #953/#952 (bare-drive + -c escaping), #955+#484 chain (gather wedge P1), #957 (vendored bash patch 20), #943 (env unbind inherited-name fix), #925-#927 (perf + test matrices).",
-    "NOTE: the rev includes #863-era lock self-entry discipline; rubash Cargo.toml version 1.4.2 must match this pin's rubash_version."
+    "Recorded from rubash master fa64d58d (2026-10-22, Cargo.toml version 1.4.3 — the v1.4.3 tag commit) — includes #939 (build provenance stamp), #946/#947/#944 (marker/fd/catalogue families), #953/#952 (bare-drive + -c escaping), #955+#484 chain (gather wedge P1), #957 (vendored bash patch 20), #943 (env unbind inherited-name fix), #925-#927 (perf + test matrices).",
+    "NOTE: the rev includes #863-era lock self-entry discipline; rubash Cargo.toml version 1.4.3 must match this pin's rubash_version."
   ]
 }
