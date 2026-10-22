@@ -170,10 +170,10 @@ Windows：去 [Releases](https://github.com/unixwin/niubash/releases) 下载
 Terminal 配置自动配好。
 Windows（winget）：`winget install --id Unixwin.Niubash`——不要管理员权限，
 PATH 和 Windows Terminal 配置自动配好。
-要便携版就拿 `.tar.gz`——捆绑的 git/awk 载荷以真
-硬链接出厂，下载和解包都比 `.zip` 小得多（`tar -xf
-niubash-v*-win-x64.tar.gz`，Windows 10+ 自带）；`.zip` 留给只认 zip 的
-工具链。
+要便携版就拿 `.7z`——捆绑的 git/awk 载荷硬链接原样保留，体积最小；
+`.tar.gz` 也行（`tar -xf niubash-v*-win-x64.tar.gz`，Windows 10+ 自带）。
+别用 `.zip`：它存不了硬链接，载荷被重复存放，包大得多，只留给除 zip
+什么都不认的工具链。
 
 Linux（x86_64、aarch64；glibc 2.35+）与 macOS（aarch64、x86_64）：拿
 便携 tarball，解包即跑：
