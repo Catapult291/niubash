@@ -48,7 +48,7 @@ agent 跑什么 shell、怎么把其余的指过来，见
 | Windows x64 / ARM64 | 已发布；每次发布过烟测门禁 | 安装器 `.exe` + `.zip`，Unix 命令随包 |
 | Linux x86_64 / aarch64（glibc 2.35+） | 已发布；每次发布过烟测门禁 | 便携 `.tar.gz`，用系统自带工具 |
 | macOS aarch64 / x86_64 | 已发布；每次发布过烟测门禁 | 便携 `.tar.gz`，用系统自带工具 |
-| Android aarch64 / armv7 | 仅 CI 构建，未发布 | NDK 链接 zip，只进 workflow 产物，未过烟测 |
+| Android aarch64 / armv7 | v1.4.3 起随 release 发货；在真机上运行（Termux），CI 自动烟测腿尚未接上 | NDK 链接 `.zip` release 资产 |
 | OpenHarmony（`aarch64-unknown-linux-ohos`） | 仅 CI check，未发布 | CI 保持可编译，未在真机运行 |
 
 "烟测门禁"指产物构建完成后、上传之前，在它自己的 OS 上跑四项检查
@@ -56,17 +56,18 @@ agent 跑什么 shell、怎么把其余的指过来，见
 ——门禁在 `release.yml` 里（"no smoke, no artifact"：Linux 腿在
 `ubuntu-22.04`/`ubuntu-22.04-arm` 原生跑，macOS x86_64 腿在 Rosetta 2 下跑），
 发布整体还额外被 golden user journey 与逐资产计时预算两道门拦着。
-Android 和 OpenHarmony 还没过这道门：Android 产物只做了构建与链接验证
-（ELF 形状检查，明确不是运行时烟测），OpenHarmony 只做了编译检查，
-两者都不宣称可日常使用。各平台完整契约与
+OpenHarmony 还没过这道门（只做编译检查，没在真机上跑过）。Android 自
+v1.4.3 起随 release 发货 `.zip`，在真机上运行（Termux aarch64/armv7，
+日常使用 + 机上实测基线）；缺的是 CI 里那条自动化逐 release 烟测腿，
+目前只接了 Windows/Linux/macOS。OpenHarmony 仍不宣称可用。各平台完整契约与
 全量状态矩阵见 [platform-support.md](docs/src/platform-support.md)。
 
 快答：
 
 - **niu 需要 WSL 吗？** 不需要。niu 在所有发布平台上都是原生构建：Windows 上没有 Linux 虚拟机、没有模拟层、没有 `/mnt/c`。
-- **niu 能跑在哪些平台？** 已发布：Windows（x64、ARM64）、Linux（x86_64、aarch64；glibc 2.35+）、macOS（aarch64、x86_64）。Android（aarch64、armv7）与 OpenHarmony（aarch64）在 CI 里构建，尚无发布；Android 另有一份实测性能基线（见[性能](#性能)）。
+- **niu 能跑在哪些平台？** 已发布：Windows（x64、ARM64）、Linux（x86_64、aarch64；glibc 2.35+）、macOS（aarch64、x86_64）、Android（aarch64、armv7；v1.4.3 起 `.zip` 随 release 发货，真机可运行）。OpenHarmony（aarch64）在 CI 里构建，尚无发布；Android 另有一份实测性能基线（见[性能](#性能)）。
 - **niu 跑得了真 Bash 脚本吗？** 跑得了。rubash 引擎以 GNU Bash 官方上游测试套件作门禁，记录在[兼容性矩阵](docs/src/rubash-bash-compat-matrix.md)。
-- **现在能在 Android 或鸿蒙上装 niu 吗？** 还不能。两个目标都能在 CI 里编译，但都没跑过运行时烟测，没有可安装的产物。
+- **现在能在 Android 或鸿蒙上装 niu 吗？** Android 能：v1.4.3 起 release 自带 `.zip`，真机（Termux aarch64/armv7）可运行。鸿蒙还不能：CI 能编译，但没有可安装产物。
 
 ## 实证
 

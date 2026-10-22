@@ -54,7 +54,7 @@ honest status of every target, lives in
 | Windows x64 / ARM64 | Released; smoke-gated every release | installer `.exe` + portable `.tar.gz`/`.7z`/`.zip`, Unix commands bundled |
 | Linux x86_64 / aarch64 (glibc 2.35+) | Released; smoke-gated every release | portable `.tar.gz`, uses system tools |
 | macOS aarch64 / x86_64 | Released; smoke-gated every release | portable `.tar.gz`, uses system tools |
-| Android aarch64 / armv7 | CI build only, no release | NDK-linked zip on workflow runs, not smoke-tested |
+| Android aarch64 / armv7 | Shipped since v1.4.3; runs on real devices (Termux), release smoke gate not yet wired in CI | NDK-linked `.zip` release asset |
 | OpenHarmony (`aarch64-unknown-linux-ohos`) | CI check only, no release | kept compiling by CI, never run on a device |
 
 "Smoke-gated" means the artifact is built, then run on its own OS against
@@ -63,10 +63,12 @@ coreutils, the offline plugin stack) before upload — the gate lives in
 `release.yml` ("no smoke, no artifact": Linux legs run it natively on
 `ubuntu-22.04`/`ubuntu-22.04-arm`, the macOS x86_64 leg under Rosetta 2),
 and the release as a whole additionally blocks on the golden user journey
-and the per-asset timing budget gates. Android and OpenHarmony have not
-passed that gate: Android artifacts are build- and link-verified only (an
-ELF shape check, explicitly not a runtime smoke), OpenHarmony is
-compile-checked only, and neither claims device readiness. The
+and the per-asset timing budget gates. OpenHarmony has not passed that
+gate (compile-checked only, never run on a device). Android ships release
+`.zip` assets since v1.4.3 and runs on real devices (Termux aarch64/armv7,
+daily-driven with on-device benchmark baselines); what it lacks is the
+automated per-release smoke leg in CI, which is wired for Windows/Linux/
+macOS only. The
 per-platform contract and the full status matrix live in
 [platform-support.md](docs/src/platform-support.md).
 
@@ -77,15 +79,17 @@ Quick answers:
   `/mnt/c`.
 - **What platforms does niu run on?** Released builds cover Windows (x64,
   ARM64), Linux (x86_64, aarch64; glibc 2.35+), and macOS (aarch64,
-  x86_64). Android (aarch64, armv7) and OpenHarmony (aarch64) build in CI
-  and have no release yet; Android additionally carries a measured
+  x86_64). OpenHarmony (aarch64) builds in CI and has no release yet;
+  Android (aarch64, armv7) ships release `.zip` assets since v1.4.3 and
+  runs on real devices (Termux). Android additionally carries a measured
   performance baseline (see [Performance](#performance)).
 - **Does niu run real Bash scripts?** Yes. The rubash engine is gated on
   GNU Bash's own upstream test suites; the record lives in the
   [compatibility matrix](docs/src/rubash-bash-compat-matrix.md).
-- **Can I install niu on Android or HarmonyOS today?** Not yet. Both
-  targets compile in CI, neither has passed a runtime smoke test, so there
-  is nothing to install.
+- **Can I install niu on Android or HarmonyOS today?** Android yes:
+  release `.zip` assets ship since v1.4.3 and run on real devices
+  (Termux aarch64/armv7). HarmonyOS not yet: it compiles in CI but has
+  no installable artifact.
 
 ## Receipts
 
