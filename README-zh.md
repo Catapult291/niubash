@@ -45,7 +45,7 @@ agent 跑什么 shell、怎么把其余的指过来，见
 
 | 平台 | 状态 | 发布形态 |
 |---|---|---|
-| Windows x64 / ARM64 | 已发布；每次发布过烟测门禁 | 安装器 `.exe` + `.zip`，Unix 命令随包 |
+| Windows x64 / ARM64 | 已发布；每次发布过烟测门禁 | 安装器 `.exe` + 便携 `.tar.gz`/`.7z`/`.zip`，Unix 命令随包 |
 | Linux x86_64 / aarch64（glibc 2.35+） | 已发布；每次发布过烟测门禁 | 便携 `.tar.gz`，用系统自带工具 |
 | macOS aarch64 / x86_64 | 已发布；每次发布过烟测门禁 | 便携 `.tar.gz`，用系统自带工具 |
 | Android aarch64 / armv7 | v1.4.3 起随 release 发货；在真机上运行（Termux），CI 自动烟测腿尚未接上 | NDK 链接 `.zip` release 资产 |
