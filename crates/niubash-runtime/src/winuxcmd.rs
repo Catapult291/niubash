@@ -187,6 +187,7 @@ pub fn prepare_winuxcmd_with_override(override_path: Option<&Path>) -> Result<Pa
         .unwrap_or_else(|| installation_root(&exe));
     auto_activate_bundled_winuxcmd(&exe);
     prepend_root_dirs_to_path(&root, &exe)?;
+    prepend_session_link_dirs(&exe);
     Ok(exe)
 }
 
@@ -207,7 +208,30 @@ pub fn ensure_on_path_with_override(override_path: Option<&Path>) -> Result<Path
     let root = installation_root_for_report(&report, &exe);
     auto_activate_bundled_winuxcmd(&exe);
     prepend_root_dirs_to_path(&root, &exe)?;
+    prepend_session_link_dirs(&exe);
     Ok(root.join("usr").join("bin"))
+}
+
+/// The root that owns this session's link family. A packaged (MSIX)
+/// install keeps its own tree read-only, so command links materialize in
+/// the per-package writable root — the same root `prepare_shell_root`
+/// prepares (`NIU_ROOT`). Everywhere else links live in the installation
+/// root beside `winuxcmd.exe` (niubash#495). Windows-only at compile
+/// time: its only consumer is the activation path's `wpm links rebuild`
+/// block, which is itself Windows-only.
+#[cfg(windows)]
+fn session_links_root(exe: &Path) -> PathBuf {
+    crate::msix::session_writable_root().unwrap_or_else(|| installation_root(exe))
+}
+
+/// The directory carrying the session's command links: `<root>\usr\bin`
+/// under MSIX, the executable's own directory otherwise (exactly the
+/// location the unpackaged contract always used).
+fn session_link_bin(exe: &Path) -> PathBuf {
+    if let Some(root) = crate::msix::session_writable_root() {
+        return root.join("usr").join("bin");
+    }
+    exe.parent().map(Path::to_path_buf).unwrap_or_default()
 }
 
 /// Return the real installation root for a selected WinuxCmd executable.
@@ -375,7 +399,34 @@ fn prepend_root_dirs_to_path(root: &Path, exe: &Path) -> Result<PathBuf> {
     Ok(exe_dir)
 }
 
+/// Under MSIX the link family sits in the writable per-package root, not
+/// the read-only install tree. Its PATH dirs go ahead of the package's —
+/// session-resolved applets and wpm-managed shims win — without stripping
+/// the package dirs the flat payloads (git.exe, rg.exe, …) still ride in
+/// (niubash#495). Non-packaged installs are a no-op here.
+fn prepend_session_link_dirs(exe: &Path) {
+    let Some(links_root) = crate::msix::session_writable_root() else {
+        return;
+    };
+    let dirs = injected_path_dirs(&links_root, exe);
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = path_with_dirs_prepended_impl(&current_path, &dirs, false);
+    if new_path == current_path {
+        return;
+    }
+    std::env::set_var("PATH", &new_path);
+    log::debug!("msix session PATH injected from: {}", links_root.display());
+}
+
 fn path_with_dirs_prepended(current_path: &str, dirs: &[PathBuf]) -> String {
+    path_with_dirs_prepended_impl(current_path, dirs, true)
+}
+
+fn path_with_dirs_prepended_impl(
+    current_path: &str,
+    dirs: &[PathBuf],
+    strip_winuxcmd_entries: bool,
+) -> String {
     let desired = dirs
         .iter()
         .map(|dir| comparable_path_entry(&dir.to_string_lossy()))
@@ -387,7 +438,7 @@ fn path_with_dirs_prepended(current_path: &str, dirs: &[PathBuf]) -> String {
             let comparable = comparable_path_entry(entry);
             (!entry.is_empty()
                 && !desired.iter().any(|dir| dir == &comparable)
-                && !is_winuxcmd_installation_entry(entry))
+                && !(strip_winuxcmd_entries && is_winuxcmd_installation_entry(entry)))
             .then(|| entry.to_string())
         })
         .collect();
@@ -466,11 +517,12 @@ fn auto_activate_bundled_winuxcmd(exe: &Path) {
         return;
     }
 
-    let Some(dir) = exe.parent() else {
+    let link_bin = session_link_bin(exe);
+    if link_bin.as_os_str().is_empty() {
         return;
-    };
+    }
 
-    if has_required_command_links(dir) {
+    if has_required_command_links(&link_bin, exe) {
         return;
     }
 
@@ -484,17 +536,23 @@ fn auto_activate_bundled_winuxcmd(exe: &Path) {
     // builds, and winuxcmd.exe is a Windows binary anyway).
     #[cfg(windows)]
     {
-        let root = installation_root(exe);
+        let install_root = installation_root(exe);
+        // niubash#495: under MSIX the install tree is read-only; the link
+        // family lands in the per-package writable root instead.
+        let links_root = session_links_root(exe);
+        if links_root != install_root {
+            prepare_packaged_links_root(&links_root, &install_root, exe);
+        }
         match crate::console_guard::suppressed_command(exe)
             .args(["wpm", "links", "rebuild", "--root"])
-            .arg(&root)
+            .arg(&links_root)
             .arg("--force")
             .output()
         {
             Ok(output) if output.status.success() => {
                 log::debug!(
                     "winuxcmd activation completed via wpm links rebuild (root {})",
-                    root.display()
+                    links_root.display()
                 );
             }
             Ok(output) => {
@@ -514,20 +572,28 @@ fn auto_activate_bundled_winuxcmd(exe: &Path) {
         // install, so a successful `links rebuild` can still leave them on
         // the previous winuxcmd.exe image. Heal them in-process before
         // reporting the set complete.
-        let shims = reconcile_bundled_shims(&root, true);
+        let shims = reconcile_bundled_shims(&links_root, true);
         if !shims.failed.is_empty() {
             log::debug!(
                 "bundled shim reconcile left {} name(s) unresolved",
                 shims.failed.len()
             );
         }
-        if has_required_command_links(dir) {
+        if has_required_command_links(&link_bin, exe) {
             return;
         }
         log::debug!(
             "expected links are still missing in {}; falling back to activation script",
-            dir.display()
+            link_bin.display()
         );
+    }
+
+    // niubash#497: a packaged install keeps the bundled script beside the
+    // read-only package executable, and it writes the package root — under
+    // MSIX it can only burn seconds and exit 1. The `wpm links rebuild`
+    // plus the in-process reconcile above are the whole activation there.
+    if crate::msix::is_packaged() {
+        return;
     }
 
     // Fallback for older WinuxCmd builds without the `wpm` subcommand: run
@@ -548,9 +614,12 @@ fn auto_activate_bundled_winuxcmd(exe: &Path) {
         .file_name()
         .unwrap_or_else(|| std::ffi::OsStr::new("activate-winuxcmd.sh"));
 
+    let Some(script_dir) = script.parent() else {
+        return;
+    };
     match crate::console_guard::suppressed_command(current_exe)
         .arg(script_name)
-        .current_dir(dir)
+        .current_dir(script_dir)
         .env("NIU_SKIP_WINUXCMD_ACTIVATION", "1")
         .output()
     {
@@ -577,21 +646,42 @@ fn bundled_activation_script(exe: &Path) -> Option<PathBuf> {
     script.is_file().then_some(script)
 }
 
-fn has_required_command_links(dir: &Path) -> bool {
+fn has_required_command_links(bin_dir: &Path, engine: &Path) -> bool {
     // Presence is not enough: a command link left on the *previous*
     // winuxcmd.exe by an update runs an older build forever, and nothing else
     // notices (unixwin/WinuxCmd#1206 - observed as a stale `yes.exe` hours
     // after the update). Comparing identity makes activation - which runs
     // `wpm links rebuild --force` when this returns false - repair the set on
     // the next shell start instead of waiting for someone to look.
-    let engine = dir.join("winuxcmd.exe");
+    //
+    // The image the links bind to is the engine materialized *beside* them
+    // when one exists (niubash#497): under MSIX the package's winuxcmd.exe
+    // cannot be hardlinked into the writable root, so activation leaves a
+    // copy there and `wpm links rebuild` links against that copy — a
+    // different file identity carrying the same bytes. Comparing the links
+    // against the resolved package `engine` instead would fail on every
+    // session start and re-run an activation that can never converge. The
+    // materialized copy must still BE the resolved image, though: a
+    // package upgrade leaves a stale copy whose own link family would
+    // otherwise pass.
+    let materialized = bin_dir.join("winuxcmd.exe");
+    let engine = if materialized.is_file() {
+        if !super::shell_links::same_file(&materialized, engine)
+            && !same_file_bytes(&materialized, engine)
+        {
+            return false;
+        }
+        materialized
+    } else {
+        engine.to_path_buf()
+    };
     let builtins_ready = ["ls.exe", "cat.exe", "grep.exe", "ln.exe"]
         .iter()
         .all(|name| {
-            let link = dir.join(name);
+            let link = bin_dir.join(name);
             link.is_file() && super::shell_links::same_file(&engine, &link)
         });
-    builtins_ready && bundled_shim_links_current(dir)
+    builtins_ready && bundled_shim_links_current(bin_dir, &engine)
 }
 
 /// The bundled-shim half of `has_required_command_links` (niubash#468): a
@@ -599,12 +689,13 @@ fn has_required_command_links(dir: &Path) -> bool {
 /// image counts as "activation needed", so a stale `awk.exe`/`gawk.exe`
 /// heals on the next shell start the way the builtins heal.
 ///
-/// `dir` is the directory holding `winuxcmd.exe`; the bundled contract only
-/// exists for the `<root>\usr\bin` layout — a flat portable layout or the
-/// `bin` PATH-entry directory declares nothing and is always "current".
-/// Names the machine's own `.wpm` state claims are wpm's problem, not ours.
-fn bundled_shim_links_current(dir: &Path) -> bool {
-    let Some(usr) = dir.parent() else {
+/// `bin_dir` is the directory holding the session's `winuxcmd` links; the
+/// bundled contract only exists for the `<root>\usr\bin` layout — a flat
+/// portable layout or the `bin` PATH-entry directory declares nothing and
+/// is always "current". Names the machine's own `.wpm` state claims are
+/// wpm's problem, not ours.
+fn bundled_shim_links_current(bin_dir: &Path, engine: &Path) -> bool {
+    let Some(usr) = bin_dir.parent() else {
         return true;
     };
     if usr.file_name().is_none_or(|name| name != "usr") {
@@ -613,8 +704,7 @@ fn bundled_shim_links_current(dir: &Path) -> bool {
     let Some(root) = usr.parent() else {
         return true;
     };
-    let engine = dir.join("winuxcmd.exe");
-    let forwarder = dir.join("winuxcmd-shim.exe");
+    let forwarder = bin_dir.join("winuxcmd-shim.exe");
     for component in crate::setup_wizard::bundled_link_shim_components() {
         let opt = root.join("opt").join(component.opt_dir);
         for shim in component.shims {
@@ -625,8 +715,8 @@ fn bundled_shim_links_current(dir: &Path) -> bool {
             if wpm_declares_command(root, shim) {
                 continue;
             }
-            let target = dir.join(shim);
-            if !bundled_shim_is_current(&target, &engine, &forwarder) {
+            let target = bin_dir.join(shim);
+            if !bundled_shim_is_current(&target, engine, &forwarder) {
                 return false;
             }
         }
@@ -729,6 +819,201 @@ fn materialize_link(source: &Path, target: &Path) -> Result<()> {
                 target.display()
             )
         }),
+    }
+}
+
+/// Materialize the pieces of the writable link root that
+/// `wpm links rebuild --root <writable>` does not cover (niubash#495):
+///
+/// - `usr\bin\winuxcmd.exe` so the canonical engine the links bind to is
+///   the package's image — and so a `winuxcmd`/`wpm` resolved through the
+///   injected PATH derives its default root from its own module path,
+///   which keeps `.wpm` receipts beside the links they manage;
+/// - an `opt` view over the install's payload tree, so shim-layout
+///   forwarding (`forwardToOptPayload` resolves `<root>\opt` from the
+///   invoked link's own path) reaches the package payloads.
+#[cfg(windows)]
+fn prepare_packaged_links_root(links_root: &Path, install_root: &Path, exe: &Path) {
+    let links_bin = links_root.join("usr").join("bin");
+    if let Err(error) = std::fs::create_dir_all(&links_bin) {
+        log::debug!(
+            "msix links bin {} is not writable: {}",
+            links_bin.display(),
+            error
+        );
+        return;
+    }
+    let engine_link = links_bin.join("winuxcmd.exe");
+    // niubash#497: a hardlink into the writable root cannot bind the
+    // package image (WindowsApps refuses the link), so activation falls
+    // back to a copy — and a byte-equal copy IS the current image, not a
+    // reason to re-materialize (and re-verify every link) each session.
+    if !super::shell_links::same_file(&engine_link, exe) && !same_file_bytes(&engine_link, exe) {
+        if let Err(error) = materialize_link(exe, &engine_link) {
+            log::debug!(
+                "msix engine link {} -> {} failed: {}",
+                engine_link.display(),
+                exe.display(),
+                error
+            );
+        }
+    }
+    prepare_packaged_opt_view(links_root, install_root);
+}
+
+/// Whether `path` is a reparse point (junction, symlink) — checked with
+/// `symlink_metadata` so the link itself is examined, not its target.
+#[cfg(windows)]
+fn is_reparse_point(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    // FILE_ATTRIBUTE_REPARSE_POINT (0x400).
+    std::fs::symlink_metadata(path)
+        .map(|meta| meta.file_attributes() & 0x400 != 0)
+        .unwrap_or(false)
+}
+
+/// Copy `source` into `target` recursively (plain files and directories;
+/// payload trees ship no links worth preserving). Used for the payload
+/// directories the writable root must own outright.
+#[cfg(windows)]
+fn copy_tree(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let destination = target.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_tree(&entry.path(), &destination)?;
+        } else if file_type.is_file() {
+            std::fs::copy(entry.path(), &destination)?;
+        }
+    }
+    Ok(())
+}
+
+/// The writable root's `opt` view over the read-only package payloads
+/// (niubash#497). It is a real directory of per-package entries so both
+/// shapes can coexist:
+///
+/// - forwarded (`layout: shim`) payloads land as real copies — the app
+///   container denies a `CreateProcess` whose target reaches into the
+///   package through a junction;
+/// - every other package gets a per-package junction — the writable view
+///   over read-only payloads the earlier single `opt` junction provided
+///   (that shape is converted on the next activation).
+///
+/// Both forms self-heal: a junction left dangling by a package upgrade —
+/// the install root is versioned, so an old target disappears — is
+/// recreated, and a copied payload whose exes drifted from the package
+/// bytes is recopied.
+#[cfg(windows)]
+fn prepare_packaged_opt_view(links_root: &Path, install_root: &Path) {
+    let package_opt = install_root.join("opt");
+    if !package_opt.is_dir() {
+        return;
+    }
+    let opt = links_root.join("opt");
+    // Convert the single-junction shape the first packaged builds wrote:
+    // a reparse point at `opt` itself must go before the real directory
+    // can hold per-package entries.
+    if is_reparse_point(&opt) && std::fs::remove_dir(&opt).is_err() {
+        log::debug!(
+            "msix opt junction {} could not be replaced by the opt view",
+            opt.display()
+        );
+        return;
+    }
+    if let Err(error) = std::fs::create_dir_all(&opt) {
+        log::debug!("msix opt dir {} is not writable: {}", opt.display(), error);
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&package_opt) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().map(|ty| !ty.is_dir()).unwrap_or(true) {
+            continue;
+        }
+        let name = entry.file_name();
+        let source = entry.path();
+        let target = opt.join(&name);
+        // A `layout: shim` payload's commands launch by `CreateProcess`
+        // from the forwarder — inside a real app-container that launch is
+        // denied when the payload path traverses a junction into
+        // `C:\Program Files\WindowsApps` (error 5), while the same payload
+        // copied under `LocalCache` runs — the same mechanism that lets
+        // flat payload copies (curl, 7z) work (niubash#497). Only the
+        // bundled shim set (gawk today) pays the copy; everything else
+        // junctions.
+        let component = crate::setup_wizard::bundled_link_shim_components()
+            .find(|component| name == std::ffi::OsStr::new(component.opt_dir));
+        match component {
+            Some(component) => ensure_opt_payload_copy(component, &source, &target),
+            None => ensure_opt_junction(&source, &target),
+        }
+    }
+}
+
+/// Keep `target` a live junction to `source`: absent names get created,
+/// dangling junctions (the package moved under a new versioned install
+/// root on upgrade) get recreated, and live junctions or real
+/// directories — e.g. a `wpm install` payload landed in the writable
+/// root itself — stay untouched.
+#[cfg(windows)]
+fn ensure_opt_junction(source: &Path, target: &Path) {
+    if std::fs::symlink_metadata(target).is_ok() {
+        // `is_dir` follows the junction: a live one resolves to its
+        // package directory, a real directory answers for itself.
+        if target.is_dir() {
+            return;
+        }
+        if is_reparse_point(target) {
+            let _ = std::fs::remove_dir(target);
+        }
+    }
+    if let Err(error) = crate::msix::create_junction(target, source) {
+        log::debug!(
+            "msix opt junction {} -> {} failed: {}",
+            target.display(),
+            source.display(),
+            error
+        );
+    }
+}
+
+/// Keep `target` a real copy of the `source` payload directory. The copy
+/// counts as current while every executable the component declares is
+/// byte-present; anything else (absent, a junction, stale bytes from the
+/// previous package build) is replaced wholesale.
+#[cfg(windows)]
+fn ensure_opt_payload_copy(
+    component: &crate::setup_wizard::BundledComponent,
+    source: &Path,
+    target: &Path,
+) {
+    let current = target.is_dir()
+        && !is_reparse_point(target)
+        && component
+            .exes
+            .iter()
+            .all(|exe| same_file_bytes(&source.join(exe), &target.join(exe)));
+    if current {
+        return;
+    }
+    if is_reparse_point(target) {
+        let _ = std::fs::remove_dir(target);
+    } else if target.is_dir() {
+        let _ = std::fs::remove_dir_all(target);
+    } else if target.exists() {
+        let _ = std::fs::remove_file(target);
+    }
+    if let Err(error) = copy_tree(source, target) {
+        log::debug!(
+            "msix opt payload copy {} -> {} failed: {}",
+            source.display(),
+            target.display(),
+            error
+        );
     }
 }
 
@@ -845,7 +1130,7 @@ pub fn reconcile_bundled_shims(root: &Path, force: bool) -> crate::shell_links::
 /// check; activation itself runs automatically at shell startup.
 pub fn command_links_ready() -> bool {
     find_winuxcmd()
-        .and_then(|exe| exe.parent().map(|dir| has_required_command_links(dir)))
+        .map(|exe| has_required_command_links(&session_link_bin(&exe), &exe))
         .unwrap_or(false)
 }
 
@@ -886,10 +1171,13 @@ pub fn list_commands() -> Vec<String> {
         }
     }
 
-    // Fallback: scan the directory for *.exe shims.
+    // Fallback: scan the link directory for *.exe shims (under MSIX the
+    // family lives in the writable root, not beside the package's
+    // winuxcmd.exe — niubash#495).
     if let Some(exe) = find_winuxcmd() {
-        if let Some(dir) = exe.parent() {
-            if let Ok(entries) = std::fs::read_dir(dir) {
+        let dir = session_link_bin(&exe);
+        {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
                 let mut cmds: Vec<String> = Vec::new();
                 for entry in entries.flatten() {
                     let path = entry.path();
@@ -1201,28 +1489,29 @@ mod tests {
     fn command_links_are_required_before_skipping_activation() {
         let dir = unique_temp_dir("winuxcmd-required-links");
         std::fs::create_dir_all(&dir).unwrap();
+        let engine = dir.join("winuxcmd.exe");
 
-        assert!(!has_required_command_links(&dir));
+        assert!(!has_required_command_links(&dir, &engine));
 
         // Names that are not links to this winuxcmd.exe do not count: an
         // update that left them on the previous image must trigger the rebuild.
         for name in ["ls.exe", "cat.exe", "grep.exe", "ln.exe"] {
             std::fs::write(dir.join(name), b"a different image").unwrap();
         }
-        assert!(!has_required_command_links(&dir));
+        assert!(!has_required_command_links(&dir, &engine));
 
         std::fs::write(dir.join("winuxcmd.exe"), b"the installed engine").unwrap();
         for name in ["ls.exe", "cat.exe", "grep.exe", "ln.exe"] {
             let _ = std::fs::remove_file(dir.join(name));
             std::fs::hard_link(dir.join("winuxcmd.exe"), dir.join(name)).unwrap();
         }
-        assert!(has_required_command_links(&dir));
+        assert!(has_required_command_links(&dir, &engine));
 
         // One stale name is enough to ask for a rebuild.
         let stale = dir.join("cat.exe");
         let _ = std::fs::remove_file(&stale);
         std::fs::write(&stale, b"previous image").unwrap();
-        assert!(!has_required_command_links(&dir));
+        assert!(!has_required_command_links(&dir, &engine));
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1390,23 +1679,146 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// niubash#497: under MSIX the link family binds to the engine copy
+    /// materialized beside the links — a different file identity carrying
+    /// the package's bytes — not to the resolved package exe itself.
+    /// Comparing links against the package path would reopen activation
+    /// on every session.
+    #[test]
+    fn materialized_engine_copy_is_the_link_identity() {
+        let base = unique_temp_dir("winuxcmd-msix-engine-copy");
+        let pkg_bin = base.join("pkg").join("usr").join("bin");
+        let links_bin = base.join("links").join("usr").join("bin");
+        std::fs::create_dir_all(&pkg_bin).unwrap();
+        std::fs::create_dir_all(&links_bin).unwrap();
+        let package_engine = pkg_bin.join("winuxcmd.exe");
+        std::fs::write(&package_engine, b"the packaged engine").unwrap();
+        // Activation's copy fallback: same bytes, different file identity.
+        let copy = links_bin.join("winuxcmd.exe");
+        std::fs::copy(&package_engine, &copy).unwrap();
+        for name in ["ls.exe", "cat.exe", "grep.exe", "ln.exe"] {
+            std::fs::hard_link(&copy, links_bin.join(name)).unwrap();
+        }
+
+        assert!(has_required_command_links(&links_bin, &package_engine));
+
+        // A package upgrade that changes the engine's bytes reopens
+        // activation: the stale copy's own link family must not pass on
+        // itself.
+        std::fs::write(&package_engine, b"the upgraded engine").unwrap();
+        assert!(!has_required_command_links(&links_bin, &package_engine));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// niubash#497: the writable `opt` view carries forwarded
+    /// (`layout: shim`) payloads as real copies — a CreateProcess through
+    /// a junction into the package is denied inside a real app-container —
+    /// and every other package as a per-package junction.
+    #[cfg(windows)]
+    #[test]
+    fn packaged_opt_view_copies_shim_payloads_and_junctions_the_rest() {
+        let base = unique_temp_dir("winuxcmd-msix-opt-view");
+        let install = base.join("install");
+        let install_opt = install.join("opt");
+        let links_root = base.join("links");
+        std::fs::create_dir_all(install_opt.join("gawk")).unwrap();
+        std::fs::create_dir_all(install_opt.join("other")).unwrap();
+        std::fs::write(install_opt.join("gawk").join("gawk.exe"), b"gnu awk").unwrap();
+        std::fs::write(install_opt.join("gawk").join("awk.exe"), b"gnu awk").unwrap();
+        std::fs::write(install_opt.join("other").join("tool.exe"), b"tool").unwrap();
+
+        prepare_packaged_opt_view(&links_root, &install);
+
+        let opt = links_root.join("opt");
+        assert!(opt.is_dir());
+        assert!(!is_reparse_point(&opt), "opt itself must be a real dir");
+
+        let gawk = opt.join("gawk");
+        assert!(gawk.is_dir());
+        assert!(
+            !is_reparse_point(&gawk),
+            "forwarded payloads are real copies"
+        );
+        assert_eq!(std::fs::read(gawk.join("gawk.exe")).unwrap(), b"gnu awk");
+
+        let other = opt.join("other");
+        assert!(is_reparse_point(&other), "other packages stay junctions");
+        assert!(other.join("tool.exe").is_file(), "junction resolves");
+
+        // A second pass is a no-op, not a recopy; drifted bytes recopy.
+        prepare_packaged_opt_view(&links_root, &install);
+        std::fs::write(install_opt.join("gawk").join("gawk.exe"), b"new awk").unwrap();
+        prepare_packaged_opt_view(&links_root, &install);
+        assert_eq!(std::fs::read(gawk.join("gawk.exe")).unwrap(), b"new awk");
+
+        // A junction left dangling by a moved install root recreates.
+        let gone = base.join("gone");
+        std::fs::create_dir_all(&gone).unwrap();
+        std::fs::remove_dir(&other).unwrap();
+        crate::msix::create_junction(&other, &gone).unwrap();
+        std::fs::remove_dir_all(&gone).unwrap();
+        prepare_packaged_opt_view(&links_root, &install);
+        assert!(other.join("tool.exe").is_file());
+
+        // A forwarded payload that somehow stayed a *live* junction — even
+        // one whose bytes match — converts to a real copy: the junction is
+        // the shape the app container denies at CreateProcess time.
+        std::fs::remove_dir_all(&gawk).unwrap();
+        crate::msix::create_junction(&gawk, &install_opt.join("gawk")).unwrap();
+        prepare_packaged_opt_view(&links_root, &install);
+        assert!(!is_reparse_point(&gawk));
+        assert_eq!(std::fs::read(gawk.join("gawk.exe")).unwrap(), b"new awk");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The first packaged builds wrote `links_root\opt` as a single
+    /// junction to the package tree; the per-package view replaces it.
+    #[cfg(windows)]
+    #[test]
+    fn packaged_opt_view_replaces_the_legacy_single_junction() {
+        let base = unique_temp_dir("winuxcmd-msix-opt-migrate");
+        let install = base.join("install");
+        let install_opt = install.join("opt");
+        let links_root = base.join("links");
+        std::fs::create_dir_all(install_opt.join("gawk")).unwrap();
+        std::fs::write(install_opt.join("gawk").join("gawk.exe"), b"awk").unwrap();
+        std::fs::write(install_opt.join("gawk").join("awk.exe"), b"awk").unwrap();
+        crate::msix::create_junction(&links_root.join("opt"), &install_opt).unwrap();
+        assert!(is_reparse_point(&links_root.join("opt")));
+
+        prepare_packaged_opt_view(&links_root, &install);
+
+        let opt = links_root.join("opt");
+        assert!(opt.is_dir());
+        assert!(!is_reparse_point(&opt));
+        assert_eq!(
+            std::fs::read(opt.join("gawk").join("gawk.exe")).unwrap(),
+            b"awk"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn stale_bundled_shim_counts_as_activation_needed() {
         let root = fake_winuxcmd_root("winuxcmd-shim-gate", true);
         let bin = root.join("usr").join("bin");
-        std::fs::hard_link(bin.join("winuxcmd.exe"), bin.join("gawk.exe")).unwrap();
-        std::fs::hard_link(bin.join("winuxcmd.exe"), bin.join("awk.exe")).unwrap();
-        assert!(has_required_command_links(&bin));
+        let engine = bin.join("winuxcmd.exe");
+        std::fs::hard_link(&engine, bin.join("gawk.exe")).unwrap();
+        std::fs::hard_link(&engine, bin.join("awk.exe")).unwrap();
+        assert!(has_required_command_links(&bin, &engine));
 
         // A shim left on the previous image reopens activation.
         let stale = bin.join("awk.exe");
         std::fs::remove_file(&stale).unwrap();
         std::fs::write(&stale, b"the previous engine image").unwrap();
-        assert!(!has_required_command_links(&bin));
+        assert!(!has_required_command_links(&bin, &engine));
 
         // ... and a missing name does too.
         std::fs::remove_file(&stale).unwrap();
-        assert!(!has_required_command_links(&bin));
+        assert!(!has_required_command_links(&bin, &engine));
 
         let _ = std::fs::remove_dir_all(&root);
     }

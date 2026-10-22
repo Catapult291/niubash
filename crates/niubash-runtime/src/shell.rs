@@ -299,6 +299,12 @@ impl Shell {
         // and the shell-name block below reuses `invoked_as` rather than
         // re-reading the now-cleared environment.
         let invoked_as = invoked_as_from_env();
+        // niubash#495: an MSIX package root is read-only, so the default
+        // shell-root resolution fails every session with os error 5. Point
+        // NIU_ROOT at the package's private LocalCache before the root is
+        // prepared — and before winuxcmd activation, which roots the link
+        // family under the same writable tree.
+        crate::msix::apply_writable_shell_root();
         // 1. Load runtime defaults and environment-backed state.
         let mut config = load_config();
         config.history = config.history.with_env_overrides();

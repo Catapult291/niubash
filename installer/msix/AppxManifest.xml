@@ -54,12 +54,24 @@
                  Executable="niu.exe"
                  EntryPoint="Windows.FullTrustApplication">
       <Extensions>
+        <!-- niubash#495: only niu.exe is aliased (the PowerShell Store
+             package precedent — pwsh.exe only). Declaring bash.exe/sh.exe
+             would collide with System32 WSL bash and Git Bash. -->
         <uap3:Extension Category="windows.appExecutionAlias"
                         EntryPoint="Windows.FullTrustApplication"
                         Executable="niu.exe">
           <uap3:AppExecutionAlias>
             <desktop:ExecutionAlias Alias="niu.exe" />
           </uap3:AppExecutionAlias>
+        </uap3:Extension>
+        <!-- Windows Terminal JSON fragment extension (official channel for
+             Store-packaged apps): WT reads Public\Fragments\*.json and
+             layers the Niubash profile into the user's settings. -->
+        <uap3:Extension Category="windows.appExtension">
+          <uap3:AppExtension Name="com.microsoft.windows.terminal.settings"
+                             Id="Niubash.TerminalProfileFragments"
+                             DisplayName="Niubash"
+                             PublicFolder="Public" />
         </uap3:Extension>
       </Extensions>
       <uap:VisualElements
