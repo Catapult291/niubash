@@ -80,7 +80,9 @@ where
         }
     }
 
-    // 5. PATH lookup using `where.exe` on Windows
+    // 5. PATH lookup with an in-process walk on Windows (no child: a
+    // `where.exe` spawn here would claim a hidden session console on
+    // console-less hosts — see find_winuxcmd_on_path)
     if let Some(exe) = path_lookup(&mut checked) {
         return WinuxCmdSearchReport {
             found: Some(exe),
@@ -99,30 +101,57 @@ where
 fn find_winuxcmd_on_path(checked: &mut Vec<String>) -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        checked.push("PATH lookup via where.exe winuxcmd.exe".to_string());
-        if let Ok(out) = crate::console_guard::suppressed_command("where.exe")
-            .arg("winuxcmd.exe")
-            .output()
-        {
-            if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout);
-                if let Some(line) = text.lines().next() {
-                    let p = PathBuf::from(line.trim());
-                    checked.push(p.display().to_string());
-                    if p.is_file() {
-                        return Some(p);
-                    }
-                }
-            }
+        // niubash#451/#462: this probe runs on EVERY shell startup
+        // (`Shell::new*` -> `prepare_winuxcmd_with_override`), including
+        // console-less `niu -c` sessions that never execute an external
+        // command. Spawning `where.exe` here used to claim the session's
+        // hidden console (via `suppress_orphan_console`'s
+        // `try_alloc_hidden_console`) — or burn its own transient conhost —
+        // so a pure-builtin session allocated 1 conhost.exe and tripped the
+        // `detached_builtin_only_session_allocates_zero_conhosts` gate.
+        // `where.exe winuxcmd.exe` is just an ordered file-existence walk,
+        // so do it in-process: same result, no child, no console, no
+        // ~30 ms spawn tax.
+        checked.push("PATH lookup for winuxcmd.exe (in-process walk)".to_string());
+        let exe = find_file_in_path_dirs("winuxcmd.exe");
+        if let Some(path) = exe.as_ref() {
+            checked.push(path.display().to_string());
         }
+        exe
     }
 
     #[cfg(not(windows))]
     {
         checked.push("PATH lookup for winuxcmd.exe is only available on Windows".to_string());
+        None
     }
+}
 
-    None
+/// `where.exe <name>` without the child: current directory first, then PATH
+/// in order (an empty entry names the current directory — `cmd.exe`
+/// semantics, same as `where.exe`), first exact-name file wins. Pure
+/// filesystem checks, so it is safe on a console-less host where a spawn
+/// would claim a hidden session console (niubash#451/#462).
+#[cfg(any(windows, test))]
+fn find_file_in_path_dirs(file_name: &str) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(cwd);
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if dir.as_os_str().is_empty() {
+                if let Ok(cwd) = std::env::current_dir() {
+                    dirs.push(cwd);
+                }
+            } else {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs.into_iter()
+        .map(|dir| dir.join(file_name))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Prepend the directory containing `winuxcmd.exe` to `PATH` so rubash's
@@ -1243,6 +1272,63 @@ mod tests {
         assert_eq!(resolve_winuxcmd_override(&dir), None);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// RAII guard restoring the process-global PATH when the test ends.
+    struct SavedPath(Option<std::ffi::OsString>);
+    impl SavedPath {
+        fn set(dirs: &[PathBuf]) -> Self {
+            let saved = std::env::var_os("PATH");
+            let joined = std::env::join_paths(dirs).unwrap();
+            // `set_var` is process-global; the repo pins libtest to one
+            // thread (`RUST_TEST_THREADS=1`), so no test races this.
+            std::env::set_var("PATH", &joined);
+            SavedPath(saved)
+        }
+    }
+    impl Drop for SavedPath {
+        fn drop(&mut self) {
+            if let Some(ref value) = self.0 {
+                std::env::set_var("PATH", value);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    #[test]
+    fn path_walk_finds_first_path_entry_in_order() {
+        // In-process replacement for `where.exe <name>`: no child process,
+        // so a console-less startup never claims a hidden session console
+        // (niubash#451/#462 gate). Unique probe names keep the process
+        // working directory out of the equation.
+        let probe = "niu-path-walk-probe-a.exe";
+        let empty_dir = unique_temp_dir("winuxcmd-walk-empty");
+        let full_dir = unique_temp_dir("winuxcmd-walk-full");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        std::fs::create_dir_all(&full_dir).unwrap();
+        std::fs::write(full_dir.join(probe), b"").unwrap();
+
+        let missing = unique_temp_dir("winuxcmd-walk-missing");
+        let _saved = SavedPath::set(&[missing.clone(), empty_dir.clone(), full_dir.clone()]);
+        assert_eq!(
+            find_file_in_path_dirs(probe),
+            Some(full_dir.join(probe)),
+            "first PATH entry holding the file must win"
+        );
+
+        let _ = std::fs::remove_dir_all(empty_dir);
+        let _ = std::fs::remove_dir_all(full_dir);
+    }
+
+    #[test]
+    fn path_walk_returns_none_when_absent() {
+        let missing = unique_temp_dir("winuxcmd-walk-absent");
+        let _saved = SavedPath::set(&[missing]);
+        assert_eq!(
+            find_file_in_path_dirs("niu-path-walk-probe-absent-xyz.exe"),
+            None
+        );
     }
 
     #[test]

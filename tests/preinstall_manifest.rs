@@ -382,13 +382,13 @@ fn winuxcmd_pin_pins_a_tag_and_both_arch_digests() {
 }
 
 #[test]
-fn winuxcmd_pin_regression_matches_release_v1_1_18() {
+fn winuxcmd_pin_regression_matches_release_v1_1_19() {
     let raw = std::fs::read_to_string(winuxcmd_pin_path())
         .expect("winuxcmd pin must exist at scripts/release/winuxcmd-pin.json");
     let pin = serde_json::from_str::<Value>(&raw).expect("winuxcmd pin must be valid JSON");
     assert_eq!(
         pin.get("winuxcmd_tag").and_then(Value::as_str),
-        Some("v1.1.18"),
+        Some("v1.1.19"),
         "release pin must stay on the WinuxCmd release the niu install is built against"
     );
     assert_eq!(
@@ -396,14 +396,14 @@ fn winuxcmd_pin_regression_matches_release_v1_1_18() {
             .and_then(Value::as_object)
             .and_then(|digests| digests.get("windows-x64"))
             .and_then(Value::as_str),
-        Some("67573051c6eb0ff6a2a9e4811b46ed52d3f6433287489e6808f2ebeb1af70294")
+        Some("624decb3bea3eb615e1c8aade7297429cbf208f36ff7ea6adb70499ba2c6a636")
     );
     assert_eq!(
         pin.get("sha256")
             .and_then(Value::as_object)
             .and_then(|digests| digests.get("windows-arm64"))
             .and_then(Value::as_str),
-        Some("03874244d5b78f559bdff12fa30afe32ea65e6c080d4290118af41b400af0821")
+        Some("53b0341650d4162b85fecb9092e8ad8f4dd132cb7de33408ed77295788e2ad74")
     );
 }
 
