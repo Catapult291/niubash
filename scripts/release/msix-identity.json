@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "identity_name": "NiubashPreview",
+  "publisher": "CN=00000000-0000-0000-0000-000000000000",
+  "publisher_display_name": "unixwin",
+  "description": "MSIX package identity for the Store build (scripts/make_msix.py reads this when --identity-name/--publisher are not passed). The values here are a PREVIEW PLACEHOLDER: fine for local signing and real app-container verification, never submittable. After Partner Center registration, replace identity_name with the reserved Package/Identity Name and publisher with the publisher subject shown on the Partner Center Product identity page (Partner Center -> Apps -> <app> -> Product identity). The Store re-signs the uploaded package, so the publisher here does not need a matching code-signing cert.",
+  "notes": [
+    "The CI release pipeline packs with this identity on every tag; the resulting .msix is unsigned (makeappx pack) — the Store re-signs on submission, and local testing signs it with a self-signed cert (signtool sign /fd sha256 /a).",
+    "The fourth version segment is reserved by the Store: make_msix.py appends .0 to the Cargo.toml version (1.4.4 -> 1.4.4.0).",
+    "Identity history: NiubashPreview placeholder since the v1.4.4-era CI integration (2026-10-22)."
+  ]
+}

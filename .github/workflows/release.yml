@@ -1643,6 +1643,89 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Store MSIX (unsigned; the Store re-signs on submission). Reuses the x64
+  # artifact's Inno Setup installer to stage the exact shipped tree (niu +
+  # bundled WinuxCmd + the must-install bundle), then packs it through
+  # scripts/make_msix.py with the identity from
+  # scripts/release/msix-identity.json (a preview stand-in identity until Partner
+  # Center reserves the real one — verification-grade, not submittable).
+  build-msix:
+    name: build-msix (Store package, unsigned)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    needs: [build-windows]
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve release inputs
+        id: release
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $tag = "${{ inputs.tag }}"
+          } else {
+            $tag = "${{ github.ref_name }}"
+          }
+          $version = $tag -replace '^v', ''
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Download the x64 package artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: niubash-v${{ steps.release.outputs.version }}-win-x64
+          path: pkg
+
+      - name: Install Pillow (MSIX visual assets)
+        run: pip install pillow
+
+      - name: Stage the shipped installer tree
+        id: stage
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $setup = Get-ChildItem -LiteralPath pkg -Filter "*-setup.exe" |
+            Where-Object { $_.Name -notlike "*.sha256" } |
+            Select-Object -First 1
+          if (-not $setup) {
+            throw "no *-setup.exe found in the win-x64 artifact"
+          }
+          $stage = Join-Path $env:RUNNER_TEMP "msix-stage"
+          $log = Join-Path $env:RUNNER_TEMP "setup-install.log"
+          $p = Start-Process -FilePath $setup.FullName -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART',
+            "/DIR=$stage", "/LOG=$log"
+          ) -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            if (Test-Path $log) { Get-Content $log -Tail 40 }
+            throw "installer exited $($p.ExitCode)"
+          }
+          foreach ($required in @('niu.exe', 'winuxcmd')) {
+            if (-not (Test-Path (Join-Path $stage $required))) {
+              if (Test-Path $log) { Get-Content $log -Tail 40 }
+              throw "staged install is missing $required"
+            }
+          }
+          Write-Host "staged: $stage"
+          "stage=$stage" >> $env:GITHUB_OUTPUT
+
+      - name: Pack the Store MSIX (unsigned; the Store re-signs)
+        shell: pwsh
+        run: |
+          python scripts/make_msix.py `
+            --niu-exe "${{ steps.stage.outputs.stage }}\niu.exe" `
+            --winuxcmd-dir "${{ steps.stage.outputs.stage }}\winuxcmd"
+
+      - name: Upload msix artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: niubash-v${{ steps.release.outputs.version }}-msix
+          path: target/msix/*.msix
+          if-no-files-found: error
+          retention-days: 14
+
   journey:
     name: golden user journey (release gate)
     runs-on: windows-2025
@@ -2028,7 +2111,7 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
-    needs: [build-windows, build-linux, build-macos, journey, perfbudget, skill-bundle]
+    needs: [build-windows, build-linux, build-macos, build-msix, journey, perfbudget, skill-bundle]
     steps:
       - uses: actions/checkout@v4.2.2
 
@@ -2082,7 +2165,7 @@ jobs:
             hash="$(sha256sum "$file" | awk '{print $1}')"
             printf '%s  %s\n' "$hash" "$(basename "$file")" >> SHA256SUMS
             count=$((count + 1))
-          done < <(find artifacts -type f \( -name '*.zip' -o -name '*.exe' -o -name '*.tar.gz' -o -name '*.7z' \) | sort)
+          done < <(find artifacts -type f \( -name '*.zip' -o -name '*.exe' -o -name '*.tar.gz' -o -name '*.7z' -o -name '*.msix' \) | sort)
           if [ "$count" -eq 0 ]; then
             echo "no payload artifacts found to hash" >&2
             exit 1
@@ -2121,6 +2204,7 @@ jobs:
             artifacts/**/*.exe
             artifacts/**/*.tar.gz
             artifacts/**/*.7z
+            artifacts/**/*.msix
             artifacts/**/*.sha256
             SHA256SUMS
           fail_on_unmatched_files: true
