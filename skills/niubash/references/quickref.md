@@ -11,7 +11,8 @@ Invocation shapes and exit-code contract:
 
 ```text
 <!-- BEGIN GENERATED:launcher-verbs -->
-Usage:  niu [option]
+Usage:  niu [GNU long option] [option] ...
+        niu [GNU long option] [option] script-file ...
         niu -c <cmd>         Run a command then exit
         niu -C <cmd>         Run one REPL-style command then exit
         niu setup           Re-run prompt/plugin setup
@@ -25,11 +26,37 @@ Usage:  niu [option]
 ```
 
 One-shot runs (`niu -c`, scripts) load no rc and no plugins; interactive
-startup sources `~/.niubashrc`. Non-interactive init files: `NIU_ENV`
-(higher precedence) or `BASH_ENV`.
+startup sources `~/.niubashrc` — preceded by the generated plugin loader
+`~/.niubash/generated/plugins.niu` when the manifest produced one.
+Non-interactive init files: `NIU_ENV` (higher precedence) or `BASH_ENV`.
+
+Beyond the usage block, `niu --help` prints the full GNU invocation face
+(the long-option and shell-option lists are generated from the engine's
+own parse tables), plus these host-level verbs:
+
+- Verbatim handoff — `niu --encoded-command <b64>` runs a base64 payload
+  with zero quoting; `-EncodedCommand <b64>` (PowerShell spelling,
+  case-insensitive) and `--ec <b64>` are the same flag. Prefix the payload
+  with `v1:` when the command line might transit an MSYS-family rewriter.
+- `--cwd-state <file>` — restore the recorded directory at startup and
+  record the final directory back on exit (session continuity for hosts
+  that relaunch the shell per command).
+- `--install-wt-shortcuts [--update-only] [--quiet]` — rewrite
+  desktop/Start-menu shortcuts into the `wt.exe -p Niubash` form.
+- `niu config get|set|list` — persisted user settings in
+  `~/.niubash/config.toml` (e.g. `completion.style`,
+  `command-not-found-hint`).
+- `niu skill install|status [--target claude|zcode|cursor|all|<dir>]` —
+  install or check this agent skill bundle itself.
+- `niu plugin migrate-rc [--diff]` — read-only migration report for
+  legacy managed rc blocks (also in the plugin verb table below).
+
+Invoke the binary as `bash`/`sh` (the bundled hardlinks) for the
+byte-for-byte GNU face: `bash --help`, `bash -c`, POSIX `sh` mode.
 
 Plugin system verbs (git-clone-only external sources, explicit trust gate,
-declarative spec `~/.niubash/plugins.toml` + lockfile):
+declarative spec `~/.niubash/plugins.toml` + lockfile
+`~/.niubash/sources/registry.toml` driving the generated loader):
 
 ```text
 <!-- BEGIN GENERATED:plugin-verbs -->
@@ -40,6 +67,9 @@ declarative spec `~/.niubash/plugins.toml` + lockfile):
   plugin update|sync|restore|rollback|clean
                             Lockfile verbs (vim-plug/lazy.nvim-style)
   plugin trust <id>         Review and activate a source's assets
+  plugin migrate-rc [--diff]
+                            Read-only migration report for legacy managed
+                            blocks (never writes the rc)
   plugin discover [--verbose]
                             Read-only overview of external plugin sources
   plugin source <command>   Full source protocol (add/trust/sign/verify/

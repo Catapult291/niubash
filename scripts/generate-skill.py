@@ -185,13 +185,17 @@ def render_region(key: str, builtins: list[tuple[str, str]], applets: list[str],
             "`awk`, `find`, `tar`, `top`, `xxd`, ...) — real Windows binaries, "
             "not emulated inside the shell; full inventory in "
             "`references/quickref.md`.",
-            "- **Launcher verbs** — `setup`, `font`, `doctor`, `plugin`, `skill`, "
-            "`--self-update`; table in `references/quickref.md`.",
+            "- **Launcher verbs** — `setup`, `font`, `doctor`, `config`, "
+            "`plugin`, `skill`, `--self-update`; table in "
+            "`references/quickref.md`.",
+            "- **Verbatim handoff** — `--encoded-command`/`-EncodedCommand`/"
+            "`--ec <b64>` runs a base64 payload with zero quoting; optional "
+            "`v1:` prefix guards MSYS-family rewriting in transit.",
             "- **Plugin system** — git-clone-only external sources (oh-my-bash, "
             "bash-it, bpkg) behind an explicit trust gate, driven by a "
             "declarative spec (`~/.niubash/plugins.toml`) with lockfile verbs "
             "(`add/list/enable/disable/trust/sync/update/restore/rollback/"
-            "clean/source/recipe/distro/mirror/ui`).",
+            "clean/migrate-rc/source/recipe/distro/mirror/ui`).",
             "- **TUI surfaces** — `niu setup` wizard (theme/prompt/tools), "
             "`niu plugin ui` menu, theme gallery, `niu font` picker; all "
             "non-interactive-friendly and safe to skip (`-c` loads none of "

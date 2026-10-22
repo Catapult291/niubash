@@ -11,7 +11,8 @@ management.
 - `wpm index update`: refresh the package index before searching if it is
   stale or empty.
 - `wpm update winuxcmd`: update WinuxCmd itself.
-- `niu doctor`: one-shot health check covering links, core, rc, and bundle.
+- `niu doctor`: one-shot health check covering links, core, rc, the
+  generated plugin loader, and the agent-skill install state.
 
 Discover what the user actually has installed before assuming a tool is
 present — run these directly in the current Niubash session:
@@ -44,6 +45,11 @@ wpm search NAME
 wpm info NAME
 wpm install NAME
 ```
+
+A freshly installed command is runnable in the same session — the shell's
+command-resolution negative cache invalidates when the file appears on
+PATH, so there is no stale "command not found" and no `hash -r` ritual
+(the builtin exists and still works if you prefer it).
 
 If the package exists but its hard links are missing:
 
