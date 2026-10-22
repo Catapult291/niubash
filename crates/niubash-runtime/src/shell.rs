@@ -856,6 +856,10 @@ impl Shell {
 
         let line = normalize_native_windows_path_literals(line);
         let mut tokens = tokenize(&line);
+        // niubash#513: tokenize's shopt simulation leaves the parse-time
+        // extglob gate at the line's final state; restore the entry state
+        // before parsing this line (see resync_parse_extglob_gate).
+        self.resync_parse_extglob_gate();
         if tokens.is_empty() {
             return Ok(0);
         }
@@ -1329,6 +1333,38 @@ impl Shell {
             log::warn!("{} exited with status {}", path.display(), code);
         }
         None
+    }
+
+    /// Re-sync the engine's parse-time extglob gate with the executor's
+    /// live shopt state after a whole-text `tokenize` (niubash#513).
+    ///
+    /// rubash's tokenizer simulates GNU's per-line `shopt -s/-u extglob`
+    /// flips as it lexes (lexer `line_extglob_mode_change`), so when
+    /// `tokenize` returns, the process-global parse gate holds the
+    /// script's FINAL simulated state. rubash's own driver parses each
+    /// complete command before later text is tokenized, so it never
+    /// observes that end state; this host tokenizes the whole input first
+    /// and parses afterwards, so a flip anywhere in the text would leak
+    /// BACKWARD into earlier commands: `case` patterns the lexer split at
+    /// `(` under a closed gate were reassembled by the parser's live-gate
+    /// check, and the parse-error fallback driver re-parsed its first
+    /// group under the leaked gate (`niu -c` ran `+(...)` patterns before
+    /// the `shopt -s extglob` that lexically follows them). GNU decides at
+    /// read time (parse.y:5466 `read_token_word`; `reset_parser`
+    /// parse.y:3502 syncs the gate from the CURRENT shopt state), so
+    /// restore the gate to the state the executor carries on entry before
+    /// parsing: a flip the input itself performs takes effect when its
+    /// `shopt` command executes — the builtin re-syncs the gate — which
+    /// is GNU's cadence for the NEXT read. The executor state is the
+    /// engine's `__RUBASH_SHOPT_STATE` carrier (the same read
+    /// script_driver's `shopt_state_enabled` performs); an absent carrier
+    /// means the default state, where extglob is off.
+    fn resync_parse_extglob_gate(&mut self) {
+        let enabled = self
+            .executor
+            .get_env("__RUBASH_SHOPT_STATE")
+            .is_some_and(|state| state.split('\u{1f}').any(|entry| entry == "extglob"));
+        self.executor.set_shopt_option("extglob", enabled);
     }
 
     /// True when this shell runs in POSIX mode. All three sources flip it
@@ -2444,6 +2480,11 @@ impl Shell {
             return Ok(code);
         }
         let mut tokens = tokenize(&script);
+        // niubash#513: tokenize's shopt simulation leaves the parse-time
+        // extglob gate at the script's final state; restore the entry
+        // state before parsing (and before the parse-error fallback
+        // driver re-parses group by group). See resync_parse_extglob_gate.
+        self.resync_parse_extglob_gate();
         if tokens.is_empty() {
             return Ok(0);
         }
@@ -4587,6 +4628,65 @@ alias hello='echo from-alias'
         assert_eq!(shell.execute_script("echo ok").unwrap(), 0);
 
         let _ = std::fs::remove_dir_all(temp);
+    }
+
+    /// niubash#513: a `shopt -s extglob` that lexically FOLLOWS a `case`
+    /// must not open the parse gate for that case. GNU reads one line at
+    /// a time (parse.y:5466 gates pattern chars on the gate in effect at
+    /// read time), so the first case is a syntax error (rc 2) and nothing
+    /// in it runs, even though the same input enables extglob later.
+    #[test]
+    fn extglob_flip_later_in_script_does_not_open_parse_gate_for_earlier_case() {
+        let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cwd_guard = CwdGuard::capture();
+
+        let mut shell = test_shell(HookConfig::default());
+        // The non-interactive entry points (#513's `-c`/script faces)
+        // construct with expand_aliases off (Shell::new_with_script_name);
+        // test_shell defaults it on for REPL-shaped tests, which would
+        // route this script to the engine's grouped reader instead of the
+        // host tokenize+parse route under test.
+        shell.executor.set_shopt_option("expand_aliases", false);
+        let code = shell
+            .execute_script(
+                "R=none; case abc in +([a-z])) R=m1;; *) R=no;; esac; \
+                 shopt -s extglob; case abc in +([a-z])) R=m2;; *) R=no2;; esac",
+            )
+            .unwrap();
+
+        assert_eq!(code, 2, "the gated-off case is a syntax error");
+        // GNU parses a whole line before executing any of it, so the
+        // assignment on the same line as the rejected case is discarded
+        // with the line and neither case body runs.
+        assert_eq!(shell.executor.get_env("R"), None, "no case body may run");
+    }
+
+    /// Control for the #513 gate restore: a `shopt -s extglob` on its OWN
+    /// line still opens the gate for the NEXT line's case (GNU's
+    /// line-at-a-time cadence), and a later `shopt -u extglob` line
+    /// closes it again for the line after that.
+    #[test]
+    fn extglob_flip_on_earlier_line_opens_gate_for_later_lines() {
+        let _env_lock = PROCESS_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cwd_guard = CwdGuard::capture();
+
+        let mut shell = test_shell(HookConfig::default());
+        shell.executor.set_shopt_option("expand_aliases", false);
+        let code = shell
+            .execute_script(
+                "shopt -s extglob\n\
+                 case abc in +([a-z])) R=m1;; *) R=no;; esac\n\
+                 shopt -u extglob\n\
+                 case abc in +([a-z])) R=m2;; *) R=no2;; esac",
+            )
+            .unwrap();
+
+        assert_eq!(code, 2, "the case after `shopt -u extglob` errors");
+        assert_eq!(
+            shell.executor.get_env("R"),
+            Some("m1"),
+            "the case under the opened gate matched; the gated-off one did not run"
+        );
     }
 
     #[test]
