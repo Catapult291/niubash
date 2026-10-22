@@ -2,11 +2,19 @@
 
 All notable changes to Niubash are documented in this file.
 
-## [Unreleased]
+## [1.4.4] - 2026-10-22
+
+Release carrying the rubash 1.4.3 engine (command-stem case fold — `ping`/`netstat`/`tracert` reachable again — plus the interactive `${v^^}` crash fix), the WinuxCmd v1.1.20 pin, and the MSIX foreign-env hardening.
 
 ### Fixed
 
+- **`ping`/`netstat`/`tracert` were `command not found`** (rubash#998/#1000): System32 ships these applets with UPPERCASE on-disk names (`PING.EXE`, `NETSTAT.EXE`, `TRACERT.EXE` — `HOSTNAME.EXE` too), and the engine's byte-exact stem contract (#799) rejected every lowercase invocation. The PATH fold arm now compares the stem ASCII-case-insensitively (byte-equal spellings still win; the resolved spelling is always the on-disk one) — parity with CMD, PowerShell and msys bash. The interactive crash on `${v^^}`/`${v:1:3}` input (niubash#503) ships in the same engine.
+- **MSIX Store 版静默降级**（#504/#505）：旧 NSIS 安装残留的 `WINUXCMD_PATH`/`WINUXSH_ROOT` 环境变量会让 packaged 进程解析到旧安装树；package identity 下现按外来安装忽略。
 - Upgrades now reconcile the bundled package shims (`winuxcmd\usr\bin\gawk.exe`, `awk.exe`): `wpm links rebuild` cannot reach them on a bundled install because the product ships no `.wpm` state, so replacing `winuxcmd.exe` left those names on the previous image — the 1.4.1 stale `awk.exe`/`gawk.exe` residue of #468. The installer runs `niu --relink-bundled-shims --force` after the wpm rebuild, and shell-startup activation runs the same reconcile: missing or stale declared names are parked and relinked to the current `winuxcmd.exe`, extracted copies are upgraded to real hardlinks, and names owned by the machine's own `.wpm` state (e.g. a user `wpm install awk`) are never touched.
+
+### Changed
+
+- **WinuxCmd pin v1.1.19 → v1.1.20**（#507，双 SHA-256 取自官方 release 资产 digest）：裸 MSYS 盘根操作数（`ls /e`）跨 applet 面经共享 argv 边界解析（#1274）；`env --file`（#1277）与 `csplit -f/--prefix`（#1278）同族折叠；每个 applet 的 `--help` 结尾带 unixwin.dev 门户链接（#1273）；unity 构建在含正则元字符的检出路径下不再中止（#1281）。
 
 ## [1.4.3] - 2026-10-21
 
