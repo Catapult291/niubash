@@ -72,7 +72,9 @@ panic = "abort"
 # win comes from the ELF/Mach-O Unix artifacts the release pipeline ships.
 strip = "symbols"
 
-# Local override for cross-repo compat runs: build niu against the local
-# rubash worktree (master + unpushed fixes) instead of the pinned git rev.
-[patch."https://github.com/unixwin/rubash.git"]
-rubash = { path = "../rubash" }
+# The rubash git dependency resolves to the rev recorded in Cargo.lock
+# (bump it after rubash lands; a frozen rev keeps --locked builds and CI
+# reproducible). The old local [patch."…rubash.git"] path override is
+# gone: current cargo demands the lock carry the git source line for
+# non-patched (CI) resolution, and the path patch and that source line
+# are mutually exclusive in the same lock.
