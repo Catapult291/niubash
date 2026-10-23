@@ -184,6 +184,70 @@ mod platform {
         }
         unsafe {
             FreeConsole();
+            repair_dead_std_handles();
+        }
+    }
+
+    /// niubash#455: a plainly spawned `niu -c`/`niu script` gets both its
+    /// orphan console AND its std handles from Windows — `FreeConsole`
+    /// destroys the console but leaves the three std slots pointing at it,
+    /// so every later external spawn inherits invalid handles: the engine's
+    /// stdio plan fails its handle dup ("Bad file descriptor", rc 126) and
+    /// a child that does run sees dead console I/O (blank render, dead
+    /// input — the exact #455 handoff failure). Re-point each dead slot at
+    /// an inheritable NUL handle: children spawn with valid stdio, reads
+    /// get EOF, writes are discarded — the same headless posture a
+    /// DETACHED invoker hands us via pipes.
+    unsafe fn repair_dead_std_handles() {
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let h = unsafe { GetStdHandle(id) };
+            let dead = if h.is_null() || h == INVALID_HANDLE_VALUE {
+                true
+            } else {
+                // A freed console's handles report either a lookup failure
+                // or FILE_TYPE_CHAR; only real file/pipe handles survive.
+                unsafe { SetLastError(0) };
+                let t = unsafe { GetFileType(h) };
+                t == 0 || t == windows_sys::Win32::Storage::FileSystem::FILE_TYPE_CHAR
+            };
+            if dead {
+                if let Some(nul) = open_nul_handle() {
+                    unsafe { SetStdHandle(id, nul) };
+                }
+            }
+        }
+    }
+
+    /// An inheritable `NUL` device handle. Leaked into the process's std
+    /// slot — like every std handle it lives for the process lifetime.
+    fn open_nul_handle() -> Option<windows_sys::Win32::Foundation::HANDLE> {
+        use windows_sys::Win32::Foundation::GENERIC_READ;
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        let sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
+                as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        let name: Vec<u16> = "NUL".encode_utf16().chain(std::iter::once(0)).collect();
+        let h = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                &sa,
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            None
+        } else {
+            Some(h)
         }
     }
 
