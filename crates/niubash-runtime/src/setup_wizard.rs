@@ -1116,10 +1116,10 @@ fn display_welcome_side_by_side(reconfigure: bool, lang: Lang) {
     let mut content = Vec::new();
     content.push(String::new());
     content.push(format!(
-        " {}  {} {}",
+        " {}  {} v{}!",
         "\u{1f389}",
         lang.tr("Welcome to Niubash"),
-        format!("v{}!", env!("CARGO_PKG_VERSION"))
+        env!("CARGO_PKG_VERSION")
     ));
     content.push(format!(
         " {}  {}",
@@ -1752,7 +1752,7 @@ fn ask_niu_git(
         // niubash#230 follow-up: the release bundle may already carry
         // niu-git (opt\niugit). Never re-offer installing what is already
         // there — record the fact so the question stays silent on re-runs.
-        if probe.bundled.iter().any(|pkg| *pkg == "niugit") {
+        if probe.bundled.contains(&"niugit") {
             write_niu_git_answer(home, "installed");
             return Some(NiuGitChoice::Skip);
         }
@@ -1779,15 +1779,12 @@ fn ask_niu_git(
         } else {
             t.tr("  │  a separate GPLv2 project — native Windows git without MSYS")
         };
-        let idx = match io.choice(
+        let idx = io.choice(
             t.tr("  🧩  niu-git — Windows-native git experience?"),
             0,
             &option_refs,
             note,
-        ) {
-            Some(value) => value,
-            None => return None, // cancelled
-        };
+        )?;
         niu_git = match idx {
             1 => NiuGitChoice::Install,
             2 => NiuGitChoice::NeverShow,
@@ -1829,15 +1826,12 @@ fn ask_external_completion_provider(io: &mut WizardIo, t: &Lang) -> Option<bool>
         ),
     ];
     let option_refs: Vec<&str> = options.iter().map(String::as_str).collect();
-    let idx = match io.choice(
+    let idx = io.choice(
         t.tr("  \u{1f50c}  External completion providers (carapace-bin)?"),
         0,
         &option_refs,
         t.tr("  \u{2502}  writes an rc snippet only — any tool speaking the bash completion protocol integrates the same way"),
-    ) {
-        Some(value) => value,
-        None => return None, // cancelled
-    };
+    )?;
     Some(idx == 1)
 }
 
@@ -2867,11 +2861,7 @@ mod tests {
         let _userprofile = EnvGuard::unset("USERPROFILE");
 
         let resolved = setup_home_dir();
-        if cfg!(windows) {
-            assert_eq!(display_path(&resolved), display_path(&home));
-        } else {
-            assert_eq!(display_path(&resolved), display_path(&home));
-        }
+        assert_eq!(display_path(&resolved), display_path(&home));
     }
 
     fn clean_cfg() -> WizardConfig {
@@ -3646,7 +3636,7 @@ mod tests {
         let journal = SetupJournal {
             rc_backup: None,
             rc_created: true,
-            theme: picked.map(|(name, source)| (name, source)),
+            theme: picked,
             preset: None,
             niu_git: None,
             collection: Some(CollectionJournal {

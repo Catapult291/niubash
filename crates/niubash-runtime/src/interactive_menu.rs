@@ -577,7 +577,8 @@ mod tests {
     fn release_events_are_ignored() {
         // Windows reports Press + Release for every keystroke; handling both
         // would move the cursor twice and let a key-up confirm the next menu.
-        for kind in [KeyEventKind::Release] {
+        {
+            let kind = KeyEventKind::Release;
             let ev = KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, kind);
             assert_eq!(key_action(&ev, 0, 3), MenuAction::Ignore);
             let ev = KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind);

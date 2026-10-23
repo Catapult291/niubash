@@ -256,7 +256,7 @@ fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> bool
         let handle = child.as_raw_handle() as HANDLE;
         // SAFETY: `handle` is the live process handle owned by `child`.
         let status = unsafe { WaitForSingleObject(handle, timeout.as_millis() as u32) };
-        return status == WAIT_OBJECT_0 || status != WAIT_TIMEOUT;
+        status == WAIT_OBJECT_0 || status != WAIT_TIMEOUT
     }
     #[cfg(not(windows))]
     {

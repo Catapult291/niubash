@@ -25,18 +25,16 @@ impl VariableCompleter {
         }
 
         // Extract variable name (after $ and potentially {)
-        let var_name = if word.starts_with("${") {
-            if word.len() > 2 {
-                &word[2..]
-            } else {
+        let var_name = if let Some(stripped) = word.strip_prefix("${") {
+            if stripped.is_empty() {
                 return Ok(None);
             }
-        } else if word.starts_with('$') {
-            if word.len() > 1 {
-                &word[1..]
-            } else {
+            stripped
+        } else if let Some(stripped) = word.strip_prefix('$') {
+            if stripped.is_empty() {
                 return Ok(None);
             }
+            stripped
         } else {
             return Ok(None);
         };
@@ -45,7 +43,7 @@ impl VariableCompleter {
         let mut all_vars = Self::get_environment_variables();
 
         // Add shell variables
-        for (key, _) in env_vars.iter() {
+        for key in env_vars.keys() {
             all_vars.push(key.clone());
         }
 

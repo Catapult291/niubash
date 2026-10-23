@@ -41,16 +41,11 @@ pub struct HookConfig {
     pub title: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EditorMode {
+    #[default]
     Emacs,
     Vi,
-}
-
-impl Default for EditorMode {
-    fn default() -> Self {
-        Self::Emacs
-    }
 }
 
 impl EditorMode {}
@@ -61,20 +56,15 @@ pub struct EditorConfig {
 }
 
 /// History mode controlling how entries are shared across shell sessions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HistoryMode {
     /// Live cross-session history, preserving the legacy behavior.
+    #[default]
     Shared,
     /// Startup snapshot for navigation; builtins can see live file updates.
     Session,
     /// Startup snapshot for navigation; this session's later entries stay local.
     Private,
-}
-
-impl Default for HistoryMode {
-    fn default() -> Self {
-        Self::Shared
-    }
 }
 
 impl HistoryMode {
@@ -130,7 +120,7 @@ impl HistoryConfig {
 /// [`CompletionStyle::Gnu`] remains available as the literal GNU readline
 /// behavior (`NIU_COMPLETION_STYLE=gnu` /
 /// `niu config set completion.style gnu`), and the Ide popup as `ide`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompletionStyle {
     /// GNU readline literal: first TAB completes the common prefix (a lone
     /// candidate completes outright); an ambiguous second TAB lists the
@@ -141,6 +131,7 @@ pub enum CompletionStyle {
     /// Multi-column grid (like zsh `compinit`). The default: every TAB
     /// shows the candidates at once, several per row — the GNU listing
     /// look without the silent first TAB.
+    #[default]
     Column,
     /// Vertical list with descriptions (like fish).
     List,
@@ -170,12 +161,6 @@ impl CompletionStyle {
             Self::List => "list",
             Self::Inline => "inline",
         }
-    }
-}
-
-impl Default for CompletionStyle {
-    fn default() -> Self {
-        Self::Column
     }
 }
 
@@ -941,7 +926,7 @@ mod tests {
         std::fs::create_dir_all(temp.parent().unwrap()).unwrap();
         let previous = std::env::var_os("NIU_CONFIG");
         std::env::set_var("NIU_CONFIG", &temp);
-        let result = (|| {
+        let result = {
             // An unknown value degrades to the default, never to a hint.
             std::fs::write(&temp, "command-not-found-hint = \"winget\"").unwrap();
             assert_eq!(resolve_command_not_found_hint(), CommandNotFoundHint::Off);
@@ -949,7 +934,7 @@ mod tests {
             std::fs::write(&temp, "[broken").unwrap();
             assert_eq!(resolve_command_not_found_hint(), CommandNotFoundHint::Off);
             Ok::<(), anyhow::Error>(())
-        })();
+        };
         match previous {
             Some(value) => std::env::set_var("NIU_CONFIG", value),
             None => std::env::remove_var("NIU_CONFIG"),
@@ -989,7 +974,7 @@ mod tests {
         std::env::remove_var("NIU_CONFIG");
         std::env::set_var("HOME", &isolated_home);
         std::env::set_var("USERPROFILE", &decoy_profile);
-        let result = (|| {
+        let result = {
             // Write through the real writer: the file must appear under the
             // isolated home and NOWHERE near the decoy profile.
             let written =
@@ -1009,7 +994,7 @@ mod tests {
             // visible (so the read path resolves the same isolated home).
             assert_eq!(resolve_command_not_found_hint(), CommandNotFoundHint::Wpm);
             Ok::<(), anyhow::Error>(())
-        })();
+        };
         match previous_niu_config {
             Some(value) => std::env::set_var("NIU_CONFIG", value),
             None => std::env::remove_var("NIU_CONFIG"),

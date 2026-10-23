@@ -391,7 +391,7 @@ impl SegmentPrompt {
         }
         segments
             .iter()
-            .map(|s| style_segment(s))
+            .map(style_segment)
             .collect::<Vec<_>>()
             .join(" ")
     }

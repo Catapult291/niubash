@@ -202,9 +202,7 @@ impl DiskCache {
                         .duration_since(SystemTime::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    return self
-                        .tool_mtime_secs
-                        .map_or(true, |cached| cached != mtime_secs);
+                    return self.tool_mtime_secs != Some(mtime_secs);
                 }
             }
         }
@@ -796,7 +794,7 @@ impl ExternalCompletionPlugin {
                 // Stale only when tool mtime changed
                 let stale = tool_mtime_secs
                     .zip(entry.tool_mtime_secs)
-                    .map_or(false, |(current, cached)| current != cached);
+                    .is_some_and(|(current, cached)| current != cached);
                 if !stale {
                     return self.filter_values(&entry.values, context);
                 }
@@ -924,6 +922,12 @@ impl ExternalCompletionPlugin {
         } else {
             Some(CompletionResult::new(matches))
         }
+    }
+}
+
+impl Default for ExternalCompletionPlugin {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1079,7 +1083,7 @@ fn parse_help_descriptions(help_text: &str) -> HashMap<String, String> {
         }
 
         // Extract flag names from the flag portion
-        for token in flag_part.split(|c: char| c == ',' || c == ' ') {
+        for token in flag_part.split([',', ' ']) {
             let token = token.trim();
             if token.starts_with("--") {
                 // Strip =VALUE suffix

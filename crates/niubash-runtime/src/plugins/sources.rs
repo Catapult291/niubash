@@ -3466,12 +3466,11 @@ mod tests {
     /// line that fails to parse (niubash#178's shape: a hand edit or a
     /// crashed write left garbage in `registry.toml`).
     fn corrupt_registry_text(pinned: &SourceRecord) -> String {
-        let mut registry = SourceRegistryToml {
+        let registry = SourceRegistryToml {
             schema: Some(SOURCE_REGISTRY_SCHEMA.to_string()),
             sources: vec![pinned.clone()],
         };
-        let mut text =
-            toml::to_string_pretty(&mut registry).expect("healthy records must serialize");
+        let mut text = toml::to_string_pretty(&registry).expect("healthy records must serialize");
         text.push_str("\n[[sources]]\nid = \"broken-entry\"\nthis line is not toml =\n");
         text
     }
@@ -3558,11 +3557,11 @@ mod tests {
 
         // Consent = a human repairs the file. Writes resume on a parseable
         // registry, and the healthy record round-trips.
-        let mut registry = SourceRegistryToml {
+        let registry = SourceRegistryToml {
             schema: Some(SOURCE_REGISTRY_SCHEMA.to_string()),
             sources: vec![pinned.clone()],
         };
-        fs::write(&path, toml::to_string_pretty(&mut registry).unwrap()).unwrap();
+        fs::write(&path, toml::to_string_pretty(&registry).unwrap()).unwrap();
         assert!(registry_corruption().is_none(), "repaired file parses");
         write_source_registry(std::slice::from_ref(&pinned))
             .expect("post-repair write must succeed");

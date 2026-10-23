@@ -453,12 +453,9 @@ mod tests {
         // with no other "oh-" candidate the completer yields nothing.
         let ctx = CompletionContext::new(std::path::PathBuf::from("."), "oh-".to_string(), 3);
         let retired = CommandCompleter::complete(&ctx).unwrap();
-        assert!(
-            retired
-                .map(|r| r.completions.contains(&"oh-my-niu".to_string()))
-                .unwrap_or(false)
-                == false
-        );
+        assert!(!retired
+            .map(|r| r.completions.contains(&"oh-my-niu".to_string()))
+            .unwrap_or(false));
     }
 
     #[test]

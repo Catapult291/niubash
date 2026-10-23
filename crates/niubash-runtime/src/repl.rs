@@ -167,7 +167,7 @@ pub fn is_repl_reserved_command(word: &str) -> bool {
 /// Extract the arguments of a `self-update` / `update-niubash` REPL command,
 /// or `None` when the line is not one.
 pub fn self_update_command_args(line: &str) -> Option<Vec<String>> {
-    let mut parts = line.trim().split_whitespace();
+    let mut parts = line.split_whitespace();
     match parts.next()? {
         "self-update" | "update-niubash" => Some(parts.map(str::to_string).collect()),
         _ => None,
@@ -1716,13 +1716,13 @@ fn native_widget_keymap_applies(keymap: Option<&str>, target: NativeKeymapTarget
     let Some(keymap) = keymap else {
         return true;
     };
-    match (keymap, target) {
-        ("main" | "all", _) => true,
-        ("emacs", NativeKeymapTarget::Emacs) => true,
-        ("viins", NativeKeymapTarget::ViInsert) => true,
-        ("vicmd", NativeKeymapTarget::ViNormal) => true,
-        _ => false,
-    }
+    matches!(
+        (keymap, target),
+        ("main" | "all", _)
+            | ("emacs", NativeKeymapTarget::Emacs)
+            | ("viins", NativeKeymapTarget::ViInsert)
+            | ("vicmd", NativeKeymapTarget::ViNormal)
+    )
 }
 
 fn native_widget_event(widget: &str) -> Option<ReedlineEvent> {
@@ -4979,7 +4979,7 @@ mod tests {
             "not a control-code uChar: {record:?}"
         );
         assert!(
-            (b'A'..=b'Z').contains(&(record.virtual_key_code as u8)),
+            (record.virtual_key_code as u8).is_ascii_uppercase(),
             "not a letter VK: {record:?}"
         );
         let mut modifiers = KeyModifiers::empty();

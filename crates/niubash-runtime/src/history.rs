@@ -747,7 +747,7 @@ impl History for LiveFileBackedHistory {
 }
 
 fn history_lock_error() -> io::Error {
-    io::Error::new(io::ErrorKind::Other, HISTORY_LOCK_ERROR)
+    io::Error::other(HISTORY_LOCK_ERROR)
 }
 
 impl Drop for LiveFileBackedHistory {
@@ -1122,7 +1122,8 @@ mod tests {
         provider.append("echo synced".to_string()).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "echo synced\n");
 
-        let mut readonly = std::fs::metadata(&path).unwrap().permissions();
+        let original = std::fs::metadata(&path).unwrap().permissions();
+        let mut readonly = original.clone();
         readonly.set_readonly(true);
         std::fs::set_permissions(&path, readonly).unwrap();
         provider.append("echo lost".to_string()).unwrap();
@@ -1131,9 +1132,7 @@ mod tests {
             "echo synced\n",
             "the read-only file kept the session entry memory-only"
         );
-        let mut writable = std::fs::metadata(&path).unwrap().permissions();
-        writable.set_readonly(false);
-        std::fs::set_permissions(&path, writable).unwrap();
+        std::fs::set_permissions(&path, original).unwrap();
 
         drop(provider);
         assert_eq!(

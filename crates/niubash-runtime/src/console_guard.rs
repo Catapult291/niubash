@@ -251,11 +251,11 @@ mod platform {
         }
 
         unsafe {
-            let module = GetModuleHandleA(b"kernelbase.dll\0".as_ptr());
+            let module = GetModuleHandleA(c"kernelbase.dll".as_ptr().cast());
             if module.is_null() {
                 return false;
             }
-            let proc = GetProcAddress(module, b"AllocConsoleWithOptions\0".as_ptr());
+            let proc = GetProcAddress(module, c"AllocConsoleWithOptions".as_ptr().cast());
             if proc.is_null() {
                 return false;
             }

@@ -731,9 +731,9 @@ mod tests {
             .as_nanos();
         let temp =
             std::env::temp_dir().join(format!("ui-theme-section-{}-{nanos}", std::process::id()));
-        let _sources = std::env::set_var(
+        std::env::set_var(
             "NIU_PLUGIN_SOURCES_ROOT",
-            &temp.join("sources").to_string_lossy().to_string(),
+            temp.join("sources").to_string_lossy().to_string(),
         );
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::plugins::sources::add_source(crate::plugins::sources::SourceInstallRequest {
@@ -760,10 +760,7 @@ mod tests {
                 .expect("trusted theme source must contribute a Themes section");
             assert!(!themes.rows.is_empty(), "{:?}", themes.rows);
             let names: Vec<&str> = themes.rows.iter().map(|row| row.id.as_str()).collect();
-            assert!(
-                names.iter().any(|name| *name == "robbyrussell"),
-                "{names:?}"
-            );
+            assert!(names.contains(&"robbyrussell"), "{names:?}");
             assert!(
                 names.windows(2).all(|pair| pair[0] <= pair[1]),
                 "theme rows must be sorted by name: {names:?}"
@@ -775,7 +772,7 @@ mod tests {
                 assert_eq!(source_id, "oh-my-bash", "{row:?}");
             }
         }));
-        let _ = std::env::remove_var("NIU_PLUGIN_SOURCES_ROOT");
+        std::env::remove_var("NIU_PLUGIN_SOURCES_ROOT");
         let _ = crate::plugins::sources::remove_source("oh-my-bash");
         let _ = std::fs::remove_dir_all(&temp);
         if let Err(panic) = result {

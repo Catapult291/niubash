@@ -38,7 +38,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1.11
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: rustfmt
+          components: rustfmt, clippy
 
       # No `cargo update -p rubash` here on purpose: under the [patch] path
       # override the sibling clone above IS latest master (the lock's git rev
@@ -54,6 +54,14 @@ jobs:
       # x2410516039/xgr-niubash; the tree has been clean since).
       - name: cargo fmt --check (workspace)
         run: cargo fmt --check --all
+
+      # niubash#450: niubash-runtime is clippy-clean on the stable toolchain;
+      # -D warnings pins the zero baseline so any new lint fails the PR.
+      # Scoped to the runtime crate for now — the niubash bin and its
+      # integration tests still carry their own pre-existing lint debt, and
+      # this gate widens to --workspace once that clears.
+      - name: cargo clippy (niubash-runtime, -D warnings)
+        run: cargo clippy -p niubash-runtime --all-targets --locked -- -D warnings
 
       - name: cargo build
         run: cargo build --locked

@@ -95,13 +95,6 @@ pub mod typeahead_guard;
 pub mod windows_terminal;
 pub mod winuxcmd;
 
-#[cfg(test)]
-pub(crate) mod test_support {
-    use std::sync::Mutex;
-
-    pub(crate) static PROCESS_STATE_LOCK: Mutex<()> = Mutex::new(());
-}
-
 pub use completion::{CompletionBehavior, CompletionMatchMode, CompletionState, NiubashCompleter};
 pub use config::{
     AutosuggestConfig, CommandNotFoundHint, EditorConfig, EditorMode, HistoryConfig, MenuConfig,
@@ -113,3 +106,10 @@ pub use prompt_segments::{
     SegmentId, SegmentPreset, SegmentPrompt, SegmentPromptAdapter, SegmentPromptConfig,
 };
 pub use shell::Shell;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Mutex;
+
+    pub(crate) static PROCESS_STATE_LOCK: Mutex<()> = Mutex::new(());
+}

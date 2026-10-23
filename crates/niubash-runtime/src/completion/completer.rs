@@ -512,7 +512,7 @@ fn compdef_suggestions(context: &CompletionContext) -> Option<CompletionResult> 
         .input
         .get(..context.cursor_pos.min(context.input.len()))
         .and_then(|input| input.chars().last())
-        .map_or(false, char::is_whitespace);
+        .is_some_and(char::is_whitespace);
     if !appending {
         words.push(current_word.clone());
     }
