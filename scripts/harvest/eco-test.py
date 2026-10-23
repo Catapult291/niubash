@@ -1011,10 +1011,12 @@ GOLD = ("SYNTAX-REJECT-RUBASH-ONLY", "HANG")
 
 
 def report(results_path: Path, top: int, include_storms: bool,
-           include_gnu: bool):
+           include_gnu: bool, build_id: str | None = None):
     groups: dict[str, list[dict]] = collections.defaultdict(list)
     verdicts = collections.Counter()
     latest: dict[str, dict] = {}
+    builds: collections.Counter = collections.Counter()
+    build_oracle: dict[str, str] = {}
     with open(results_path, encoding="utf-8") as fh:
         for ln in fh:
             ln = ln.strip()
@@ -1029,6 +1031,18 @@ def report(results_path: Path, top: int, include_storms: bool,
             latest[r.get("content_hash", "?")] = r
     rows = list(latest.values())
     for r in rows:
+        bid = r.get("build_id", "legacy-unknown") or "legacy-unknown"
+        builds[bid] += 1
+        ident = r.get("build_identity") or {}
+        oracle = ident.get("gnu_oracle") or {}
+        if bid not in build_oracle:
+            build_oracle[bid] = (
+                f"{oracle.get('kind', '?')} :: "
+                f"{oracle.get('version', '?')}")
+    if build_id is not None:
+        rows = [r for r in rows
+                if (r.get("build_id") or "legacy-unknown") == build_id]
+    for r in rows:
         verdicts[r.get("verdict", "?")] += 1
     for r in rows:
         v = r.get("verdict")
@@ -1037,8 +1051,25 @@ def report(results_path: Path, top: int, include_storms: bool,
         if gold:
             groups[r.get("signature") or v].append(r)
     tested = len(rows)
-    print(f"== eco-test report: {tested} assets tested "
-          f"({results_path}) ==")
+    if build_id is None and len(builds) > 1:
+        print(f"== eco-test report: {tested} assets total across "
+              f"{len(builds)} builds ({results_path}) ==")
+        print("per-build asset counts (issue titles MUST use ONE build):")
+        for bid, n in builds.most_common():
+            print(f"  {n:5d}  build {bid[:12]}  oracle {build_oracle[bid]}")
+        print("gold groups below are CROSS-BUILD cumulative watchlists — "
+              "do NOT copy their totals into issue titles; re-run with "
+              "--build-id <id> for the current-build counts.")
+    else:
+        label = (f"build {build_id[:12]}" if build_id
+                 else f"({results_path})")
+        print(f"== eco-test report: {tested} assets tested {label} ==")
+        if rows:
+            ident0 = rows[0].get("build_identity") or {}
+            oracle0 = ident0.get("gnu_oracle") or {}
+            print(f"oracle: {oracle0.get('kind', '?')} :: "
+                  f"{oracle0.get('version', '?')}  "
+                  f"(titles must stamp kind+version)")
     print("verdict distribution:")
     for v, n in verdicts.most_common():
         print(f"  {n:5d}  {v}")
@@ -1060,8 +1091,10 @@ def report(results_path: Path, top: int, include_storms: bool,
         ex = [{"repo": r["repo"], "path": r["path"], "verdict": r["verdict"],
                "url": r["source_url"]} for r in rs[:5]]
         print(f"\n[{len(rs)} assets] {sig}")
-        for e in ex:
-            print(f"    {e['repo']} :: {e['path']} ({e['verdict']})")
+        for e, r in zip(ex, rs[:5]):
+            bid = (r.get("build_id") or "legacy-unknown")[:12]
+            print(f"    {e['repo']} :: {e['path']} ({e['verdict']}, "
+                  f"build {bid})")
         report_json.append({"signature": sig, "count": len(rs),
                             "examples": ex,
                             "assets": [{"repo": r["repo"], "path": r["path"],
@@ -1329,6 +1362,10 @@ def main(argv=None):
     ap.add_argument("--include-gnu", action="store_true",
                     help="report mode: also group ASSET-NATURE (and legacy "
                          "GNU-ALSO-FAILS lines)")
+    ap.add_argument("--build-id", default=None,
+                    help="report mode: restrict to one build id; without it "
+                         "the report is a cross-build cumulative watchlist "
+                         "and must not feed issue titles")
     args = ap.parse_args(argv)
 
     if hasattr(sys.stdout, "reconfigure"):
@@ -1349,7 +1386,7 @@ def main(argv=None):
 
     if args.report:
         return report(results_path, args.top, args.include_storms,
-                      args.include_gnu)
+                      args.include_gnu, args.build_id)
 
     import sqlite3
     manifest_dir = Path(args.manifest_dir).resolve()
