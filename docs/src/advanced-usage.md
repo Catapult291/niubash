@@ -97,12 +97,21 @@ regenerate `~/.niubash/generated/plugins.niu`, which the host sources
 read-only *before* your rc — so rc lines always win
 (see [Plugin Workflow](#plugin-workflow)).
 
-Interactive non-login shells read startup files in a fixed order:
-`~/.bashrc` first (GNU parity — bring your existing bash configuration; the
-migration path, rubash#1187), then `~/.niubashrc` last so niu-specific
-lines always override. `--norc` skips both; `--rcfile <file>` reads only
-the named file, exactly like GNU bash. The legacy `~/.winuxshrc` and
-`~/.winshrc` names are never read, migrated, or written. Machine state —
+Interactive shells read ONE startup file: `~/.niubashrc`. If it does not
+exist, niubash falls back to `~/.bashrc` (the migration path for existing
+bash configurations). The two never stack — one config file, one blast
+radius, no implicit double-sourcing. Want the bash layer under niu? Add
+one visible line to `~/.niubashrc`:
+
+```bash
+[[ -f ~/.bashrc ]] && source ~/.bashrc
+```
+
+Explicit, visible, yours — the same shape as bash's own
+`.bash_profile` → `.bashrc` chain. `--norc` skips startup files;
+`--rcfile <file>` reads only the named file, exactly like GNU bash. The
+legacy `~/.winuxshrc` and `~/.winshrc` names are never read, migrated, or
+written. Machine state —
 the plugin manifest, source registry and trust records, the generated
 loader, test isolation, completion directories — is maintained by Niubash
 itself and is not a user configuration entry point.
