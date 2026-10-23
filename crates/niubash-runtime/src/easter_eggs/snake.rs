@@ -170,7 +170,7 @@ impl Game {
 
         // Bordered torus: the frame makes the wrap visibly deliberate.
         let hbar: String = "\u{2500}".repeat(WIDTH + 2);
-        write!(stdout, "  \x1b[90m\u{250c}{hbar}\u{2510}\x1b[0m\x1b[K\n")?;
+        writeln!(stdout, "  \x1b[90m\u{250c}{hbar}\u{2510}\x1b[0m\x1b[K")?;
         for y in 0..HEIGHT {
             write!(stdout, "  \x1b[90m\u{2502}\x1b[0m ")?;
             for x in 0..WIDTH {
@@ -187,9 +187,9 @@ impl Game {
             }
             writeln!(stdout, " \x1b[90m\u{2502}\x1b[0m\x1b[K")?;
         }
-        write!(stdout, "  \x1b[90m\u{2514}{hbar}\u{2518}\x1b[0m\x1b[K\n")?;
+        writeln!(stdout, "  \x1b[90m\u{2514}{hbar}\u{2518}\x1b[0m\x1b[K")?;
 
-        write!(stdout, "\x1b[K\n")?;
+        writeln!(stdout, "\x1b[K")?;
         match self.phase {
             Phase::Over => write!(
                 stdout,

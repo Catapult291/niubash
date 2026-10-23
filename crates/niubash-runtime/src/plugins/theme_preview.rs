@@ -320,8 +320,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// cap at [`MAX_PREVIEW_LINES`].
 pub fn preview_lines(rendered: &str) -> Vec<String> {
     let cleaned = rendered
-        .replace('\x01', "")
-        .replace('\x02', "")
+        .replace(['\x01', '\x02'], "")
         .replace("\\[", "")
         .replace("\\]", "");
     let mut lines: Vec<String> = cleaned.split('\n').map(str::to_string).collect();
@@ -382,7 +381,7 @@ impl Default for GalleryPreviews {
 impl GalleryPreviews {
     /// A cache rendering through the real child pipeline.
     pub fn new() -> Self {
-        Self::with_renderer(Arc::new(|request| render_theme(request)))
+        Self::with_renderer(Arc::new(render_theme))
     }
 
     /// A cache with an injected renderer (tests: no child processes).

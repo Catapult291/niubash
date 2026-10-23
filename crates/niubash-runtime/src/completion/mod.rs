@@ -16,16 +16,11 @@ pub use completer::{CompletionState, NiubashCompleter};
 
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompletionMatchMode {
+    #[default]
     Prefix,
     Substring,
-}
-
-impl Default for CompletionMatchMode {
-    fn default() -> Self {
-        Self::Prefix
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -274,124 +269,6 @@ impl CompletionResult {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_get_current_word() {
-        let ctx = CompletionContext::new(
-            PathBuf::from("/home/user"),
-            "echo hello world".to_string(),
-            10,
-        );
-        assert_eq!(ctx.get_current_word(), Some("hello".to_string()));
-    }
-
-    #[test]
-    fn completion_behavior_matches_prefix_and_substring_modes() {
-        let default_behavior = CompletionBehavior::default();
-        assert!(default_behavior.matches("grep", "gre"));
-        assert!(default_behavior.matches("grep", "GRE"));
-        assert!(!default_behavior.matches("grep", "ep"));
-
-        let substring = CompletionBehavior {
-            match_mode: CompletionMatchMode::Substring,
-            ..CompletionBehavior::default()
-        };
-        assert!(substring.matches("grep", "ep"));
-
-        let case_sensitive = CompletionBehavior {
-            case_sensitive: true,
-            ..CompletionBehavior::default()
-        };
-        assert!(case_sensitive.matches("grep", "gre"));
-        assert!(!case_sensitive.matches("grep", "GRE"));
-    }
-
-    #[test]
-    fn test_get_current_word_handles_escapes_and_quotes() {
-        let escaped =
-            CompletionContext::new(PathBuf::from("/home/user"), "ls two\\ w".to_string(), 9);
-        let escaped_word = escaped.get_current_shell_word().unwrap();
-        assert_eq!(escaped_word.value, "two w");
-        assert_eq!(escaped_word.start, 3);
-        assert_eq!(escaped.current_word_span(), Some((3, 9)));
-
-        let quoted =
-            CompletionContext::new(PathBuf::from("/home/user"), "ls \"two w".to_string(), 9);
-        let quoted_word = quoted.get_current_shell_word().unwrap();
-        assert_eq!(quoted_word.value, "two w");
-        assert_eq!(quoted_word.quote, Some('"'));
-        assert_eq!(quoted_word.start, 3);
-    }
-
-    #[test]
-    fn test_is_command_position_for_partial_and_empty_commands() {
-        let empty = CompletionContext::new(PathBuf::from("/home/user"), "".to_string(), 0);
-        assert!(empty.is_command_position());
-
-        let partial = CompletionContext::new(PathBuf::from("/home/user"), "gre".to_string(), 3);
-        assert!(partial.is_command_position());
-
-        let after_pipe =
-            CompletionContext::new(PathBuf::from("/home/user"), "ls | gre".to_string(), 8);
-        assert!(after_pipe.is_command_position());
-
-        let arg = CompletionContext::new(PathBuf::from("/home/user"), "echo gre".to_string(), 8);
-        assert!(!arg.is_command_position());
-
-        let escaped_arg =
-            CompletionContext::new(PathBuf::from("/home/user"), "echo two\\ w".to_string(), 11);
-        assert!(!escaped_arg.is_command_position());
-
-        let quoted_pipe = CompletionContext::new(
-            PathBuf::from("/home/user"),
-            "echo \"|\" | gre".to_string(),
-            14,
-        );
-        assert!(quoted_pipe.is_command_position());
-    }
-
-    #[test]
-    fn test_is_path_completion() {
-        let ctx =
-            CompletionContext::new(PathBuf::from("/home/user"), "cat /tmp/fil".to_string(), 12);
-        assert!(ctx.is_path_completion());
-    }
-
-    #[test]
-    fn test_blank_argument_position_is_path_completion() {
-        let arg = CompletionContext::new(PathBuf::from("/home/user"), "ls ".to_string(), 3);
-        assert!(arg.is_path_completion());
-
-        let after_pipe =
-            CompletionContext::new(PathBuf::from("/home/user"), "ls | ".to_string(), 5);
-        assert!(!after_pipe.is_path_completion());
-        assert!(after_pipe.is_command_position());
-    }
-
-    #[test]
-    fn test_is_variable_completion() {
-        let ctx = CompletionContext::new(PathBuf::from("/home/user"), "echo $HOM".to_string(), 9);
-        assert!(ctx.is_variable_completion());
-    }
-
-    #[test]
-    fn test_prev_token_handles_escaped_values() {
-        let value = CompletionContext::new(
-            PathBuf::from("/home/user"),
-            "cmd --flag two\\ w".to_string(),
-            17,
-        );
-        assert_eq!(value.get_prev_token(), Some("--flag".to_string()));
-
-        let blank =
-            CompletionContext::new(PathBuf::from("/home/user"), "cmd --flag ".to_string(), 11);
-        assert_eq!(blank.get_prev_token(), Some("--flag".to_string()));
-    }
-}
-
 // ─── Char-boundary helpers ────────────────────────────────────────────────────
 
 /// Round `pos` down to the nearest UTF-8 char boundary in `s`.
@@ -579,4 +456,122 @@ fn segment_ends_with_unescaped_whitespace(segment: &str) -> bool {
     }
 
     ends_with_whitespace
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_current_word() {
+        let ctx = CompletionContext::new(
+            PathBuf::from("/home/user"),
+            "echo hello world".to_string(),
+            10,
+        );
+        assert_eq!(ctx.get_current_word(), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn completion_behavior_matches_prefix_and_substring_modes() {
+        let default_behavior = CompletionBehavior::default();
+        assert!(default_behavior.matches("grep", "gre"));
+        assert!(default_behavior.matches("grep", "GRE"));
+        assert!(!default_behavior.matches("grep", "ep"));
+
+        let substring = CompletionBehavior {
+            match_mode: CompletionMatchMode::Substring,
+            ..CompletionBehavior::default()
+        };
+        assert!(substring.matches("grep", "ep"));
+
+        let case_sensitive = CompletionBehavior {
+            case_sensitive: true,
+            ..CompletionBehavior::default()
+        };
+        assert!(case_sensitive.matches("grep", "gre"));
+        assert!(!case_sensitive.matches("grep", "GRE"));
+    }
+
+    #[test]
+    fn test_get_current_word_handles_escapes_and_quotes() {
+        let escaped =
+            CompletionContext::new(PathBuf::from("/home/user"), "ls two\\ w".to_string(), 9);
+        let escaped_word = escaped.get_current_shell_word().unwrap();
+        assert_eq!(escaped_word.value, "two w");
+        assert_eq!(escaped_word.start, 3);
+        assert_eq!(escaped.current_word_span(), Some((3, 9)));
+
+        let quoted =
+            CompletionContext::new(PathBuf::from("/home/user"), "ls \"two w".to_string(), 9);
+        let quoted_word = quoted.get_current_shell_word().unwrap();
+        assert_eq!(quoted_word.value, "two w");
+        assert_eq!(quoted_word.quote, Some('"'));
+        assert_eq!(quoted_word.start, 3);
+    }
+
+    #[test]
+    fn test_is_command_position_for_partial_and_empty_commands() {
+        let empty = CompletionContext::new(PathBuf::from("/home/user"), "".to_string(), 0);
+        assert!(empty.is_command_position());
+
+        let partial = CompletionContext::new(PathBuf::from("/home/user"), "gre".to_string(), 3);
+        assert!(partial.is_command_position());
+
+        let after_pipe =
+            CompletionContext::new(PathBuf::from("/home/user"), "ls | gre".to_string(), 8);
+        assert!(after_pipe.is_command_position());
+
+        let arg = CompletionContext::new(PathBuf::from("/home/user"), "echo gre".to_string(), 8);
+        assert!(!arg.is_command_position());
+
+        let escaped_arg =
+            CompletionContext::new(PathBuf::from("/home/user"), "echo two\\ w".to_string(), 11);
+        assert!(!escaped_arg.is_command_position());
+
+        let quoted_pipe = CompletionContext::new(
+            PathBuf::from("/home/user"),
+            "echo \"|\" | gre".to_string(),
+            14,
+        );
+        assert!(quoted_pipe.is_command_position());
+    }
+
+    #[test]
+    fn test_is_path_completion() {
+        let ctx =
+            CompletionContext::new(PathBuf::from("/home/user"), "cat /tmp/fil".to_string(), 12);
+        assert!(ctx.is_path_completion());
+    }
+
+    #[test]
+    fn test_blank_argument_position_is_path_completion() {
+        let arg = CompletionContext::new(PathBuf::from("/home/user"), "ls ".to_string(), 3);
+        assert!(arg.is_path_completion());
+
+        let after_pipe =
+            CompletionContext::new(PathBuf::from("/home/user"), "ls | ".to_string(), 5);
+        assert!(!after_pipe.is_path_completion());
+        assert!(after_pipe.is_command_position());
+    }
+
+    #[test]
+    fn test_is_variable_completion() {
+        let ctx = CompletionContext::new(PathBuf::from("/home/user"), "echo $HOM".to_string(), 9);
+        assert!(ctx.is_variable_completion());
+    }
+
+    #[test]
+    fn test_prev_token_handles_escaped_values() {
+        let value = CompletionContext::new(
+            PathBuf::from("/home/user"),
+            "cmd --flag two\\ w".to_string(),
+            17,
+        );
+        assert_eq!(value.get_prev_token(), Some("--flag".to_string()));
+
+        let blank =
+            CompletionContext::new(PathBuf::from("/home/user"), "cmd --flag ".to_string(), 11);
+        assert_eq!(blank.get_prev_token(), Some("--flag".to_string()));
+    }
 }

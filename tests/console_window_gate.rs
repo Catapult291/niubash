@@ -966,3 +966,179 @@ fn encode_base64(input: &[u8]) -> String {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// niubash#455: the orphan-console release must leave child stdio usable
+// ---------------------------------------------------------------------------
+
+const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+
+#[repr(C)]
+struct StartupInfoW {
+    cb: u32,
+    reserved: *mut u16,
+    desktop: *mut u16,
+    title: *mut u16,
+    x: u32,
+    y: u32,
+    x_size: u32,
+    y_size: u32,
+    x_count_chars: u32,
+    y_count_chars: u32,
+    fill_attribute: u32,
+    flags: u32,
+    show_window: u16,
+    reserved2: u16,
+    reserved3: *mut u8,
+    std_input: *mut c_void,
+    std_output: *mut c_void,
+    std_error: *mut c_void,
+}
+
+#[repr(C)]
+struct ProcessInformation {
+    process: *mut c_void,
+    thread: *mut c_void,
+    process_id: u32,
+    thread_id: u32,
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateProcessW(
+        app: *const u16,
+        cmdline: *mut u16,
+        proc_attr: *mut c_void,
+        thread_attr: *mut c_void,
+        inherit: i32,
+        flags: u32,
+        env: *mut c_void,
+        dir: *const u16,
+        si: *const StartupInfoW,
+        pi: *mut ProcessInformation,
+    ) -> i32;
+    fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
+    fn GetExitCodeProcess(h: *mut c_void, code: *mut u32) -> i32;
+}
+
+/// Spawn `niu -c <script>` the way a console-less GUI/agent invoker does:
+/// `CREATE_NEW_CONSOLE` with NO redirected std handles. Windows allocates a
+/// fresh *visible* console AND points the child's three std slots at it —
+/// the orphan-console release then frees the console under niu's feet. This
+/// is the only spawn shape that reproduces the niubash#455 dead-stdio
+/// handoff (std::process::Command always sets STARTF_USESTDHANDLES, so its
+/// children get pipe/devnull handles that survive the release).
+fn spawn_niu_fresh_console(script: &str) -> (u32, *mut c_void) {
+    let niu = env!("CARGO_BIN_EXE_niu");
+    let mut cmdline: Vec<u16> = format!("\"{niu}\" -c \"{script}\"")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let si = StartupInfoW {
+        cb: std::mem::size_of::<StartupInfoW>() as u32,
+        reserved: std::ptr::null_mut(),
+        desktop: std::ptr::null_mut(),
+        title: std::ptr::null_mut(),
+        x: 0,
+        y: 0,
+        x_size: 0,
+        y_size: 0,
+        x_count_chars: 0,
+        y_count_chars: 0,
+        fill_attribute: 0,
+        flags: 0,
+        show_window: 0,
+        reserved2: 0,
+        reserved3: std::ptr::null_mut(),
+        std_input: std::ptr::null_mut(),
+        std_output: std::ptr::null_mut(),
+        std_error: std::ptr::null_mut(),
+    };
+    let mut pi = ProcessInformation {
+        process: std::ptr::null_mut(),
+        thread: std::ptr::null_mut(),
+        process_id: 0,
+        thread_id: 0,
+    };
+    let ok = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            cmdline.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &si,
+            &mut pi,
+        )
+    };
+    assert!(
+        ok != 0,
+        "CreateProcessW(niu -c) failed: {}",
+        windows_get_last_error()
+    );
+    unsafe { CloseHandle(pi.thread) };
+    (pi.process_id, pi.process)
+}
+
+fn windows_get_last_error() -> u32 {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLastError() -> u32;
+    }
+    unsafe { GetLastError() }
+}
+
+#[test]
+fn plainly_spawned_niu_c_keeps_children_spawnable_after_console_release() {
+    // niubash#455: release_orphan_console frees the auto-allocated console
+    // that also owns the process's std handles; before the fix every later
+    // external spawn inherited dead handles and died in the engine's stdio
+    // plan ("Bad file descriptor", rc 126) — a console TUI child renders
+    // nothing and reads nothing, the reported blank+dead-keys+hang. The
+    // release must re-point the dead std slots (NUL) so children spawn.
+    let dir = std::env::temp_dir().join(format!("niu-gate-455-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let out_file = dir.join("child-out.txt");
+    let script = format!(
+        "C:/Windows/System32/hostname.exe > \"{}\"; echo rc=$? >> \"{}\"",
+        out_file.display(),
+        out_file.display()
+    );
+
+    let (pid, process) = spawn_niu_fresh_console(&script);
+    // ~2s of poll while niu runs: no persistent visible window may linger,
+    // matching the release contract the rest of this file pins.
+    let offenders = collect_offenders(
+        pid,
+        || (unsafe { WaitForSingleObject(process, 0) }) == 0x102, // WAIT_TIMEOUT
+        true,
+    );
+    let mut code = u32::MAX;
+    unsafe {
+        WaitForSingleObject(process, 15_000);
+        GetExitCodeProcess(process, &mut code);
+        CloseHandle(process);
+    }
+    let body = std::fs::read_to_string(&out_file).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(code, 0, "niu -c exited {code}; child output: {body:?}");
+    assert!(
+        offenders.is_empty(),
+        "visible console windows lingered (owner pids {offenders:?})"
+    );
+    let lines = non_empty_lines(body.as_bytes());
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected hostname + rc lines after release, got: {body:?}"
+    );
+    assert_eq!(
+        lines[1], "rc=0",
+        "external child must spawn cleanly after the console release: {body:?}"
+    );
+}

@@ -23,6 +23,7 @@
 //!   double-dispatched: once through the host flag here (`run_trap_hooks`
 //!   from the REPL) and once through the engine's own command-boundary
 //!   trap dispatch.
+//!
 //! The engine queue also has no non-destructive peek (`take_pending_signals`
 //! drains it), so the host cannot poll it from the prompt loop either. The
 //! host's only unix reaction point is reedline's `Signal::CtrlC` — while

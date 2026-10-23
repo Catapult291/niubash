@@ -1017,7 +1017,7 @@ fn write_managed_block(begin: &str, end: &str, block: &str) -> anyhow::Result<(P
     // its header and the in-block copy leaves with this rewrite, so the
     // user area never grows a duplicate section per verb.
     let mut foreign = foreign_body_lines(&lines, &spans, block, managed.as_ref());
-    foreign.retain(|line| !pile_lines.contains(&line.trim().to_string()));
+    foreign.retain(|line| !pile_lines.contains(line.trim()));
     let consumed = spans.len();
     let mut insert_after_block = lines.len();
     match spans.as_slice() {
@@ -1144,7 +1144,7 @@ fn remove_managed_block(begin: &str, end: &str) -> anyhow::Result<usize> {
         }
         None => Vec::new(),
     };
-    foreign.retain(|line| !pile_lines.contains(&line.trim().to_string()));
+    foreign.retain(|line| !pile_lines.contains(line.trim()));
     let first_start = spans[0].0;
     let mut rewritten: Vec<String> = Vec::new();
     for (index, line) in lines.iter().enumerate() {
@@ -2174,7 +2174,7 @@ pub fn publish_loader_generation(
     // computed nor kept are stale (the source left the manifest entirely):
     // the generation drops them, with a visible row — unless another pass
     // already reported the drop (`drop_silent`).
-    for (id, _) in &current {
+    for id in current.keys() {
         if !desired.contains_key(id)
             && !computed.iter().any(|(existing, _)| existing == id)
             && !keep_current.contains(id)
@@ -2610,14 +2610,12 @@ mod tests {
         let _sandbox = sandbox("stray-theme-scan");
         fs::write(
             rc_file(),
-            format!(
-                "export OSH_THEME=agnoster\n\
+            "export OSH_THEME=agnoster\n\
                  # >>> niu source oh-my-bash >>>\n\
                  OSH_THEME='robbyrussell'\n\
                  # <<< niu source oh-my-bash <<<\n\
                  BASH_IT_THEME='bobby'\n\
-                 export NOSH_THEME='nope'\n"
-            ),
+                 export NOSH_THEME='nope'\n",
         )
         .unwrap();
         let stray = super::stray_theme_assignment_lines();

@@ -63,7 +63,7 @@ pub fn render_logo(target_cols: u16) {
         target_cols as usize
     } else {
         let term_w = super::interactive_menu::term_width() as usize;
-        (term_w / 3).max(20).min(60)
+        (term_w / 3).clamp(20, 60)
     };
     let th = ((h as f64 / w as f64 * tw as f64 * 0.5) as usize).max(1);
 
@@ -190,7 +190,7 @@ pub fn render_logo_to_string(target_cols: u16) -> String {
 pub fn logo_height(target_cols: u16) -> u16 {
     let logo_bytes = include_bytes!("../assets/niubash-icon-256.png");
     let mut decoder = png::Decoder::new(std::io::Cursor::new(logo_bytes));
-    let _ = decoder.set_transformations(png::Transformations::normalize_to_color8());
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = match decoder.read_info() {
         Ok(r) => r,
         Err(_) => return 0,

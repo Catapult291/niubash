@@ -57,9 +57,9 @@ pub(crate) fn dispatch(interactive: bool, argv: &[String]) -> anyhow::Result<Opt
 fn print_usage(name: &str) -> anyhow::Result<i32> {
     use std::io::Write;
     let mut out = std::io::stdout();
-    write!(
+    writeln!(
         out,
-        "  {DIM}{name}: an interactive niubash easter egg{RESET}\n"
+        "  {DIM}{name}: an interactive niubash easter egg{RESET}"
     )?;
     out.flush()?;
     Ok(0)

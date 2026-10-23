@@ -40,7 +40,7 @@ fn find_winuxcmd_with_report() -> WinuxCmdSearchReport {
     find_winuxcmd_with_report_from_sources(
         override_path.as_deref(),
         exe_dir.as_deref(),
-        |checked| find_winuxcmd_on_path(checked),
+        find_winuxcmd_on_path,
     )
 }
 
@@ -497,7 +497,7 @@ fn is_winuxcmd_installation_entry(entry: &str) -> bool {
     #[cfg(windows)]
     {
         let path = PathBuf::from(entry.trim_matches('"'));
-        return path.join("winuxcmd.exe").is_file() || path.join("usr/bin/winuxcmd.exe").is_file();
+        path.join("winuxcmd.exe").is_file() || path.join("usr/bin/winuxcmd.exe").is_file()
     }
 
     #[cfg(not(windows))]
@@ -1354,9 +1354,7 @@ mod tests {
         let from_entry_bin = bundled_winuxcmd_candidates(Path::new(r"C:\tools\winuxcmd\bin"));
         let found = from_entry_bin
             .iter()
-            .find(|candidate| {
-                candidate.path == PathBuf::from(r"C:\tools\winuxcmd\usr\bin\winuxcmd.exe")
-            })
+            .find(|candidate| candidate.path == *r"C:\tools\winuxcmd\usr\bin\winuxcmd.exe")
             .expect("the installation one level up must be a candidate");
         assert_eq!(found.root, PathBuf::from(r"C:\tools\winuxcmd"));
 
@@ -1365,16 +1363,13 @@ mod tests {
             bundled_winuxcmd_candidates(Path::new(r"C:\tools\winuxcmd\opt\niugit\bin"));
         assert!(from_payload
             .iter()
-            .any(|candidate| candidate.path
-                == PathBuf::from(r"C:\tools\winuxcmd\usr\bin\winuxcmd.exe")));
+            .any(|candidate| candidate.path == *r"C:\tools\winuxcmd\usr\bin\winuxcmd.exe"));
 
         // The niubash layout: `<x>\bin\bash.exe` finds `<x>\winuxcmd\...`.
         let from_niubash_bin = bundled_winuxcmd_candidates(Path::new(r"C:\apps\Niubash\bin"));
         let bundled = from_niubash_bin
             .iter()
-            .find(|candidate| {
-                candidate.path == PathBuf::from(r"C:\apps\Niubash\winuxcmd\usr\bin\winuxcmd.exe")
-            })
+            .find(|candidate| candidate.path == *r"C:\apps\Niubash\winuxcmd\usr\bin\winuxcmd.exe")
             .expect("the bundled tree must be a candidate");
         assert_eq!(bundled.root, PathBuf::from(r"C:\apps\Niubash\winuxcmd"));
     }

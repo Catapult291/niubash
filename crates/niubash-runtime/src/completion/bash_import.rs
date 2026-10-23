@@ -214,7 +214,7 @@ fn build_flag_defs(
         // Only pair when both flags have IDENTICAL static value lists.
         // Path-type flags are never paired automatically.
         let matched_short: Option<&str> = if let Some(FlagValueInfo::Static(vals)) = val_info {
-            short_flags.iter().find_map(|&&ref short| {
+            short_flags.iter().find_map(|&short| {
                 if used_short.contains(short.as_str()) {
                     return None;
                 }

@@ -6,7 +6,7 @@
 //! language) never fail the run.
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const OK: &str = "\x1b[1;92m✅\x1b[0m";
 const WARN: &str = "\x1b[1;93m⚠️\x1b[0m";
@@ -619,7 +619,7 @@ fn same_executable(a: &PathBuf, b: &PathBuf) -> bool {
 /// never canonicalizes to the package's real `niu.exe` under
 /// `C:\Program Files\WindowsApps`. Both names start this exact package, so
 /// the shadow warning must not fire on them.
-fn same_packaged_origin(path_niu: &PathBuf) -> bool {
+fn same_packaged_origin(path_niu: &Path) -> bool {
     crate::msix::is_packaged() && crate::msix::is_app_execution_alias_path(path_niu)
 }
 

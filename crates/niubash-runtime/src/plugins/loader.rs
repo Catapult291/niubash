@@ -579,7 +579,7 @@ pub fn scan_legacy_blocks(rc_text: &str) -> anyhow::Result<Vec<LegacyBlock>> {
             });
         }
     }
-    out.sort_by(|a, b| a.start_line.cmp(&b.start_line));
+    out.sort_by_key(|a| a.start_line);
     Ok(out)
 }
 
@@ -658,9 +658,9 @@ pub fn migrate_rc(
                 let lines: Vec<&str> = text.lines().collect();
                 let mut keep: Vec<usize> = Vec::new();
                 for (index, _) in lines.iter().enumerate() {
-                    let inside = blocks.iter().any(|b| {
-                        !b.end_missing && index + 1 >= b.start_line && index + 1 <= b.end_line
-                    });
+                    let inside = blocks
+                        .iter()
+                        .any(|b| !b.end_missing && index + 1 >= b.start_line && index < b.end_line);
                     if !inside {
                         keep.push(index);
                     }

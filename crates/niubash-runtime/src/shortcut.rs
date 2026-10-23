@@ -298,7 +298,7 @@ pub fn plan_for_installation(niu_exe: &Path, icon: Option<&Path>) -> ShortcutPla
             super::windows_terminal::niubash_profile_registered(),
         )
     });
-    ShortcutPlan::build(wt_exe.as_deref(), niu_exe, icon, &working_directory)
+    ShortcutPlan::build(wt_exe, niu_exe, icon, &working_directory)
 }
 
 /// The niubash#211 eligibility rule in one place: the WT shortcut form

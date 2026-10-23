@@ -138,7 +138,7 @@ impl PathQuery {
             };
         }
 
-        if let Some(last_sep) = word.rfind(|c| c == '/' || c == '\\') {
+        if let Some(last_sep) = word.rfind(['/', '\\']) {
             let display_prefix = word[..=last_sep].to_string();
             let dir_part = &word[..last_sep];
             let prefix = word[last_sep + 1..].to_string();

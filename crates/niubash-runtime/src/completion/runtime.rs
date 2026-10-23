@@ -185,7 +185,7 @@ pub(crate) fn command_words_before_cursor(context: &CompletionContext) -> Option
     let pos = floor_char_boundary(&context.input, pos);
     let before_cursor = &context.input[..pos];
     let start = before_cursor
-        .rfind(|ch: char| ch == ';' || ch == '|' || ch == '&' || ch == '\n')
+        .rfind([';', '|', '&', '\n'])
         .map(|idx| idx + 1)
         .unwrap_or(0);
     let segment = before_cursor[start..].trim_start();
@@ -201,7 +201,7 @@ pub(crate) fn comp_cword(context: &CompletionContext) -> usize {
         .input
         .get(..context.cursor_pos.min(context.input.len()))
         .and_then(|input| input.chars().last())
-        .map_or(false, char::is_whitespace)
+        .is_some_and(char::is_whitespace)
     {
         words.len()
     } else {

@@ -32,8 +32,6 @@ use crate::winuxcmd;
 
 const COMPATIBLE_SHELL_PATH_ENV: &str = "NIU_COMPATIBLE_SHELL_PATH";
 #[allow(dead_code)]
-#[allow(dead_code)]
-#[allow(dead_code)]
 const NIU_RC_FILE: &str = ".niubashrc";
 /// Niubash-native non-interactive environment file variable. Takes precedence
 /// over `BASH_ENV` so an agent shell can point at a dedicated init file.
@@ -642,9 +640,7 @@ impl Shell {
         if !is_plain_simple_command(cmd) || command_has_redirects(cmd) || cmd.words.len() < 2 {
             return None;
         }
-        let Some(command_name) = cmd.words.first() else {
-            return None;
-        };
+        let command_name = cmd.words.first()?;
         let is_this_shell = matches!(command_name.as_str(), "$THIS_SH" | "${THIS_SH}")
             || self
                 .executor
@@ -789,9 +785,7 @@ impl Shell {
             return None;
         }
         let words = decoded_words(&commands[0].words);
-        let Some(head) = words.first() else {
-            return None;
-        };
+        let head = words.first()?;
         if !crate::easter_eggs::is_registered(head) {
             return None;
         }
@@ -1101,7 +1095,7 @@ impl Shell {
     /// branch of the startup path (niubash#399); the env-file gates are
     /// independent of it (see `source_non_interactive_env`).
     pub fn login_shell_active(&self) -> bool {
-        self.executor.get_env("__RUBASH_LOGIN_SHELL").as_deref() == Some("1")
+        self.executor.get_env("__RUBASH_LOGIN_SHELL") == Some("1")
     }
 
     /// The login profile chain (GNU shell.c:1836-1880
@@ -1251,9 +1245,7 @@ impl Shell {
         if let Some(status) = self.load_generated_plugin_loader(rc_path.as_deref()) {
             return Some(status);
         }
-        let Some(path) = rc_path else {
-            return None;
-        };
+        let path = rc_path?;
         if !path.exists() {
             // GNU maybe_execute_file passes FEVAL_ENOENTOK (evalfile.c:345):
             // a missing --rcfile is silent, exactly like a missing default.
@@ -1402,7 +1394,7 @@ impl Shell {
     /// before startup files run: invoked as sh/ash (Shell::new),
     /// `--posix`, and `-o posix` (ShellInvocation::apply_to_executor).
     fn posix_mode_active(&self) -> bool {
-        self.executor.get_env("__RUBASH_POSIX_MODE").as_deref() == Some("1")
+        self.executor.get_env("__RUBASH_POSIX_MODE") == Some("1")
     }
 
     /// GNU shell.c:1103 execute_env_file: an unset or empty variable sources
@@ -1421,9 +1413,7 @@ impl Shell {
             .map(str::to_owned)
             .or_else(|| std::env::var(name).ok())
             .filter(|value| !value.trim().is_empty());
-        let Some(raw) = raw else {
-            return None;
-        };
+        let raw = raw?;
 
         normalize_executor_home_env(&mut self.executor, &self.home_dir);
         let path = self.resolve_non_interactive_env_path(&raw);
@@ -1505,9 +1495,7 @@ impl Shell {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
         };
-        let Some(raw) = niu_raw.or(bash_raw) else {
-            return None;
-        };
+        let raw = niu_raw.or(bash_raw)?;
 
         normalize_executor_home_env(&mut self.executor, &self.home_dir);
         let path = self.resolve_non_interactive_env_path(&raw);
@@ -2470,7 +2458,7 @@ impl Shell {
         // normal driver. Interactive input keeps the REPL continuation
         // route — GNU interactive shells prompt PS2 instead of failing the
         // read (the engine gate mirrors this with `!interactive`).
-        let parse_posix = self.executor.get_env("__RUBASH_POSIX_MODE").as_deref() == Some("1");
+        let parse_posix = self.executor.get_env("__RUBASH_POSIX_MODE") == Some("1");
         if allow_grouped_readers
             && !self.interactive
             && (rubash::script_driver::heredoc_delimiter_unclosed_quote(&script).is_some()
@@ -2578,7 +2566,7 @@ impl Shell {
                 && armed
                     .commands
                     .iter()
-                    .any(|command| Self::command_has_parse_error_marker(command))
+                    .any(Self::command_has_parse_error_marker)
             {
                 let code = rubash::script_driver::run_source_with_line_offset(
                     &mut self.executor,
@@ -3867,7 +3855,7 @@ fn ensure_prompt_terminal_env(executor: &mut Executor) {
 fn set_executor_env_if_missing_or_empty(executor: &mut Executor, name: &str, value: &str) {
     if executor
         .get_env(name)
-        .map_or(true, |current| current.trim().is_empty())
+        .is_none_or(|current| current.trim().is_empty())
     {
         executor.export_env(name, value);
     }
@@ -4159,13 +4147,17 @@ enum ShellChannel {
     Stderr,
 }
 
+/// Payload recorded by the [`CHANNEL_CAPTURE`] test seam: `Some` while armed,
+/// each entry a `(channel, bytes)` pair.
+#[cfg(test)]
+type ChannelCaptureBuffer = Option<Vec<(ShellChannel, Vec<u8>)>>;
+
 #[cfg(test)]
 thread_local! {
     /// Test seam for [`shell_channel_write`]: when armed with `Some`, channel
     /// writes are recorded here as (channel, payload) instead of reaching the
     /// real process handles, letting tests assert the stream separation.
-    static CHANNEL_CAPTURE:
-        std::cell::RefCell<Option<Vec<(ShellChannel, Vec<u8>)>>> =
+    static CHANNEL_CAPTURE: std::cell::RefCell<ChannelCaptureBuffer> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -5472,7 +5464,7 @@ complete -F _envtooldyn_hook envtooldyn
         );
 
         shell.execute_interactive_line("unalias gst").unwrap();
-        assert!(shell.aliases.get("gst").is_none());
+        assert!(!shell.aliases.contains_key("gst"));
     }
 
     #[test]
@@ -5634,7 +5626,7 @@ complete -F _envtooldyn_hook envtooldyn
                 shell
                     .executor
                     .get_env("HOME")
-                    .is_some_and(|home| is_windows_drive_path(home)),
+                    .is_some_and(is_windows_drive_path),
                 "HOME should be Windows-native for external tools, got {:?}",
                 shell.executor.get_env("HOME")
             );
@@ -6271,7 +6263,7 @@ complete -F _envtooldyn_hook envtooldyn
             );
         } else {
             assert_eq!(
-                shell.executor.get_env("PWD").as_deref(),
+                shell.executor.get_env("PWD"),
                 Some(target_shell_path.as_str())
             );
         }
@@ -6634,9 +6626,7 @@ complete -F _envtooldyn_hook envtooldyn
         // marker, REPL dispatch (the greeting tail only runs with repl).
         shell.executor.set_env("__RUBASH_POSIX_MODE", "1");
         shell.executor.set_env("__RUBASH_LOGIN_SHELL", "1");
-        shell
-            .executor
-            .set_env("ENV", &env_file.to_string_lossy().into_owned());
+        shell.executor.set_env("ENV", &env_file.to_string_lossy());
         let exit = shell.run_startup_files(true);
         assert_eq!(
             exit,
@@ -6675,9 +6665,7 @@ complete -F _envtooldyn_hook envtooldyn
         shell.home_dir = temp.path().to_path_buf();
         shell.executor.set_env("__RUBASH_POSIX_MODE", "1");
         shell.executor.set_env("__RUBASH_LOGIN_SHELL", "1");
-        shell
-            .executor
-            .set_env("ENV", &env_file.to_string_lossy().into_owned());
+        shell.executor.set_env("ENV", &env_file.to_string_lossy());
         let exit = shell.run_startup_files(true);
         assert_eq!(exit, None);
         assert_eq!(shell.executor.get_env("GREETING_RAN"), Some("42"));
