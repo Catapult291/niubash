@@ -97,11 +97,52 @@ regenerate `~/.niubash/generated/plugins.niu`, which the host sources
 read-only *before* your rc — so rc lines always win
 (see [Plugin Workflow](#plugin-workflow)).
 
-`~/.niubashrc` is the only startup file: the legacy `~/.winuxshrc`,
-`~/.winshrc`, and `~/.bashrc` names are never read, migrated, or written.
-Machine state — the plugin manifest, source registry and trust records, the
-generated loader, test isolation, completion directories — is maintained by
-Niubash itself and is not a user configuration entry point.
+Interactive shells read ONE startup file: `~/.niubashrc`. If it does not
+exist, niubash falls back to `~/.bashrc` (the migration path for existing
+bash configurations). The two never stack — one config file, one blast
+radius, no implicit double-sourcing. Want the bash layer under niu? Add
+one visible line to `~/.niubashrc`:
+
+```bash
+[[ -f ~/.bashrc ]] && source ~/.bashrc
+```
+
+Explicit, visible, yours — the same shape as bash's own
+`.bash_profile` → `.bashrc` chain. `--norc` skips startup files;
+`--rcfile <file>` reads only the named file, exactly like GNU bash. The
+legacy `~/.winuxshrc` and `~/.winshrc` names are never read, migrated, or
+written. Machine state —
+the plugin manifest, source registry and trust records, the generated
+loader, test isolation, completion directories — is maintained by Niubash
+itself and is not a user configuration entry point.
+
+## Script Debugging Flags
+
+Two startup flags wire debugger support. Neither affects `-c` automation
+unless you pass them explicitly.
+
+### `--debug` — arm the DEBUG-trap substrate (niu extension)
+
+`niu --debug script.sh` turns `extdebug` on from the first command: DEBUG
+traps fire at every GNU stop site with `BASH_ARGC`/`BASH_ARGV` populated,
+so a trap-based debugger or profiler can install itself without editing
+the script. GNU bash accepts the same flag as a no-op (its internal
+`debugging` variable is write-only — nothing in bash reads it), so scripts
+that pass `--debug` keep running unchanged under GNU bash too.
+
+### `--debugger` — run bashdb (GNU parity)
+
+`niu --debugger script.sh` mirrors GNU bash: the shell looks for the bashdb
+starter file (`bashdb-main.inc`) and sources it before your script runs.
+Search order: `$BASHDB_START_FILE` (set this when your bashdb lives under a
+nonstandard prefix — Termux, a custom `--prefix` build), then
+`/usr/local/share/bashdb/bashdb-main.inc`, then
+`/usr/share/bashdb/bashdb-main.inc`. If no starter file exists, niubash
+prints GNU's diagnostic pair (`No such file or directory` + `warning:
+cannot start debugger; debugging mode disabled`) and continues with
+debugging disabled — exactly what GNU bash does. With bashdb installed,
+existing bashdb users point the shell at their starter and upgrade in
+place.
 
 Do not put automation-critical behavior only in an interactive rc file. Pass
 needed environment variables directly to `niu -c` or the script process, or

@@ -227,8 +227,9 @@ tar -xzf niubash-v*-linux-x86_64.tar.gz && niubash-v*-linux-x86_64/niu
 From source (Rust 1.95+):
 `git clone https://github.com/unixwin/niubash.git && cd niubash && cargo build --release`
 
-Configuration is one file, `~/.niubashrc`, in plain Bash syntax — start
-with [Getting started](docs/src/getting-started.md).
+Configuration is ONE file, `~/.niubashrc`, in plain Bash syntax (no
+`~/.niubashrc` yet? niubash falls back to your `~/.bashrc`) — start with
+[Getting started](docs/src/getting-started.md).
 
 ## Documentation
 
