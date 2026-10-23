@@ -43,6 +43,14 @@ use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_C_EVENT};
 unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> i32 {
     if ctrl_type == CTRL_C_EVENT {
         CTRL_C_RECEIVED.store(true, Ordering::SeqCst);
+        // Host swallows the event so the shell survives, but the engine's
+        // in-process waits (sleep_interruptibly, external wait slices)
+        // only poll the rubash signal mailbox — inject SIGINT there so
+        // Ctrl+C aborts the foreground command (niubash D8) instead of
+        // waiting for it to finish. At the reedline prompt the console is
+        // in raw mode so this handler rarely fires; the `0x03` keystroke
+        // path is Signal::CtrlC + consume_ctrl_c.
+        rubash::builtins::kill::note_console_ctrl_c();
         return 1; // handled — don't terminate the shell
     }
     0 // pass through for other signals

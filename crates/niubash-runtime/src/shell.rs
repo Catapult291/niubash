@@ -879,7 +879,10 @@ impl Shell {
         } else if let Some(execution) = self.execute_host_synced_simple_ast(&ast) {
             match execution {
                 Ok(code) => code,
-                Err(rubash::executor::ExecuteError::ExitCode(code)) => code,
+                Err(rubash::executor::ExecuteError::ExitCode(code)) => {
+                    self.executor.set_last_exit_code(code);
+                    code
+                }
                 Err(rubash::executor::ExecuteError::Return(code)) => code,
                 Err(rubash::executor::ExecuteError::ExpansionFailure(code)) => code,
                 Err(rubash::executor::ExecuteError::FatalFunctionError(code)) => code,
@@ -899,7 +902,10 @@ impl Shell {
         } else {
             match self.executor.execute_ast(&ast) {
                 Ok(()) => self.executor.last_exit_code(),
-                Err(rubash::executor::ExecuteError::ExitCode(code)) => code,
+                Err(rubash::executor::ExecuteError::ExitCode(code)) => {
+                    self.executor.set_last_exit_code(code);
+                    code
+                }
                 Err(rubash::executor::ExecuteError::Return(code)) => code,
                 Err(rubash::executor::ExecuteError::ExpansionFailure(code)) => code,
                 Err(rubash::executor::ExecuteError::FatalFunctionError(code)) => code,
