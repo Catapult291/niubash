@@ -993,8 +993,11 @@ impl Shell {
 
     /// Source the user's REPL startup file once before the first prompt.
     ///
-    /// `~/.niubashrc` is the only automatic interactive rc entry point.
-    /// Without it, native defaults remain active; no other rc is searched.
+    /// `~/.niubashrc` is the automatic interactive rc entry point. Under
+    /// the default `startup.rc-policy = "primary-only"` a missing primary
+    /// leaves native defaults and no other rc is searched; an explicit
+    /// `bashrc-fallback` setup pick makes `~/.bashrc` eligible only when
+    /// the primary is genuinely absent (niubash#359; the two never stack).
     /// The rc is ordinary shell code: the built-in plugin/theme
     /// stack is retired (niubash#145), so NIU_PLUGINS / NIU_THEME lines in
     /// an old rc are inert assignments the host no longer reads. Returns
@@ -1542,6 +1545,29 @@ impl Shell {
         let primary = self.home_dir.join(NIU_RC_FILE);
         if primary.exists() {
             return Some(primary);
+        }
+        // niubash#359 `startup.rc-policy`: only an explicit setup-persisted
+        // `bashrc-fallback` pick lets ~/.bashrc fill the personal-rc slot,
+        // and only when the primary is GENUINELY absent — symlink_metadata
+        // does not follow the final entry away, so a dangling/cyclic
+        // .niubashrc symlink still owns the slot, and any non-NotFound
+        // error (permission, traversal, IO) is ambiguous presence rather
+        // than absence. `primary.exists()` was already false for both
+        // cases; keep it as the first gate and resolve the ambiguity only
+        // when the opt-in is on. A missing/broken .bashrc leaves defaults;
+        // its later open/source failure never selects another file.
+        if crate::config::resolve_rc_policy() == crate::config::RcPolicy::BashrcFallback {
+            match std::fs::symlink_metadata(&primary) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    let bashrc = self.home_dir.join(".bashrc");
+                    if bashrc.exists() {
+                        return Some(bashrc);
+                    }
+                }
+                // Any other outcome (Ok metadata or an ambiguous error)
+                // means the primary slot is occupied — no fallback.
+                _ => return Some(primary),
+            }
         }
         None
     }

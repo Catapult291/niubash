@@ -46,12 +46,14 @@ const SETUP_JOURNAL_SCHEMA: &str = "niubash:setup-journal@0.1.0";
 /// `niu plugin source rollback` cover the bundle/source channels.
 #[derive(Debug, Default)]
 struct SetupJournal {
-    /// Backup of the previous rc (when one existed).
-    rc_backup: Option<PathBuf>,
+    /// Proposal sample written because `~/.niubashrc` already existed
+    /// (niubash#359 create-only: there is no rc backup anymore — an
+    /// existing rc is never touched, so there is nothing to restore).
+    rc_sample: Option<PathBuf>,
     /// `true` when this run *created* the rc (fresh install: no previous
-    /// rc existed, so there is no backup to restore). The undo receipt
-    /// must then cover the write itself — remove the generated rc and the
-    /// setup-done marker (niubash#179 L02-1).
+    /// rc existed). The undo receipt must then cover the write itself —
+    /// remove the generated rc and the setup-done marker (niubash#179
+    /// L02-1).
     rc_created: bool,
     /// Theme picked from an external source: (name, source id).
     theme: Option<(String, String)>,
@@ -95,10 +97,10 @@ fn write_setup_journal(home: &std::path::Path, journal: &SetupJournal) {
          applied_at = \"{}\"\n",
         timestamp_id()
     );
-    if let Some(backup) = &journal.rc_backup {
+    if let Some(sample) = &journal.rc_sample {
         body.push_str(&format!(
-            "rc_backup = {}\n",
-            shell_quote(&backup.to_string_lossy())
+            "rc_sample = {}\n",
+            shell_quote(&sample.to_string_lossy())
         ));
     }
     if journal.rc_created {
@@ -145,15 +147,16 @@ fn write_setup_journal(home: &std::path::Path, journal: &SetupJournal) {
 /// One undo command per journal entry (§6.3). A fresh install (niubash#179
 /// L02-1) has no previous rc to restore, so its receipt covers the write
 /// itself: remove the generated rc (guard block included) and the setup
-/// marker. Source ids are deduplicated (L02-2): when the theme and the
-/// collection name the same source, the removal line prints once.
+/// marker. An rc that already existed was never touched (niubash#359
+/// create-only), so its undo line only removes the parked proposal sample.
+/// Source ids are deduplicated (L02-2): when the theme and the collection
+/// name the same source, the removal line prints once.
 fn setup_undo_lines(home: &std::path::Path, journal: &SetupJournal) -> Vec<String> {
     let mut lines = Vec::new();
-    if let Some(backup) = &journal.rc_backup {
+    if let Some(sample) = &journal.rc_sample {
         lines.push(format!(
-            "cp {} {}                  # restore the previous rc",
-            backup.display(),
-            home.join(PRIMARY_RC_FILE).display()
+            "rm {}                  # remove the unused proposal sample (the rc was never touched)",
+            sample.display()
         ));
     }
     if journal.rc_created {
@@ -1130,8 +1133,11 @@ fn display_welcome_side_by_side(reconfigure: bool, lang: Lang) {
     content.push(String::new());
     if reconfigure {
         content.push(
-            lang.tr("Reconfigure your interactive prompt/plugins. Existing rc will be backed up.")
-                .to_string(),
+            // niubash#359 create-only: a rerun never touches an existing rc.
+            lang.tr(
+                "Reconfigure your interactive prompt/plugins. Your existing rc stays untouched.",
+            )
+            .to_string(),
         );
     } else {
         content.push(lang.tr("Let\u{2019}s get you set up.").to_string());
@@ -1193,13 +1199,15 @@ fn run_wizard_inner(reconfigure: bool) -> anyhow::Result<()> {
     if !io.interactive {
         let preset = Preset::builtin("minimal");
         let cfg = preset.to_config(&probe, &mut Vec::new(), lang);
-        let backup_path = write_rc_and_mark_done(&home, &cfg, lang)?;
-        let rc_created = backup_path.is_none();
+        let outcome = write_rc_and_mark_done(&home, &cfg, lang)?;
         write_setup_journal(
             &home,
             &SetupJournal {
-                rc_backup: backup_path,
-                rc_created,
+                rc_sample: match &outcome {
+                    RcWrite::ExistingKept(sample) => Some(sample.clone()),
+                    RcWrite::Created => None,
+                },
+                rc_created: matches!(outcome, RcWrite::Created),
                 preset: Some(preset.name.clone()),
                 ..SetupJournal::default()
             },
@@ -1297,7 +1305,7 @@ fn run_wizard_inner(reconfigure: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let backup_path = write_rc_and_mark_done(&home, &cfg, lang)?;
+    let outcome = write_rc_and_mark_done(&home, &cfg, lang)?;
     // The pick is recorded in the spec too (niubash#168): the rc block and
     // the spec entry must not disagree about theme ownership, or every
     // later sync re-materializes the old claim over this choice.
@@ -1357,10 +1365,14 @@ fn run_wizard_inner(reconfigure: bool) -> anyhow::Result<()> {
     // Setup journal + per-entry undo (iron law 3: 失败可回滚). A theme
     // picked either at Q1 or post-install lands in the same field.
     let journal = SetupJournal {
-        rc_backup: backup_path.clone(),
-        // Fresh install (no previous rc): the receipt must cover the write
-        // itself (niubash#179 L02-1).
-        rc_created: backup_path.is_none(),
+        rc_sample: match &outcome {
+            RcWrite::ExistingKept(sample) => Some(sample.clone()),
+            RcWrite::Created => None,
+        },
+        // Created (no previous rc): the receipt must cover the write itself
+        // (niubash#179 L02-1). An existing rc was never touched
+        // (niubash#359 create-only), so only the sample is undoable.
+        rc_created: matches!(outcome, RcWrite::Created),
         theme: match &theme_pick {
             ThemePick::External { name, source_id } => Some((name.clone(), source_id.clone())),
             ThemePick::Keep => None,
@@ -1374,7 +1386,6 @@ fn run_wizard_inner(reconfigure: bool) -> anyhow::Result<()> {
     write_setup_journal(&home, &journal);
 
     print_finish_screen(
-        backup_path.as_deref(),
         &setup_undo_lines(&home, &journal),
         &setup_retry_lines(&journal),
         lang,
@@ -2015,20 +2026,12 @@ fn recommend_niu_git(home: &std::path::Path, lang: Lang) {
 /// `failed` carries the retry lines for collection entries that did not
 /// install, so a red apply cannot hide behind a green-looking finish
 /// (journey run-13 observation: 1 entry failed, the finish screen silent).
-fn print_finish_screen(
-    backup_path: Option<&std::path::Path>,
-    undo: &[String],
-    failed: &[String],
-    lang: Lang,
-) {
+/// There is no backup line anymore (niubash#359 create-only: an existing rc
+/// is never touched, so there is never a backup — the parked proposal sample
+/// is named again by its undo receipt below).
+fn print_finish_screen(undo: &[String], failed: &[String], lang: Lang) {
     let t = lang;
     println!();
-    if let Some(path) = backup_path {
-        println!(
-            "  \u{1f4e6}  {}",
-            fill(t.tr("Previous rc backed up to {}"), &[&path.display()])
-        );
-    }
     // niubash#180 bottom line (mandatory minimum): the finish screen must
     // state the truth about the current session. The wizard process cannot
     // know what its parent is, so the line names both ways the new config
@@ -2107,24 +2110,23 @@ pub fn apply_preset(name: &str) -> anyhow::Result<()> {
     for note in &notes {
         println!("  \u{2502}  {}", note);
     }
-    let backup_path = write_rc_and_mark_done(&home, &cfg, lang)?;
-    let journal = SetupJournal {
-        rc_backup: backup_path.clone(),
-        rc_created: backup_path.is_none(),
-        preset: Some(preset.name.clone()),
-        ..SetupJournal::default()
-    };
-    write_setup_journal(&home, &journal);
+    let outcome = write_rc_and_mark_done(&home, &cfg, lang)?;
+    write_setup_journal(
+        &home,
+        &SetupJournal {
+            rc_sample: match &outcome {
+                RcWrite::ExistingKept(sample) => Some(sample.clone()),
+                RcWrite::Created => None,
+            },
+            rc_created: matches!(outcome, RcWrite::Created),
+            preset: Some(preset.name.clone()),
+            ..SetupJournal::default()
+        },
+    );
     println!(
         "  \u{2705}  {}",
         format!("{} '{}'.", t.tr("Preset applied:"), preset.name)
     );
-    if let Some(path) = backup_path {
-        println!(
-            "  \u{1f4e6}  {}",
-            fill(t.tr("Previous rc backed up to {}"), &[&path.display()])
-        );
-    }
     Ok(())
 }
 
@@ -2216,32 +2218,64 @@ fn record_theme_pick_in_spec(pick: &ThemePick) {
     }
 }
 
-/// Write `~/.niubashrc` from `cfg` (backing up any existing file) and create
-/// the `.setup-done` marker. Returns the backup path when one was made.
+/// Write `~/.niubashrc` from `cfg` create-only (or park the proposal as a
+/// candidates sample when the rc already exists — niubash#359) and create
+/// the `.setup-done` marker. Returns what happened with the rc.
 fn write_rc_and_mark_done(
     home: &std::path::Path,
     cfg: &WizardConfig,
     lang: Lang,
-) -> anyhow::Result<Option<PathBuf>> {
+) -> anyhow::Result<RcWrite> {
     let rc_content = generate_rc(cfg);
     let rc_path = home.join(PRIMARY_RC_FILE);
-    let backup_path = write_primary_rc(home, &rc_content)?;
+    let outcome = write_primary_rc(home, &rc_content)?;
 
     let niubash_dir = home.join(".niubash");
     let _ = std::fs::create_dir_all(&niubash_dir);
     let _ = std::fs::write(niubash_dir.join(SETUP_DONE_FILE), b"");
-    // niubash#180: hand the new configuration to any live session. The rc
-    // write already succeeded; a failed marker only costs the in-session
-    // apply — the finish-screen truth line still tells the user how to
-    // apply it by hand, so this stays non-fatal.
-    let _ = std::fs::write(niubash_dir.join(APPLY_PENDING_FILE), b"");
-
-    println!();
-    println!(
-        "  \u{2705}  {}",
-        fill(lang.tr("Shell rc written to {}"), &[&rc_path.display()])
-    );
-    Ok(backup_path)
+    match &outcome {
+        RcWrite::Created => {
+            // niubash#180: hand the new configuration to any live session.
+            // The rc write already succeeded; a failed marker only costs
+            // the in-session apply — the finish-screen truth line still
+            // tells the user how to apply it by hand, so this stays
+            // non-fatal.
+            let _ = std::fs::write(niubash_dir.join(APPLY_PENDING_FILE), b"");
+            println!();
+            println!(
+                "  \u{2705}  {}",
+                fill(lang.tr("Shell rc written to {}"), &[&rc_path.display()])
+            );
+        }
+        RcWrite::ExistingKept(sample) => {
+            // The rc is byte-identical — NO apply-pending marker: there
+            // is no new configuration for a live session to apply, and
+            // re-sourcing an unchanged rc would lie about what happened.
+            println!();
+            println!(
+                "  \u{2705}  {}",
+                fill(
+                    lang.tr("{} exists — it is yours, left untouched"),
+                    &[&rc_path.display()]
+                )
+            );
+            println!(
+                "  \u{2502}  {}",
+                fill(
+                    lang.tr("the proposed configuration was written to {}"),
+                    &[&sample.display()]
+                )
+            );
+            println!(
+                "  \u{2502}  {}",
+                fill(
+                    lang.tr("review and apply by hand, e.g. diff -u {} {}"),
+                    &[&rc_path.display(), &sample.display()]
+                )
+            );
+        }
+    }
+    Ok(outcome)
 }
 
 /// Path of the niubash#180 handoff marker.
@@ -2453,28 +2487,101 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r#"'\''"#))
 }
 
-fn write_primary_rc(home: &std::path::Path, rc_content: &str) -> anyhow::Result<Option<PathBuf>> {
+/// What `write_primary_rc` did with the generated rc text (niubash#359
+/// create-only): the file was either created by this run or pre-existed
+/// and was left byte-identical — a backup does not authorize replacement,
+/// so there is no overwrite path at all anymore.
+#[derive(Debug)]
+enum RcWrite {
+    /// `~/.niubashrc` did not exist and was created by this run.
+    Created,
+    /// An existing `~/.niubashrc` stayed untouched; the generated proposal
+    /// landed in this separately named sample instead, for the user to
+    /// diff and apply by hand.
+    ExistingKept(PathBuf),
+}
+
+/// True when ANY directory entry occupies the primary rc path — a file,
+/// a directory, or a dangling symlink all count (symlink_metadata does
+/// not follow the entry away). An occupied slot is user-owned content:
+/// setup leaves it alone.
+fn primary_rc_occupied(home: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(home.join(PRIMARY_RC_FILE)).is_ok()
+}
+
+/// Where a proposed rc lands when `~/.niubashrc` already exists —
+/// `~/.niubash/candidates/`, the same read-only-advice directory
+/// `niu plugin migrate-rc` uses for its suggested rc.
+fn setup_rc_sample_path(home: &std::path::Path) -> PathBuf {
+    home.join(".niubash")
+        .join("candidates")
+        .join("setup-proposed.niubashrc")
+}
+
+/// Park the generated rc text as the candidates sample: the primary rc
+/// slot is (or became) occupied, so this is the only place the proposal
+/// may land. The occupier's bytes and metadata stay exactly as they are.
+fn park_rc_sample(home: &std::path::Path, rc_content: &str) -> anyhow::Result<RcWrite> {
+    let sample = setup_rc_sample_path(home);
+    crate::path_utils::write_file_atomic(&sample, rc_content.as_bytes())?;
+    Ok(RcWrite::ExistingKept(sample))
+}
+
+/// Monotonic-per-process suffix so two concurrent writers never share a
+/// staging temp name (the same rule `path_utils::write_file_atomic` runs
+/// under — a shared name would let a second writer clobber the first's
+/// staging file between its write and its create-only link).
+fn staged_rc_seq() -> u128 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    (COUNTER.fetch_add(1, Ordering::Relaxed) as u128) << 32 | std::process::id() as u128
+}
+
+/// Write the generated rc create-only (niubash#359). No overwrite path
+/// exists at all: an existing user rc can never be clobbered, appended,
+/// normalized, deduplicated, repaired, or backed-up-then-replaced — when
+/// the slot is taken (file, directory, dangling symlink, or an rc a
+/// concurrent process just created) the generated text lands in the
+/// candidates sample instead.
+///
+/// Publication is atomic AND exclusive: the bytes are staged in a
+/// uniquely-named SIBLING temp file, then a create-only hard link swaps
+/// them in. `fs::hard_link` fails with `AlreadyExists` when anything got
+/// created at the destination in the meantime, and the link itself is a
+/// single atomic directory operation — so a crash can never expose a torn
+/// first rc (niubash#304's same-window guarantee, restated under
+/// create-only rules where a plain `rename` publish would be forbidden:
+/// rename REPLACES, and replacing is exactly what this contract retires).
+fn write_primary_rc(home: &std::path::Path, rc_content: &str) -> anyhow::Result<RcWrite> {
     let rc_path = home.join(PRIMARY_RC_FILE);
     let niubash_dir = home.join(".niubash");
     std::fs::create_dir_all(&niubash_dir)?;
-    let stamp = timestamp_id();
 
-    let backup_path = if rc_path.is_file() {
-        let backup_dir = niubash_dir.join("backups");
-        std::fs::create_dir_all(&backup_dir)?;
-        let backup = backup_dir.join(format!(".niubashrc.{stamp}.bak"));
-        std::fs::copy(&rc_path, &backup)?;
-        Some(backup)
-    } else {
-        None
-    };
+    // Fast path: the slot already carries user-owned content. symlink_
+    // metadata does not follow a dangling symlink away, so a broken
+    // symlink occupies the slot exactly like a real file — and no
+    // create-only publication may displace it.
+    if primary_rc_occupied(home) {
+        return park_rc_sample(home, rc_content);
+    }
 
-    // niubash#304: swap the new rc in through a same-dir temp + replace
-    // rename (MoveFileEx REPLACE_EXISTING on Windows). The former
-    // remove-then-rename dance left the rc ABSENT between the two steps —
-    // the window a concurrent reader (pipe/sed) actually observed.
-    crate::path_utils::write_file_atomic(&rc_path, rc_content.as_bytes())?;
-    Ok(backup_path)
+    let staging = rc_path.with_file_name(format!(".{PRIMARY_RC_FILE}.tmp-{}", staged_rc_seq()));
+    let published = std::fs::write(&staging, rc_content.as_bytes())
+        .and_then(|()| std::fs::hard_link(&staging, &rc_path));
+    // The staging copy is never the deliverable: remove it whatever the
+    // link did (the successful link made its own directory entry).
+    let _ = std::fs::remove_file(&staging);
+    match published {
+        Ok(()) => Ok(RcWrite::Created),
+        // A concurrent creator won the race between our occupied check and
+        // the link: their rc is user-owned now — park the sample, touch
+        // nothing (the same conservative resolution an ambiguous error at
+        // the occupied-check gets).
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            park_rc_sample(home, rc_content)
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn timestamp_id() -> String {
@@ -2494,8 +2601,8 @@ fn zh(en: &str) -> Option<&'static str> {
         "Welcome to Niubash" => "欢迎来到 Niubash",
         "A native Rust implementation of bash for Windows \u{2014} no WSL, no MSYS2, no emulation layer." =>
             "Windows 原生 Rust 实现的 bash —— 无需 WSL、MSYS2，没有模拟层。",
-        "Reconfigure your interactive prompt/plugins. Existing rc will be backed up." =>
-            "重新配置交互提示符/插件。现有 rc 文件会先备份。",
+        "Reconfigure your interactive prompt/plugins. Your existing rc stays untouched." =>
+            "重新配置交互提示符/插件。现有 rc 文件保持原样，不会改动。",
         "Let\u{2019}s get you set up." => "我们开始配置吧。",
 
         // Environment summary
@@ -2660,7 +2767,14 @@ fn zh(en: &str) -> Option<&'static str> {
         "Setup cancelled \u{2014} nothing was written." =>
             "设置已取消 —— 未写入任何内容。",
         "Shell rc written to {}" => "Shell 配置已写入 {}",
-        "Previous rc backed up to {}" => "原 rc 已备份至 {}",
+        // niubash#359 create-only: an existing rc is never touched; the
+        // proposal is parked as a sample for the user to diff and apply.
+        "{} exists — it is yours, left untouched" =>
+            "{} 已存在 —— 它属于你，未做任何改动",
+        "the proposed configuration was written to {}" =>
+            "建议的配置已写入 {}",
+        "review and apply by hand, e.g. diff -u {} {}" =>
+            "请自行审阅后手动应用，例如 diff -u {} {}",
         "could not write" => "无法写入",
 
         // Finish screen
@@ -2872,21 +2986,23 @@ mod tests {
         }
     }
 
-    /// niubash#180: every rc rewrite leaves the one-shot handoff marker for
-    /// the live session; the session consumes it exactly once, and a stale
-    /// marker from before a session started is cleared as its baseline.
+    /// niubash#180/#359: an rc CREATED by a run leaves the one-shot handoff
+    /// marker for the live session; the session consumes it exactly once,
+    /// and a stale marker from before a session started is cleared as its
+    /// baseline. An existing rc that stayed untouched leaves NO marker —
+    /// there is no new configuration for a live session to apply.
     #[test]
-    fn rc_rewrite_leaves_a_consumable_apply_pending_marker() {
+    fn rc_create_leaves_a_consumable_apply_pending_marker() {
         let temp = unique_temp_dir("wizard-apply-pending");
         let home = temp.join("home");
         std::fs::create_dir_all(&home).unwrap();
 
         assert!(!take_apply_pending_marker(&home), "no marker before a run");
-        let backup = write_rc_and_mark_done(&home, &clean_cfg(), Lang::En)
+        let outcome = write_rc_and_mark_done(&home, &clean_cfg(), Lang::En)
             .expect("the rc write must succeed");
         assert!(
-            backup.is_none(),
-            "no previous rc means no backup: {backup:?}"
+            matches!(outcome, RcWrite::Created),
+            "no previous rc means the run created it: {outcome:?}"
         );
         assert!(apply_pending_path(&home).is_file(), "marker written");
         assert!(take_apply_pending_marker(&home), "marker consumed once");
@@ -2895,8 +3011,215 @@ mod tests {
             "second take must not fire — a failed apply can never loop the REPL"
         );
 
+        // A pre-existing rc is never rewritten (create-only): no new
+        // configuration, no apply-pending marker, rc bytes untouched.
         clear_stale_apply_pending_marker(&home);
         assert!(!apply_pending_path(&home).is_file());
+        let existing = "# my own rc\nalias e='echo mine'\n";
+        std::fs::write(home.join(PRIMARY_RC_FILE), existing).unwrap();
+        let outcome = write_rc_and_mark_done(&home, &clean_cfg(), Lang::En)
+            .expect("the occupied-slot write must succeed");
+        assert!(
+            matches!(outcome, RcWrite::ExistingKept(_)),
+            "an existing rc must be kept, not rewritten: {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join(PRIMARY_RC_FILE)).unwrap(),
+            existing,
+            "the existing rc must stay byte-identical"
+        );
+        assert!(
+            !apply_pending_path(&home).is_file(),
+            "an existing-kept run must not claim a live session needs to apply"
+        );
+
+        clear_stale_apply_pending_marker(&home);
+        assert!(!apply_pending_path(&home).is_file());
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// niubash#359 create-only, bytes AND metadata: an occupied primary slot
+    /// is user-owned — the rc keeps its exact bytes and its modification
+    /// time, and the generated proposal lands in the candidates sample with
+    /// the full proposed text (nothing truncated, nothing reflowed).
+    #[test]
+    fn existing_rc_is_untouched_bytes_and_metadata_and_sample_gets_proposal() {
+        let temp = unique_temp_dir("wizard-create-only-bytes");
+        let home = temp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let existing = "# user's own rc — setup must not touch a byte\nexport MINE=1\n";
+        let rc_path = home.join(PRIMARY_RC_FILE);
+        std::fs::write(&rc_path, existing).unwrap();
+        let mtime_before = std::fs::metadata(&rc_path).unwrap().modified().unwrap();
+
+        let proposal = generate_rc(&clean_cfg());
+        let outcome =
+            write_primary_rc(&home, &proposal).expect("the occupied-slot run must succeed");
+        let RcWrite::ExistingKept(sample) = &outcome else {
+            panic!("an occupied slot must yield ExistingKept, got {outcome:?}");
+        };
+        assert_eq!(
+            sample
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_default(),
+            home.join(".niubash").join("candidates"),
+            "the sample parks in ~/.niubash/candidates/"
+        );
+        assert_eq!(
+            std::fs::read_to_string(sample).unwrap(),
+            proposal,
+            "the sample must carry the full proposal"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&rc_path).unwrap(),
+            existing,
+            "the rc bytes must be identical"
+        );
+        assert_eq!(
+            std::fs::metadata(&rc_path).unwrap().modified().unwrap(),
+            mtime_before,
+            "the rc metadata must be identical"
+        );
+        // No staging leftovers beside the rc: the temp sibling is always
+        // cleaned up, whatever the publish did.
+        let leftovers: Vec<_> = std::fs::read_dir(&home)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging leftovers: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// niubash#359 create-only: a missing rc is created with the exact
+    /// proposed bytes, and no sample is parked for it.
+    #[test]
+    fn missing_rc_is_created_atomically_without_a_sample() {
+        let temp = unique_temp_dir("wizard-create-only-created");
+        let home = temp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let proposal = generate_rc(&clean_cfg());
+        let outcome = write_primary_rc(&home, &proposal).expect("the create must succeed");
+        assert!(
+            matches!(outcome, RcWrite::Created),
+            "a missing rc must be Created, got {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join(PRIMARY_RC_FILE)).unwrap(),
+            proposal
+        );
+        assert!(
+            !home.join(".niubash/candidates").exists(),
+            "no sample is parked when the rc was created"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&home)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging leftovers: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// niubash#359 create-only race coverage: two concurrent create-only
+    /// writers racing for one empty slot — the exact shape of a concurrent
+    /// `niu setup` vs `niu setup --preset` run — must produce exactly ONE
+    /// Created (the create-only publish is exclusive: a hard link onto an
+    /// existing entry fails) and one ExistingKept, and the winner's bytes
+    /// land complete. The rc can therefore never end up torn or mixed,
+    /// whichever way the interleaving goes.
+    #[test]
+    fn concurrent_creation_never_clobbers_the_winner() {
+        for round in 0..6 {
+            let temp = unique_temp_dir("wizard-create-only-race");
+            let home = temp.join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let proposals = [
+                format!("# writer A round {round}\nexport WHO=A\n"),
+                format!("# writer B round {round}\nexport WHO=B\n"),
+            ];
+            let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let mut writers = Vec::new();
+            for proposal in &proposals {
+                let start = start.clone();
+                let home = home.clone();
+                let proposal = proposal.clone();
+                writers.push(std::thread::spawn(move || {
+                    start.wait();
+                    write_primary_rc(&home, &proposal)
+                }));
+            }
+            let mut created = 0usize;
+            let mut kept = 0usize;
+            for writer in writers {
+                match writer.join().unwrap().expect("a lost race parks a sample") {
+                    RcWrite::Created => {
+                        created += 1;
+                    }
+                    RcWrite::ExistingKept(_) => {
+                        kept += 1;
+                    }
+                }
+            }
+            assert_eq!(created, 1, "round {round}: exactly one exclusive create");
+            assert_eq!(kept, 1, "round {round}: the loser parks a sample");
+            let final_bytes = std::fs::read_to_string(home.join(PRIMARY_RC_FILE)).unwrap();
+            assert!(
+                proposals.iter().any(|p| p == &final_bytes),
+                "round {round}: the rc must be one writer's COMPLETE bytes, never a mix: \
+                 {final_bytes:?} vs {proposals:?}"
+            );
+            let _ = std::fs::remove_dir_all(&temp);
+        }
+    }
+
+    /// niubash#359: the undo receipt for an existing-kept run removes the
+    /// parked sample (there is nothing to restore — the rc was never
+    /// touched), and the fresh-install receipt still covers the write
+    /// itself (niubash#179 L02-1).
+    #[test]
+    fn undo_receipt_covers_sample_removal_and_fresh_install() {
+        let temp = unique_temp_dir("wizard-undo-sample");
+        let home = temp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let outcome = write_primary_rc(&home, generate_rc(&clean_cfg()).as_str()).expect("create");
+        assert!(matches!(outcome, RcWrite::Created));
+        let fresh = SetupJournal {
+            rc_sample: None,
+            rc_created: true,
+            ..SetupJournal::default()
+        };
+        let undo = setup_undo_lines(&home, &fresh);
+        assert_eq!(undo.len(), 2, "{undo:?}");
+        assert!(
+            undo[0].starts_with("rm ") && undo[0].contains(".niubashrc"),
+            "{undo:?}"
+        );
+        assert!(undo[1].contains(".setup-done"), "{undo:?}");
+
+        let sample = setup_rc_sample_path(&home);
+        std::fs::create_dir_all(sample.parent().unwrap()).unwrap();
+        std::fs::write(&sample, "proposal").unwrap();
+        let kept = SetupJournal {
+            rc_sample: Some(sample.clone()),
+            rc_created: false,
+            ..SetupJournal::default()
+        };
+        let undo = setup_undo_lines(&home, &kept);
+        assert_eq!(undo.len(), 1, "{undo:?}");
+        assert!(
+            undo[0].starts_with("rm ") && undo[0].contains("setup-proposed.niubashrc"),
+            "the sample removal is the only receipt: {undo:?}"
+        );
+        // Executing the receipt actually removes the sample.
+        let removal = undo[0].split_whitespace().nth(1).unwrap().to_string();
+        let removal = removal.trim_matches('\'');
+        std::fs::remove_file(removal).unwrap();
+        assert!(!sample.exists());
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -3575,6 +3898,7 @@ mod tests {
         // build_config(Keep), collection journal naming the fresh source.
         let mut cfg = build_config(&ThemePick::Keep);
         std::fs::write(home.join(PRIMARY_RC_FILE), generate_rc(&cfg)).unwrap();
+        let rc_before = std::fs::read_to_string(home.join(PRIMARY_RC_FILE)).unwrap();
         let candidates = post_install_theme_candidates(Some(&CollectionJournal {
             name: "recommended".to_string(),
             sources: vec!["oh-my-bash".to_string()],
@@ -3599,16 +3923,25 @@ mod tests {
             "the pick must have trusted it"
         );
 
-        // The rc on disk carries NO activation content (niubash#359): the
-        // pick went to the spec + config; the loader will carry the block
-        // once a sync runs (adopt_installed_sources_into_spec does, at the
-        // end of the run).
+        // The rc on disk stays EXACTLY the Apply-time bytes (niubash#359
+        // create-only): the post-install pick must not rewrite an existing
+        // rc — the pick went to the spec + config; the loader will carry
+        // the block once a sync runs (adopt_installed_sources_into_spec
+        // does, at the end of the run) and the theme-ful proposal is
+        // parked as the candidates sample.
         let rc = std::fs::read_to_string(home.join(PRIMARY_RC_FILE)).unwrap();
+        assert_eq!(
+            rc, rc_before,
+            "the post-install pick must not rewrite an existing rc"
+        );
         assert!(!rc.contains("OSH_THEME="), "{rc}");
         assert!(!rc.contains(">>> niu source oh-my-bash"), "{rc}");
+        assert!(!rc.contains("# Prompt owned by"), "{rc}");
         assert!(
-            rc.contains("# Prompt owned by the oh-my-bash theme 'agnoster'"),
-            "{rc}"
+            std::fs::read_to_string(home.join(".niubash/candidates/setup-proposed.niubashrc"))
+                .unwrap()
+                .contains("# Prompt owned by the oh-my-bash theme 'agnoster'"),
+            "the parked sample carries the theme-ful proposal"
         );
         {
             let _spec_guard = EnvGuard::set(
@@ -3634,7 +3967,7 @@ mod tests {
 
         // One journal + undo lines for both the collection and the pick.
         let journal = SetupJournal {
-            rc_backup: None,
+            rc_sample: None,
             rc_created: true,
             theme: picked,
             preset: None,
@@ -3839,9 +4172,12 @@ mod tests {
     #[test]
     fn setup_journal_records_entries_and_undo_commands() {
         let temp = unique_temp_dir("setup-journal");
-        let backup = temp.join("backups/.niubashrc.1-2.bak");
+        // niubash#359 create-only: there is no rc backup anymore — the
+        // journal records a PARKED SAMPLE (the proposal for an rc that
+        // already existed) and its undo receipt removes the sample.
+        let sample = temp.join(".niubash/candidates/setup-proposed.niubashrc");
         let journal = SetupJournal {
-            rc_backup: Some(backup.clone()),
+            rc_sample: Some(sample.clone()),
             rc_created: false,
             theme: Some(("robbyrussell".to_string(), "oh-my-bash".to_string())),
             preset: None,
@@ -3855,7 +4191,7 @@ mod tests {
         write_setup_journal(&temp, &journal);
         let text = std::fs::read_to_string(setup_journal_path(&temp)).unwrap();
         assert!(text.contains(SETUP_JOURNAL_SCHEMA), "{text}");
-        assert!(text.contains("rc_backup = "), "{text}");
+        assert!(text.contains("rc_sample = "), "{text}");
         assert!(text.contains("theme = 'robbyrussell'"), "{text}");
         assert!(text.contains("theme_source = 'oh-my-bash'"), "{text}");
         assert!(text.contains("collection = 'recommended'"), "{text}");
@@ -3864,14 +4200,15 @@ mod tests {
             "{text}"
         );
 
-        // One undo command per entry: rc restore, theme disable, and the
+        // One undo command per entry: sample removal (nothing to restore —
+        // the rc was never touched, niubash#359), theme disable, and the
         // source-removal hint (deduplicated: the theme and the collection
         // name the same source, so it prints ONCE — niubash#179 L02-2;
         // executable-tool entries install nothing, so they have no undo).
         let undo = setup_undo_lines(&temp, &journal);
         assert!(undo.len() == 3, "{undo:?}");
-        assert!(undo[0].starts_with("cp "), "{undo:?}");
-        assert!(undo[0].contains(".niubashrc"), "{undo:?}");
+        assert!(undo[0].starts_with("rm "), "{undo:?}");
+        assert!(undo[0].contains("setup-proposed.niubashrc"), "{undo:?}");
         assert!(
             undo[1].contains("niu plugin disable robbyrussell"),
             "{undo:?}"
@@ -3892,7 +4229,7 @@ mod tests {
             "retracted tool verbs must not appear in undo lines: {undo:?}"
         );
 
-        // A skip run (no theme, no backup) undoes nothing.
+        // A skip run (no theme, no sample) undoes nothing.
         let empty = SetupJournal::default();
         assert!(setup_undo_lines(&temp, &empty).is_empty());
 
@@ -3900,7 +4237,7 @@ mod tests {
         // receipt covers the write itself — remove the generated rc and the
         // setup-done marker; the theme's undo lines still apply.
         let fresh = SetupJournal {
-            rc_backup: None,
+            rc_sample: None,
             rc_created: true,
             theme: Some(("robbyrussell".to_string(), "oh-my-bash".to_string())),
             preset: None,
@@ -3928,6 +4265,7 @@ mod tests {
         write_setup_journal(&temp, &fresh);
         let text = std::fs::read_to_string(setup_journal_path(&temp)).unwrap();
         assert!(text.contains("rc_created = true"), "{text}");
+        assert!(!text.contains("rc_sample = "), "{text}");
         let _ = std::fs::remove_dir_all(&temp);
     }
 
