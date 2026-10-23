@@ -58,6 +58,7 @@ belongs in rubash or in the Niubash host layer.
 | `niu -c` still has host-side rough edges around POSIX assignment prefixes, `env VAR=value cmd`, heredoc temp-file flows, and complex quoting in agent commands. | Track as Niubash command-mode/host issues, not as rubash language failures unless a direct rubash fixture reproduces it. |
 | Job control and interactive terminal process-group semantics are not covered by the focused compat matrix. | Route through rubash first; add Niubash host tests only for Windows process integration. |
 | Plugin runtime behavior is intentionally outside current shell compatibility scope. | Keep in plugin docs; do not mix with bash language compatibility claims. |
+| Windows `read`/`$( )` strip a trailing CR (`\r\n` line endings in piped/redirected input are normalized away) — GNU bash passes bytes through verbatim. | **Intentional host deviation** (niubash#521): CRLF text is the native Windows interchange format; byte-transparency would surface stray `\r` into every variable read from a Windows-produced file. Documented here rather than "fixed"; revisit only if a consumer needs byte-exact GNU behavior, in which case route it as an opt-in flag, never as a default change. |
 
 ## Maintenance Rules
 
