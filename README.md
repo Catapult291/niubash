@@ -88,6 +88,13 @@ Quick answers:
 - **Does niu run real Bash scripts?** Yes. The rubash engine is gated on
   GNU Bash's own upstream test suites; the record lives in the
   [compatibility matrix](docs/src/rubash-bash-compat-matrix.md).
+- **Beyond Git Bash compatibility.** Console device redirects work where
+  even Git Bash fails: `echo >/dev/tty`, `exec 3<>/dev/tty`, and
+  `test -e /dev/tty` all behave like GNU — the engine maps `/dev/tty` to
+  the console and splits `CON` into its `CONIN$`/`CONOUT$` halves instead
+  of hitting Windows' device-open restrictions (`FILE_APPEND_DATA` and
+  read-write opens are rejected on `CON`). This is what keeps `git`/`ssh`
+  askpass prompts working.
 - **Can I install niu on Android or HarmonyOS today?** Android yes:
   release `.zip` assets ship since v1.4.3 and run on real devices
   (Termux aarch64/armv7). HarmonyOS not yet: it compiles in CI but has
