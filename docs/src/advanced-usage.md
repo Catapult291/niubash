@@ -166,7 +166,13 @@ persisted value:
 - `ide` — multi-column popup with descriptions, VS Code style. Column count
   adapts to the terminal width; the description of the selected candidate
   renders beside it.
-- `column` — plain multi-column grid (like zsh `compinit`).
+- `column` — plain multi-column grid (like zsh `compinit`). Two intended
+  fallbacks collapse the grid to a single vertical column: any candidate
+  carrying a description (e.g. flag completions such as `git checkout
+  -<TAB>` — the description text needs the row width), and a terminal too
+  narrow to fit even one column of the widest candidate. Both are the
+  upstream menu's adaptive layout, not a style mix-up; commands whose
+  completions carry no descriptions always grid.
 - `list` — vertical list with descriptions (like fish).
 - `inline` — first match inserted directly, Tab cycles (like bash
   `menu-complete`).
