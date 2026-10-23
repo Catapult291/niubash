@@ -63,10 +63,19 @@ enum GnuPhase {
 pub struct GnuMenu {
     settings: MenuSettings,
     active: bool,
-    /// Engine event queued by [`GnuMenu::menu_event`], processed at paint
-    /// time in [`GnuMenu::update_working_details`] (where the editor and
-    /// completer are reachable — the ColumnarMenu pattern).
-    event: Option<MenuEvent>,
+    /// Engine events queued by [`GnuMenu::menu_event`], processed FIFO at
+    /// paint time in [`GnuMenu::update_working_details`] (where the editor
+    /// and completer are reachable — the ColumnarMenu pattern).
+    ///
+    /// The queue is a deque, not a single slot: `handle_menu_event` applies
+    /// `Activate`'s `active` flip IMMEDIATELY, so a keystroke landing in the
+    /// same engine batch after a TAB (a TAB pressed mid-burst, or typed
+    /// faster than a repaint) is delivered here as an `Edit` while an
+    /// `Activate` is still pending. A single slot let that `Edit` overwrite
+    /// the `Activate` — the prefix splice never ran (the completion was
+    /// silently lost) and `active` stayed true with the phase machine never
+    /// engaged, leaving a phantom menu that ate navigation keys and Enter.
+    events: std::collections::VecDeque<MenuEvent>,
     /// Candidates from the latest completion query, with display metrics.
     completions: CompletionDisplay,
     phase: GnuPhase,
@@ -83,7 +92,7 @@ impl Default for GnuMenu {
         Self {
             settings: MenuSettings::default(),
             active: false,
-            event: None,
+            events: std::collections::VecDeque::new(),
             completions: CompletionDisplay::default(),
             phase: GnuPhase::Idle,
             anchor_buffer: None,
@@ -186,11 +195,14 @@ fn render_list(
 
 impl GnuMenu {
     /// Back to factory state: inactive, no attempt anchored, no list.
+    /// Pending engine events are dropped too — a deactivate must not let a
+    /// pre-reset `Activate` replay on a later line.
     fn reset(&mut self) {
         self.active = false;
         self.phase = GnuPhase::Idle;
         self.anchor_buffer = None;
         self.completions = CompletionDisplay::default();
+        self.events.clear();
     }
 
     /// Fetch the candidates for the current line into `self.completions`.
@@ -247,10 +259,32 @@ impl GnuMenu {
     /// unchanged buffer (TAB #N's `Complete` lands here) keeps it up.
     fn apply_edit(&mut self, editor: &Editor) {
         if self.phase != GnuPhase::Listed {
+            // `active` is only ever set by the Listed phase, so active-
+            // without-list is desync (e.g. an Activate handle_menu_event
+            // applied before its queued processing was superseded): the
+            // phantom menu must release its claim on Enter/arrows.
+            self.active = false;
             return;
         }
         if self.anchor_buffer.as_deref() != Some(editor.get_buffer()) {
             self.reset();
+        }
+    }
+
+    /// Run every queued engine event in arrival order. Activated-at-
+    /// dispatch events and the edits that trailed them in the same batch
+    /// must both be seen: dropping the Activate left `active` desynced
+    /// (niubash#537's phantom menu) and lost the prefix splice.
+    fn drain_events(&mut self, editor: &mut Editor, completer: &mut dyn Completer) {
+        while let Some(event) = self.events.pop_front() {
+            match event {
+                MenuEvent::Activate(_) => self.apply_activate(editor, completer),
+                MenuEvent::Edit(_) => self.apply_edit(editor),
+                // Deactivate was applied by `handle_menu_event`; navigation
+                // events never reach this menu (no arrow-key bindings) and must
+                // not disturb the printed list if they ever do.
+                _ => {}
+            }
         }
     }
 }
@@ -274,7 +308,7 @@ impl Menu for GnuMenu {
 
     fn menu_event(&mut self, event: MenuEvent) {
         self.handle_menu_event(&event);
-        self.event = Some(event);
+        self.events.push_back(event);
     }
 
     fn can_quick_complete(&self) -> bool {
@@ -307,14 +341,7 @@ impl Menu for GnuMenu {
         painter: &Painter,
     ) {
         self.terminal_columns = painter.screen_width() as usize;
-        match self.event.take() {
-            Some(MenuEvent::Activate(_)) => self.apply_activate(editor, completer),
-            Some(MenuEvent::Edit(_)) => self.apply_edit(editor),
-            // Deactivate was applied by `handle_menu_event`; navigation
-            // events never reach this menu (no arrow-key bindings) and must
-            // not disturb the printed list if they ever do.
-            _ => {}
-        }
+        self.drain_events(editor, completer);
     }
 
     fn replace_in_buffer(&self, _editor: &mut Editor) {
@@ -416,19 +443,17 @@ mod tests {
     /// Drive an engine Activate through the paint-time dispatch. The real
     /// `update_working_details` records `painter.screen_width()` first
     /// (defaulting to 80 here — reedline's `Painter` constructor is
-    /// crate-private) and then forwards to the same `apply_activate`.
+    /// crate-private) and then forwards to the same [`GnuMenu::drain_events`].
     fn activate(menu: &mut GnuMenu, editor: &mut Editor, completer: &mut dyn Completer) {
         menu.menu_event(MenuEvent::Activate(false));
-        assert!(menu.event.take().is_some(), "Activate must be queued");
-        menu.apply_activate(editor, completer);
+        menu.drain_events(editor, completer);
     }
 
     /// Drive an engine Edit (a TAB that fell through the already-active Menu
     /// arm, or a keystroke) the same way.
-    fn edit_event(menu: &mut GnuMenu, editor: &Editor) {
+    fn edit_event(menu: &mut GnuMenu, editor: &mut Editor, completer: &mut dyn Completer) {
         menu.menu_event(MenuEvent::Edit(false));
-        assert!(menu.event.take().is_some(), "Edit must be queued");
-        menu.apply_edit(editor);
+        menu.drain_events(editor, completer);
     }
 
     #[test]
@@ -520,7 +545,7 @@ mod tests {
 
         // TAB #3 arrives as an Edit event (the engine falls through its
         // already-active Menu arm) with an unchanged buffer: list stays.
-        edit_event(&mut menu, &editor);
+        edit_event(&mut menu, &mut editor, &mut completer);
         assert!(menu.is_active(), "unchanged line keeps the list up");
         assert_eq!(menu.phase, GnuPhase::Listed);
     }
@@ -539,7 +564,7 @@ mod tests {
             |line| line.set_buffer("checkoutx".to_string()),
             UndoBehavior::CreateUndoPoint,
         );
-        edit_event(&mut menu, &editor);
+        edit_event(&mut menu, &mut editor, &mut completer);
 
         assert!(!menu.is_active(), "an edit dismisses the printed list");
         assert_eq!(menu.phase, GnuPhase::Idle);
@@ -583,6 +608,55 @@ mod tests {
         activate(&mut menu, &mut editor, &mut completer);
 
         assert_eq!(editor.get_buffer(), "zz", "no match, no edit");
+        assert!(!menu.is_active());
+        assert_eq!(menu.phase, GnuPhase::Idle);
+    }
+
+    /// niubash#537: `menu_event` must not lose a queued `Activate` when an
+    /// `Edit` lands in the same engine batch — the engine repaints once per
+    /// batch, so TAB + a typed char (a burst, or fast typing) arrive before
+    /// `update_working_details` runs. `handle_menu_event` already flipped
+    /// `active` on the Activate's dispatch; if the Edit then overwrote the
+    /// pending Activate, the menu stayed `active` with the phase machine
+    /// never engaged — a phantom menu eating navigation keys and Enter.
+    #[test]
+    fn same_batch_activate_then_edit_leaves_no_phantom_menu() {
+        let mut completer = PrefixCompleter::new(&["checkout", "checkouts"]);
+        let mut menu = GnuMenu::default();
+        let mut editor = editor_with("che");
+
+        // One batch: TAB's Activate, then the typed char's Edit — both
+        // queued, neither processed until the (single) repaint drains.
+        menu.menu_event(MenuEvent::Activate(false));
+        menu.menu_event(MenuEvent::Edit(false));
+        menu.drain_events(&mut editor, &mut completer);
+
+        assert!(
+            !menu.is_active(),
+            "the menu must not stay active — no list was ever printed"
+        );
+        // The Activate ran too: the common prefix spliced into the line
+        // before the trailing edit's word could be re-queried or the
+        // attempt dropped entirely.
+        assert_eq!(menu.phase, GnuPhase::Attempted);
+    }
+
+    /// The same race, opposite order kept honest: a menu that reached
+    /// `Listed` and then saw a buffer-changing edit must reset, not linger.
+    #[test]
+    fn listed_then_edit_in_one_batch_dismisses() {
+        let mut completer = PrefixCompleter::new(&["checkout", "checkouts"]);
+        let mut menu = GnuMenu::default();
+        let mut editor = editor_with("check");
+        activate(&mut menu, &mut editor, &mut completer);
+        activate(&mut menu, &mut editor, &mut completer);
+        assert!(menu.is_active());
+        editor.edit_buffer(
+            |line| line.set_buffer("checkoutx".to_string()),
+            UndoBehavior::CreateUndoPoint,
+        );
+        menu.menu_event(MenuEvent::Edit(false));
+        menu.drain_events(&mut editor, &mut completer);
         assert!(!menu.is_active());
         assert_eq!(menu.phase, GnuPhase::Idle);
     }
