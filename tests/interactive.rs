@@ -879,14 +879,14 @@ fn tab_completion_empty_set_enter_still_submits() {
 /// must commit the highlighted candidate into the editable line — not
 /// execute the partial line — and a second Enter submits. The #373
 /// dismissal prefix made the first Enter close the menu and run `cat
-/// m486-` (a "No such file" error); pinned for both interactive menu
-/// styles (`column`, the default, and `list`).
+/// m486-` (a "No such file" error); pinned for all four interactive menu
+/// styles (`column` — the default, `list`, `ide`, `inline`).
 #[test]
 fn completion_menu_enter_commits_highlighted_candidate() {
     if !require_pty_or_skip("completion_menu_enter_commits_highlighted_candidate") {
         return;
     }
-    for style in ["column", "list"] {
+    for style in ["column", "list", "ide", "inline"] {
         let mut s = NiuSession::spawn_custom(
             "menu-enter-486",
             &driver::default_rc(),
