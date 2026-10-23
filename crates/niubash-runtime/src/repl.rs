@@ -161,7 +161,56 @@ pub fn parse_user_bindkeys(value: &str) -> Vec<NativeWidgetBinding> {
 /// table, so the syntax highlighter consults this predicate to avoid painting
 /// valid REPL commands as unknown tokens (niu#260).
 pub fn is_repl_reserved_command(word: &str) -> bool {
-    matches!(word, "exit" | "logout" | "self-update" | "update-niubash")
+    is_exit_word(word) || matches!(word, "self-update" | "update-niubash")
+}
+
+/// The session-terminating REPL words. Shared by the highlighter predicate
+/// above and the `exit`/`logout` line parser so both agree on the vocabulary.
+fn is_exit_word(word: &str) -> bool {
+    matches!(word, "exit" | "logout")
+}
+
+/// Parse an interactive `exit`/`logout` line into the status the session must
+/// end with (niubash D1: `exit 3` used to print only the builtin's output and
+/// leave the REPL running, because the matcher required the whole line to be
+/// exactly `exit`).
+///
+/// Returns `None` for every line the REPL must hand to the engine instead:
+/// non-exit words, and argument shapes the engine diagnoses itself. The
+/// engine follows bash 5.3, where `exit abc` reports `numeric argument
+/// required` and `exit 3 4` reports `too many arguments`; both leave the
+/// session alive, so they must not be intercepted here.
+fn repl_exit_status(line: &str) -> Option<i32> {
+    let line = line.trim();
+    // `exit 3;` is ordinary interactive punctuation, not a command list.
+    let line = line.strip_suffix(';').unwrap_or(line).trim_end();
+    let mut words = line.split_whitespace();
+    if !is_exit_word(words.next()?) {
+        return None;
+    }
+    let mut args: Vec<&str> = words.collect();
+    // GNU get_exitstat skips one leading `--` before the status word.
+    if args.first() == Some(&"--") {
+        args.remove(0);
+    }
+    match args.as_slice() {
+        [] => Some(0),
+        [status] => status
+            .parse::<i128>()
+            .ok()
+            .map(|value| value.rem_euclid(256) as i32),
+        _ => None,
+    }
+}
+
+/// End the interactive session with `status`: run the EXIT trap (GNU
+/// `exit_shell`), persist session history (a hard exit skips the history
+/// provider's `Drop`), and leave with the trap's status as the process code.
+fn end_repl_session(shell: &mut Shell, status: i32) -> ! {
+    let code = shell.finish_with_exit_trap(status).unwrap_or(status);
+    shell.flush_session_history();
+    flush_repl_output();
+    std::process::exit(code);
 }
 
 /// Extract the arguments of a `self-update` / `update-niubash` REPL command,
@@ -2850,9 +2899,10 @@ pub fn run_repl(shell: Shell) -> anyhow::Result<()> {
                 if pending.is_empty() && line.trim().is_empty() {
                     continue;
                 }
-                if pending.is_empty() && matches!(line.trim(), "exit" | "logout") {
-                    let _ = shell.borrow_mut().finish_with_exit_trap(0);
-                    break;
+                if pending.is_empty() {
+                    if let Some(status) = repl_exit_status(line) {
+                        end_repl_session(&mut shell.borrow_mut(), status);
+                    }
                 }
                 if pending.is_empty() {
                     if let Some(args) = self_update_command_args(line) {
@@ -2943,9 +2993,10 @@ fn run_repl_without_line_editor(shell: &mut Shell) -> anyhow::Result<()> {
         if pending.is_empty() && line.trim().is_empty() {
             continue;
         }
-        if pending.is_empty() && matches!(line.trim(), "exit" | "logout") {
-            let _ = shell.finish_with_exit_trap(0);
-            break;
+        if pending.is_empty() {
+            if let Some(status) = repl_exit_status(line) {
+                end_repl_session(shell, status);
+            }
         }
 
         pending.push(line);
@@ -3005,6 +3056,35 @@ mod tests {
         assert!(!is_repl_reserved_command("Self-Update"));
         assert!(!is_repl_reserved_command("self_update"));
         assert!(!is_repl_reserved_command("ls"));
+    }
+
+    #[test]
+    fn repl_exit_status_accepts_exit_and_logout_with_a_status_argument() {
+        assert_eq!(repl_exit_status("exit"), Some(0));
+        assert_eq!(repl_exit_status("  exit  "), Some(0));
+        assert_eq!(repl_exit_status("exit 3"), Some(3));
+        assert_eq!(repl_exit_status("exit 3;"), Some(3));
+        assert_eq!(repl_exit_status("logout"), Some(0));
+        assert_eq!(repl_exit_status("logout 7"), Some(7));
+        // GNU get_exitstat skips one leading `--`.
+        assert_eq!(repl_exit_status("exit --"), Some(0));
+        assert_eq!(repl_exit_status("exit -- 9"), Some(9));
+        // Eight-bit truncation, same as the engine's exit builtin.
+        assert_eq!(repl_exit_status("exit 258"), Some(2));
+        assert_eq!(repl_exit_status("exit -1"), Some(255));
+    }
+
+    #[test]
+    fn repl_exit_status_leaves_diagnosed_shapes_to_the_engine() {
+        // bash 5.3 reports these and keeps the session alive, so the REPL
+        // must not terminate on them.
+        assert_eq!(repl_exit_status("exit abc"), None);
+        assert_eq!(repl_exit_status("exit 3 4"), None);
+        assert_eq!(repl_exit_status("exit 3 4;"), None);
+        // Not exit/logout at all.
+        assert_eq!(repl_exit_status("echo exit 3"), None);
+        assert_eq!(repl_exit_status("exit3"), None);
+        assert_eq!(repl_exit_status(""), None);
     }
 
     #[test]
