@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use anyhow::Context as _;
+
 use crate::completion::CompletionBehavior;
 use crate::path_utils::shell_home_dir;
 
@@ -434,11 +436,95 @@ pub const COMMAND_NOT_FOUND_HINT_KEY: &str = "command-not-found-hint";
 /// table with a `style` field), spelled with the dot on every command surface.
 pub const COMPLETION_STYLE_KEY: &str = "completion.style";
 
+/// The personal-rc policy key (niubash#359): in the file this is the TOML
+/// dotted key `startup.rc-policy` (a `[startup]` table with an `rc-policy`
+/// field). Explicit `niu setup --rc-policy` owns the write; `niu config`
+/// reads and preserves it but never sets it — the doc allows no
+/// environment-based implicit grant and no competing booleans.
+pub const RC_POLICY_KEY: &str = "startup.rc-policy";
+
 /// The `[completion]` section of config.toml.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct CompletionConfigSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     style: Option<String>,
+}
+
+/// The `[startup]` section of config.toml.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct StartupConfigSection {
+    #[serde(rename = "rc-policy", default, skip_serializing_if = "Option::is_none")]
+    rc_policy: Option<String>,
+}
+
+/// Which file may fill the default interactive personal-rc slot
+/// (niubash#359). Persisted as `startup.rc-policy` in config.toml; every
+/// read problem — missing key, unknown value, wrong type, duplicate keys,
+/// malformed TOML, unreadable file — fails closed to `primary-only`, and
+/// startup never repairs or rewrites that state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RcPolicy {
+    /// `~/.niubashrc` is the only personal rc; `~/.bashrc` is never
+    /// considered (the default).
+    #[default]
+    PrimaryOnly,
+    /// Explicit setup opt-in: when the primary is genuinely absent,
+    /// `~/.bashrc` becomes eligible for the slot. An existing primary —
+    /// even empty, unreadable, a directory, or a broken symlink — owns it
+    /// exclusively.
+    BashrcFallback,
+}
+
+impl RcPolicy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "primary-only" => Some(Self::PrimaryOnly),
+            "bashrc-fallback" => Some(Self::BashrcFallback),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PrimaryOnly => "primary-only",
+            Self::BashrcFallback => "bashrc-fallback",
+        }
+    }
+}
+
+/// Resolve the effective personal-rc policy. Deliberately has NO
+/// `NIU_`-prefixed override: the contract forbids environment-based
+/// implicit grants, so only a persisted explicit-setup pick flips the
+/// default. Anything unparseable fails closed to `primary-only`.
+pub fn resolve_rc_policy() -> RcPolicy {
+    read_user_config()
+        .startup
+        .and_then(|startup| startup.rc_policy)
+        .and_then(|value| RcPolicy::parse(&value))
+        .unwrap_or_default()
+}
+
+/// Persist `startup.rc-policy` (the `niu setup --rc-policy` writer —
+/// explicit setup is the only command that may persist or revoke this
+/// policy). Setting the built-in default removes the key again so the
+/// file never pins a stale default. No rc file is touched: selecting the
+/// fallback must not create an empty primary rc, which would suppress
+/// the selected fallback (niubash#359).
+pub fn set_rc_policy(policy: RcPolicy) -> anyhow::Result<PathBuf> {
+    write_user_config(|doc| {
+        ensure_schema(doc);
+        if policy == RcPolicy::default() {
+            remove_table_key(doc, "startup", "rc-policy");
+            Ok(())
+        } else {
+            set_table_key(
+                doc,
+                "startup",
+                "rc-policy",
+                toml_edit::value(policy.as_str()),
+            )
+        }
+    })
 }
 
 /// Where the persisted user settings live: `$NIU_CONFIG` overrides (tests,
@@ -471,6 +557,8 @@ struct UserConfigFile {
     command_not_found_hint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     completion: Option<CompletionConfigSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    startup: Option<StartupConfigSection>,
 }
 
 /// Read and parse the persisted user settings. Any problem — missing file,
@@ -483,40 +571,125 @@ fn read_user_config() -> UserConfigFile {
         .unwrap_or_default()
 }
 
-/// Render the config file fresh from `config` (the mirrors.toml writer
-/// convention): hand-added unknown keys or comments are not preserved, and
-/// every known key the caller left unset is omitted.
-fn write_user_config(config: &UserConfigFile) -> anyhow::Result<PathBuf> {
-    let path = user_config_path();
-    let mut text = String::new();
-    text.push_str(&format!("schema = \"{USER_CONFIG_SCHEMA}\"\n"));
-    if let Some(hint) = &config.command_not_found_hint {
-        text.push_str(&format!("{COMMAND_NOT_FOUND_HINT_KEY} = \"{hint}\"\n"));
-    }
-    if let Some(completion) = &config.completion {
-        if let Some(style) = &completion.style {
-            // Rendered as the dotted key `completion.style`; the [completion]
-            // table form the toml crate emits is the same namespace.
-            text.push_str(&format!("\n[completion]\nstyle = \"{style}\"\n"));
+/// Header notes for a freshly created config.toml (parsed into the new
+/// document so every later surgical edit lands after them). Existing files
+/// keep their own layout — these lines are never injected into one.
+const USER_CONFIG_NOTES: &str = "\
+# `niu config set <key> <value>` edits one key surgically; unrelated keys\n\
+# and comments are preserved, and setting a key back to its default\n\
+# removes the override again.\n\
+# command-not-found-hint: package-search suggestion printed after\n\
+#   \"command not found\". off (default) | wpm — wpm suggests one\n\
+#   `wpm search --name` line for high-confidence near-misses only;\n\
+#   third-party managers are never recommended (niubash#249).\n\
+# completion.style: TAB completion shape. gnu (default) | ide |\n\
+#   column | list | inline — `NIU_COMPLETION_STYLE` overrides this\n\
+#   file (env > config > default).\n\
+# startup.rc-policy: which file fills the interactive personal-rc slot\n\
+#   when ~/.niubashrc is absent. primary-only (default) |\n\
+#   bashrc-fallback — explicit `niu setup --rc-policy` owns this key;\n\
+#   it is preserved, never set, by `niu config` (niubash#359).\n";
+
+/// The document a first-time writer starts from (header notes + schema).
+fn fresh_user_config_doc() -> toml_edit::DocumentMut {
+    format!("{USER_CONFIG_NOTES}\nschema = \"{USER_CONFIG_SCHEMA}\"\n")
+        .parse()
+        .expect("the fresh config template is valid TOML")
+}
+
+/// Keep the managed schema marker current without moving user content.
+fn ensure_schema(doc: &mut toml_edit::DocumentMut) {
+    doc["schema"] = toml_edit::value(USER_CONFIG_SCHEMA);
+}
+
+/// Remove `key` from `doc[table]`; drop the table itself when the removal
+/// leaves it empty (a table carrying other keys — managed or unknown —
+/// is preserved untouched). Handles BOTH render shapes: a `[table]` header
+/// section and an inline `table = {…}` (a hand edit may use either — they
+/// are the same namespace to every TOML reader).
+fn remove_table_key(doc: &mut toml_edit::DocumentMut, table: &str, key: &str) {
+    let emptied = match doc.get_mut(table) {
+        Some(toml_edit::Item::Table(section)) => {
+            section.remove(key);
+            section.is_empty()
         }
+        Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(section))) => {
+            section.remove(key);
+            section.is_empty()
+        }
+        // A wrong-typed or absent section has no such key to remove.
+        _ => false,
+    };
+    if emptied {
+        doc.remove(table);
     }
-    text.push_str(
-        "\n\
-        # ── notes ──────────────────────────────────────────────────────────\n\
-        # `niu config set <key> <value>` rewrites this file; setting a key\n\
-        # back to its default value removes the override again.\n\
-        # command-not-found-hint: package-search suggestion printed after\n\
-        #   \"command not found\". off (default) | wpm — wpm suggests one\n\
-        #   `wpm search --name` line for high-confidence near-misses only;\n\
-        #   third-party managers are never recommended (niubash#249).\n\
-        # completion.style: TAB completion shape. gnu (default) | ide |\n\
-        #   column | list | inline — `NIU_COMPLETION_STYLE` overrides this\n\
-        #   file (env > config > default).\n",
-    );
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+}
+
+/// Set `table.key = value`, preserving the section's existing shape and
+/// its sibling keys: a missing section becomes a standard `[table]` header,
+/// an existing header or inline section keeps its form. A wrong-typed
+/// section (e.g. `table = "x"`) is a refusal, not a replacement — the
+/// bytes stay exactly as they were.
+fn set_table_key(
+    doc: &mut toml_edit::DocumentMut,
+    table: &str,
+    key: &str,
+    value: toml_edit::Item,
+) -> anyhow::Result<()> {
+    if !doc.contains_key(table) {
+        doc[table] = toml_edit::table();
     }
-    std::fs::write(&path, text)?;
+    match doc.get_mut(table) {
+        Some(toml_edit::Item::Table(section)) => {
+            section[key] = value;
+            Ok(())
+        }
+        Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(section))) => {
+            section.insert(
+                key,
+                value
+                    .into_value()
+                    .map_err(|error| anyhow::anyhow!("could not encode {table}.{key}: {error}"))?,
+            );
+            Ok(())
+        }
+        _ => anyhow::bail!(
+            "could not save {}: `{table}` is not a table — fix it by hand; \
+             niu never replaces config content it cannot read as written",
+            user_config_path().display()
+        ),
+    }
+}
+
+/// Surgically persist one setting in config.toml (niubash#359): `edit`
+/// mutates the parsed document and the result publishes atomically.
+/// Unrelated keys, comments, ordering and layout survive — the pre-1.4.3
+/// writer rebuilt a typed subset and dropped them, which the rc-ownership
+/// contract forbids. A malformed or unreadable existing file is NEVER
+/// replaced with defaults: the error reports the inability to save and
+/// the bytes stay untouched.
+fn write_user_config(
+    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> anyhow::Result<()>,
+) -> anyhow::Result<PathBuf> {
+    let path = user_config_path();
+    let mut doc = match std::fs::read_to_string(&path) {
+        Ok(text) => text.parse::<toml_edit::DocumentMut>().map_err(|err| {
+            anyhow::anyhow!(
+                "could not save {}: the file is not parseable TOML ({err}); \
+                 fix it by hand or remove it — niu never replaces a config it \
+                 cannot read",
+                path.display()
+            )
+        })?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => fresh_user_config_doc(),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("could not save {}: cannot read the file", path.display())
+            })
+        }
+    };
+    edit(&mut doc)?;
+    crate::path_utils::write_file_atomic(&path, doc.to_string().as_bytes())?;
     Ok(path)
 }
 
@@ -584,38 +757,33 @@ pub fn resolve_completion_style() -> (CompletionStyle, CompletionStyleSource) {
     (style, source)
 }
 
-/// Persist `completion.style` (the `niu config set completion.style` writer).
-/// The file is rewritten with both known settings preserved; passing the
-/// current built-in default removes the key again so the file never pins a
-/// stale default.
+/// Persist `completion.style` (the `niu config set completion.style`
+/// writer). Only that one key is touched; passing the current built-in
+/// default removes the key again so the file never pins a stale default.
 pub fn set_completion_style(style: CompletionStyle) -> anyhow::Result<PathBuf> {
-    let mut config = read_user_config();
-    config.schema = Some(USER_CONFIG_SCHEMA.to_string());
-    let is_default = style == CompletionStyle::default();
-    if is_default {
-        config.completion = None;
-    } else {
-        config.completion = Some(CompletionConfigSection {
-            style: Some(style.as_str().to_string()),
-        });
-    }
-    write_user_config(&config)
+    write_user_config(|doc| {
+        ensure_schema(doc);
+        if style == CompletionStyle::default() {
+            remove_table_key(doc, "completion", "style");
+            Ok(())
+        } else {
+            set_table_key(doc, "completion", "style", toml_edit::value(style.as_str()))
+        }
+    })
 }
 
-/// Persist `command-not-found-hint` (the `niu config set` writer). The
-/// file renders fresh — hand-added unknown keys or comments are not
-/// preserved, matching the mirrors.toml writer convention — and the other
-/// known settings are carried over.
+/// Persist `command-not-found-hint` (the `niu config set` writer). Only
+/// that one key is touched; the built-in default removes the override.
 pub fn set_command_not_found_hint(hint: CommandNotFoundHint) -> anyhow::Result<PathBuf> {
-    let mut config = read_user_config();
-    config.schema = Some(USER_CONFIG_SCHEMA.to_string());
-    let is_default = hint == CommandNotFoundHint::default();
-    if is_default {
-        config.command_not_found_hint = None;
-    } else {
-        config.command_not_found_hint = Some(hint.as_str().to_string());
-    }
-    write_user_config(&config)
+    write_user_config(|doc| {
+        ensure_schema(doc);
+        if hint == CommandNotFoundHint::default() {
+            doc.remove(COMMAND_NOT_FOUND_HINT_KEY);
+        } else {
+            doc[COMMAND_NOT_FOUND_HINT_KEY] = toml_edit::value(hint.as_str());
+        }
+        Ok(())
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -826,6 +994,259 @@ mod tests {
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_else(|| std::path::PathBuf::from(".")),
         );
+        let _ = std::fs::remove_file(&temp);
+        result.unwrap();
+    }
+
+    #[test]
+    fn rc_policy_parse_and_defaults() {
+        assert_eq!(RcPolicy::parse("primary-only"), Some(RcPolicy::PrimaryOnly));
+        assert_eq!(
+            RcPolicy::parse("bashrc-fallback"),
+            Some(RcPolicy::BashrcFallback)
+        );
+        // Tolerated spellings, same namespace contract as the other keys.
+        assert_eq!(
+            RcPolicy::parse("  BASHRC-FALLBACK "),
+            Some(RcPolicy::BashrcFallback)
+        );
+        assert_eq!(RcPolicy::default(), RcPolicy::PrimaryOnly);
+        // Anything else fails closed at parse time too.
+        assert_eq!(RcPolicy::parse("bashrc"), None);
+        assert_eq!(RcPolicy::parse("fallback"), None);
+        assert_eq!(RcPolicy::parse(""), None);
+        assert_eq!(RcPolicy::parse("primary-only; rm -rf"), None);
+        assert_eq!(RcPolicy::PrimaryOnly.as_str(), "primary-only");
+        assert_eq!(RcPolicy::BashrcFallback.as_str(), "bashrc-fallback");
+    }
+
+    /// niubash#359 acceptance matrix, persistence rows: unknown/missing
+    /// enum, wrong type, malformed TOML, unreadable config — every read
+    /// problem fails closed to primary-only, never to fallback.
+    #[test]
+    fn resolve_rc_policy_fails_closed_matrix() {
+        let _env_lock = crate::test_support::PROCESS_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let temp = std::env::temp_dir().join(format!(
+            "niu-config-rcpolicy-matrix-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(temp.parent().unwrap()).unwrap();
+        let previous = std::env::var_os("NIU_CONFIG");
+        std::env::set_var("NIU_CONFIG", &temp);
+        let result = {
+            // No file at all.
+            std::fs::remove_file(&temp).ok();
+            assert_eq!(resolve_rc_policy(), RcPolicy::PrimaryOnly, "no file");
+            // Missing key.
+            std::fs::write(&temp, "schema = \"niubash:config@0.1.0\"\n").unwrap();
+            assert_eq!(resolve_rc_policy(), RcPolicy::PrimaryOnly, "missing key");
+            // Explicit primary-only.
+            std::fs::write(&temp, "[startup]\nrc-policy = \"primary-only\"\n").unwrap();
+            assert_eq!(
+                resolve_rc_policy(),
+                RcPolicy::PrimaryOnly,
+                "explicit primary-only"
+            );
+            // Valid opt-in.
+            std::fs::write(&temp, "[startup]\nrc-policy = \"bashrc-fallback\"\n").unwrap();
+            assert_eq!(
+                resolve_rc_policy(),
+                RcPolicy::BashrcFallback,
+                "valid opt-in"
+            );
+            // Unknown enum value.
+            std::fs::write(&temp, "[startup]\nrc-policy = \"bashrc\"\n").unwrap();
+            assert_eq!(resolve_rc_policy(), RcPolicy::PrimaryOnly, "unknown enum");
+            // Wrong value type.
+            std::fs::write(&temp, "[startup]\nrc-policy = 3\n").unwrap();
+            assert_eq!(resolve_rc_policy(), RcPolicy::PrimaryOnly, "wrong type");
+            // Wrong table type (the whole startup section unusable).
+            std::fs::write(&temp, "startup = \"x\"\n").unwrap();
+            assert_eq!(
+                resolve_rc_policy(),
+                RcPolicy::PrimaryOnly,
+                "wrong table type"
+            );
+            // Duplicate key spellings (dotted + table) are malformed TOML.
+            std::fs::write(
+                &temp,
+                "startup.rc-policy = \"bashrc-fallback\"\n[startup]\nrc-policy = \"bashrc-fallback\"\n",
+            )
+            .unwrap();
+            assert_eq!(resolve_rc_policy(), RcPolicy::PrimaryOnly, "duplicate key");
+            // Malformed TOML.
+            std::fs::write(&temp, "[startup\nrc-policy = ").unwrap();
+            assert_eq!(resolve_rc_policy(), RcPolicy::PrimaryOnly, "malformed toml");
+            // A config DIRECTORY is unreadable as a file.
+            std::fs::remove_file(&temp).unwrap();
+            std::fs::create_dir_all(&temp).unwrap();
+            assert_eq!(
+                resolve_rc_policy(),
+                RcPolicy::PrimaryOnly,
+                "unreadable config"
+            );
+            Ok::<(), anyhow::Error>(())
+        };
+        match previous {
+            Some(value) => std::env::set_var("NIU_CONFIG", value),
+            None => std::env::remove_var("NIU_CONFIG"),
+        }
+        std::fs::remove_dir_all(&temp).ok();
+        result.unwrap();
+    }
+
+    /// The niubash#359 writer contract: persisting one setting is surgical —
+    /// comments, unknown keys, sibling sections, and the rc-policy enum all
+    /// survive `niu config` writes untouched, and only explicit setup may
+    /// change the policy.
+    #[test]
+    fn config_writes_preserve_comments_unknown_keys_and_rc_policy() {
+        let _env_lock = crate::test_support::PROCESS_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let temp = std::env::temp_dir().join(format!(
+            "niu-config-preserve-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let previous = std::env::var_os("NIU_CONFIG");
+        std::env::set_var("NIU_CONFIG", &temp);
+        let result = (|| {
+            let original = "\n\
+                # my own note, kept by hand\n\
+                custom-flag = \"keep me\"\n\
+                schema = \"niubash:config@0.0.9\"\n\
+                [startup]\n\
+                # a comment INSIDE the section, kept too\n\
+                rc-policy = \"bashrc-fallback\"\n\
+                [completion]\n\
+                style = \"ide\"\n\
+                unknown-in-section = 1\n\
+            ";
+            std::fs::write(&temp, original).unwrap();
+
+            // A `niu config` write touches only its one key: the rc-policy
+            // (owned by setup), the unknown keys, and the comments all
+            // survive byte-for-byte.
+            set_command_not_found_hint(CommandNotFoundHint::Wpm)?;
+            let text = std::fs::read_to_string(&temp)?;
+            assert!(text.contains("# my own note, kept by hand"), "{text}");
+            assert!(text.contains("custom-flag = \"keep me\""), "{text}");
+            assert!(text.contains("rc-policy = \"bashrc-fallback\""), "{text}");
+            assert!(text.contains("# a comment INSIDE the section"), "{text}");
+            assert!(text.contains("unknown-in-section = 1"), "{text}");
+            assert_eq!(resolve_rc_policy(), RcPolicy::BashrcFallback);
+
+            // Setting completion back to the default removes exactly that
+            // key; the section's unknown key must stay (no table nuking).
+            set_completion_style(CompletionStyle::Column)?;
+            let text = std::fs::read_to_string(&temp)?;
+            assert!(!text.contains("style = \"ide\""), "{text}");
+            assert!(text.contains("unknown-in-section = 1"), "{text}");
+            assert_eq!(resolve_rc_policy(), RcPolicy::BashrcFallback);
+
+            // An inline-table section is the same namespace: the writer
+            // preserves its shape and siblings instead of rewriting it.
+            std::fs::write(
+                &temp,
+                "completion = { style = \"ide\", unknown-in-section = 1 }\n[startup]\nrc-policy = \"bashrc-fallback\"\n",
+            )
+            .unwrap();
+            set_command_not_found_hint(CommandNotFoundHint::Off)?;
+            let text = std::fs::read_to_string(&temp)?;
+            assert!(
+                text.contains("unknown-in-section = 1"),
+                "inline sibling lost: {text}"
+            );
+            set_completion_style(CompletionStyle::List)?;
+            let text = std::fs::read_to_string(&temp)?;
+            assert!(text.contains("style = \"list\""), "{text}");
+            assert!(
+                text.contains("unknown-in-section = 1"),
+                "inline sibling lost after set: {text}"
+            );
+            assert_eq!(resolve_rc_policy(), RcPolicy::BashrcFallback);
+            Ok::<(), anyhow::Error>(())
+        })();
+        match previous {
+            Some(value) => std::env::set_var("NIU_CONFIG", value),
+            None => std::env::remove_var("NIU_CONFIG"),
+        }
+        let _ = std::fs::remove_file(&temp);
+        result.unwrap();
+    }
+
+    /// `niu setup --rc-policy` is the only writer: round-trip select and
+    /// revoke, no rc file involved (the path only names config.toml), and
+    /// a failed persistence leaves the previous bytes AND policy intact.
+    #[test]
+    fn set_rc_policy_round_trips_and_fails_without_replacing() {
+        let _env_lock = crate::test_support::PROCESS_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let temp = std::env::temp_dir().join(format!(
+            "niu-config-rcpolicy-set-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let previous = std::env::var_os("NIU_CONFIG");
+        std::env::set_var("NIU_CONFIG", &temp);
+        let result = (|| {
+            // Fresh write: the fallback opt-in persists…
+            std::fs::remove_file(&temp).ok();
+            let path = set_rc_policy(RcPolicy::BashrcFallback)?;
+            assert_eq!(path, temp, "the writer reports the config path only");
+            assert_eq!(resolve_rc_policy(), RcPolicy::BashrcFallback);
+            // …and revoking via the built-in default removes the key.
+            set_rc_policy(RcPolicy::PrimaryOnly)?;
+            let text = std::fs::read_to_string(&temp)?;
+            assert!(
+                !text.contains("= \"bashrc-fallback\""),
+                "the revoked key must be gone (notes comments may stay): {text}"
+            );
+            assert_eq!(resolve_rc_policy(), RcPolicy::PrimaryOnly);
+
+            // Malformed config: the writer REFUSES and the bytes stay —
+            // no defaults replacement, no repair (the contract's
+            // atomic-publication row).
+            let corrupt = "[startup\nthis is not toml";
+            std::fs::write(&temp, corrupt).unwrap();
+            let err = set_rc_policy(RcPolicy::BashrcFallback)
+                .expect_err("a corrupt config must refuse to save");
+            assert!(err.to_string().contains("not parseable TOML"), "{err:#}");
+            assert_eq!(
+                std::fs::read_to_string(&temp).unwrap(),
+                corrupt,
+                "the corrupt bytes must stay untouched"
+            );
+            assert_eq!(resolve_rc_policy(), RcPolicy::PrimaryOnly, "fail closed");
+
+            // A wrong-typed startup section is a refusal too, never a
+            // silent table replacement of user content.
+            let wrong = "startup = \"mine\"\n";
+            std::fs::write(&temp, wrong).unwrap();
+            let err = set_rc_policy(RcPolicy::BashrcFallback)
+                .expect_err("a wrong-typed startup must refuse to save");
+            assert!(err.to_string().contains("not a table"), "{err:#}");
+            assert_eq!(std::fs::read_to_string(&temp).unwrap(), wrong);
+            Ok::<(), anyhow::Error>(())
+        })();
+        match previous {
+            Some(value) => std::env::set_var("NIU_CONFIG", value),
+            None => std::env::remove_var("NIU_CONFIG"),
+        }
         let _ = std::fs::remove_file(&temp);
         result.unwrap();
     }

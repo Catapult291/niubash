@@ -951,15 +951,16 @@ fn d2_wizard_one_run_theme_journey() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// d3 — niubash#180: `niu setup` typed INSIDE a live session (the owner's
-/// exact repro: answer the wizard, and the session still ran the old
-/// configuration until a manual `source ~/.niubashrc`). The wizard is a
-/// child process, so the handoff goes through a one-shot marker: the rc
-/// rewrite leaves `~/.niubash/setup-apply-pending`, the finish screen
-/// states the truth about the current session, and the parent session
-/// consumes the marker at its next prompt — re-sourcing the new rc so the
-/// freshly picked theme (a DIFFERENT theme than the session's current
-/// look) renders without opening a new terminal.
+/// d3 — niubash#180/#359: `niu setup` typed INSIDE a live session (the
+/// owner's exact repro). The 1.4.2 contract rewrote the rc and handed the
+/// new bytes to the running session through a one-shot marker. Under the
+/// niubash#359 create-only contract a RERUN over an existing rc touches NO
+/// byte of it — the proposal parks in ~/.niubash/candidates/ and the
+/// finish screen tells the truth ("New config takes effect in new
+/// terminals") without any live-session apply. What DOES move is the
+/// theme pick: it lands in the plugin spec and the published loader
+/// generation, so a NEW terminal renders the picked look while this
+/// session honestly keeps the old one.
 #[test]
 fn d3_setup_rerun_applies_in_the_live_session() {
     if !journey_driver::require_pty_or_skip("d3_setup_rerun_applies_in_the_live_session") {
@@ -1058,41 +1059,62 @@ fn d3_setup_rerun_applies_in_the_live_session() {
 
     // The finish screen must state the truth about the current session
     // (niubash#180 minimum) — prominent, before the how-to-change block.
+    // The capture spans the whole post-Apply gate, so it also carries the
+    // writer's create-only verdict: the existing rc was left untouched and
+    // the proposal parked as a sample.
     let finish = s.expect("Change things later:");
     assert!(
         finish.contains("New config takes effect in new terminals."),
         "{finish}"
     );
     assert!(finish.contains("source ~/.niubashrc"), "{finish}");
+    assert!(
+        finish.contains("exists"),
+        "the rerun must report the existing rc as left untouched: {finish}"
+    );
+    assert!(
+        finish.contains("review and apply by hand"),
+        "the rerun must name the diff-and-apply recipe: {finish}"
+    );
 
-    // The wizard child exits; the parent session consumes the handoff
-    // marker at its next prompt, re-sources the new rc, and renders the
-    // freshly picked theme — no new terminal opened.
-    s.expect("Applied the new configuration");
-    s.expect("agnoster-fixture-face ");
-
-    // The one-shot marker is consumed, the pick is active (the loader
-    // generation carries it — niubash#359), and the old sentinel prompt is
-    // gone for good.
+    // niubash#359 create-only: the rerun left the existing rc byte-exact —
+    // the old sentinel prompt is the session's OWN content and stays — and
+    // the proposal parked as the candidates sample instead. NO handoff
+    // marker exists: a running session has nothing new to apply, so the
+    // live prompt keeps the old look (the finish screen said as much).
+    let rc = fs::read_to_string(home.join(".niubashrc")).unwrap();
+    assert_eq!(rc, rc_text, "a rerun must not rewrite an existing rc");
     assert!(
         !home.join(".niubash").join("setup-apply-pending").exists(),
-        "the handoff marker must be consumed by the apply"
+        "an existing-kept run must not leave a live-session apply marker"
     );
-    let rc = fs::read_to_string(home.join(".niubashrc")).unwrap();
-    assert!(!rc.contains("OSH_THEME="), "{rc}");
-    assert!(!rc.contains("OLD> "), "{rc}");
+    assert!(
+        fs::read_to_string(
+            home.join(".niubash")
+                .join("candidates")
+                .join("setup-proposed.niubashrc")
+        )
+        .unwrap_or_default()
+        .contains("Niubash interactive rc"),
+        "the proposal must park as the candidates sample"
+    );
+
+    // The theme pick still moves: it was recorded in the plugin spec and
+    // published into the loader generation, so a NEW terminal renders the
+    // picked look (the loader is read-only at startup; this session
+    // already sourced its rc and stays on the old look).
     let loader = fs::read_to_string(home.join(".niubash").join("generated").join("plugins.niu"))
         .unwrap_or_default();
     assert!(
         loader.contains("OSH_THEME='agnoster'"),
         "the pick is in the loader generation: {loader}"
     );
-    // Default answer to the provider question is Skip: no snippet in the rc.
-    assert!(!rc.contains("carapace"), "{rc}");
 
+    // The live session keeps its own prompt (nothing was applied under it)
+    // and still exits cleanly.
     s.send_line("exit");
     let code = s.wait_exit();
-    assert_eq!(code, 0, "the session must exit cleanly after the apply");
+    assert_eq!(code, 0, "the session must exit cleanly after the run");
 
     let _ = fs::remove_dir_all(&root);
 }
